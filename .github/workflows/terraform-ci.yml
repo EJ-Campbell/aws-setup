@@ -1,14 +1,16 @@
 name: Terraform CI
 
+# Disabled - using local `make apply` instead
+# To re-enable, add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets
 on:
-  workflow_dispatch:  # Allow manual trigger
-  pull_request:
-    branches: [ main ]
-  push:
-    branches: [ main ]
-    paths:
-      - '**.tf'
-      - '.github/workflows/terraform-ci.yml'
+  workflow_dispatch:  # Manual trigger only
+  # pull_request:
+  #   branches: [ main ]
+  # push:
+  #   branches: [ main ]
+  #   paths:
+  #     - '**.tf'
+  #     - '.github/workflows/terraform-ci.yml'
 
 permissions:
   contents: read

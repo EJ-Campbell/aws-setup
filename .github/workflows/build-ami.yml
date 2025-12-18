@@ -1,13 +1,15 @@
 name: Build Custom AMI
 
+# Disabled - duplicate of packer-build-ami.yml
+# To re-enable, add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'ami.pkr.hcl'
-      - 'scripts/**'
-      - '.github/workflows/build-ami.yml'
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'ami.pkr.hcl'
+  #     - 'scripts/**'
+  #     - '.github/workflows/build-ami.yml'
 
 permissions:
   contents: read

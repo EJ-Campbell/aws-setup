@@ -1,13 +1,15 @@
 name: Build AMI with Packer
 
+# Disabled - requires OIDC role TerraformGithubActionRole
+# To re-enable, set up OIDC trust in AWS IAM
 on:
-  workflow_dispatch:  # Allow manual trigger
-  push:
-    branches: [ main ]
-    paths:
-      - 'ami.pkr.hcl'
-      - 'scripts/version-server.py'
-      - '.github/workflows/packer-build-ami.yml'
+  workflow_dispatch:  # Manual trigger only
+  # push:
+  #   branches: [ main ]
+  #   paths:
+  #     - 'ami.pkr.hcl'
+  #     - 'scripts/version-server.py'
+  #     - '.github/workflows/packer-build-ami.yml'
 
 permissions:
   contents: read
