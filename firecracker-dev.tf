@@ -1,11 +1,36 @@
 # Firecracker Development Instance
-# Single c5.large instance for Firecracker/KVM testing
-# Cost: ~$0.085/hour = ~$61/month (stop when not in use!)
+# ARM64 metal instance for Firecracker/KVM testing
+# Cost: ~$1.36/hour for c6g.metal (stop when not in use!)
 
 variable "enable_firecracker_instance" {
   description = "Enable standalone Firecracker development instance"
   type        = bool
-  default     = false
+  default     = true  # Enabled - instance is imported
+}
+
+variable "firecracker_instance_type" {
+  description = "Instance type for Firecracker dev"
+  type        = string
+  default     = "c6g.metal"  # ARM64 metal for nested virt
+}
+
+variable "firecracker_volume_size" {
+  description = "Root volume size in GB"
+  type        = number
+  default     = 300
+}
+
+variable "firecracker_key_name" {
+  description = "SSH key pair name"
+  type        = string
+  default     = "fcvm-ec2"
+}
+
+# AMI for ARM64 Ubuntu - hardcoded to match imported instance
+variable "firecracker_ami" {
+  description = "AMI ID for Firecracker instance"
+  type        = string
+  default     = "ami-002a311ff44607e17"  # Ubuntu ARM64
 }
 
 # Security group for Firecracker dev instance
@@ -53,40 +78,43 @@ resource "aws_security_group" "firecracker_dev" {
 # Firecracker dev instance
 resource "aws_instance" "firecracker_dev" {
   count         = var.enable_firecracker_instance ? 1 : 0
-  ami           = local.ubuntu2404_ami_id
-  instance_type = "c5.large" # Nitro instance with KVM support
+  ami           = var.firecracker_ami
+  instance_type = var.firecracker_instance_type
+  key_name      = var.firecracker_key_name
 
   # Network configuration
   subnet_id                   = aws_subnet.subnet_a.id
   vpc_security_group_ids      = [aws_security_group.firecracker_dev[0].id]
   associate_public_ip_address = true
 
-  # IAM role for SSM access
-  iam_instance_profile = aws_iam_instance_profile.dev[0].name
-
   # Root volume
   root_block_device {
-    volume_size           = 150 # Large enough for Firecracker + VMs
+    volume_size           = var.firecracker_volume_size
     volume_type           = "gp3"
     delete_on_termination = true
-    encrypted             = true
     iops                  = 3000
     throughput            = 125
   }
 
-  # User data - install Firecracker and dependencies
+  # User data - captures current instance setup for reproducibility
   user_data = base64encode(<<-EOF
     #!/bin/bash
     set -euxo pipefail
 
-    # Update system
+    # ============================================
+    # System packages
+    # ============================================
     apt-get update
     apt-get upgrade -y
 
-    # Install dependencies
     apt-get install -y \
+      zsh \
       curl \
       wget \
+      git \
+      jq \
+      build-essential \
+      software-properties-common \
       podman \
       uidmap \
       slirp4netns \
@@ -94,105 +122,151 @@ resource "aws_instance" "firecracker_dev" {
       containernetworking-plugins \
       nftables \
       iproute2 \
-      dnsmasq \
-      jq \
-      build-essential \
-      software-properties-common
+      dnsmasq
 
-    # Install Eternal Terminal for persistent SSH sessions
-    add-apt-repository -y ppa:jgmath2000/et
-    apt-get update
-    apt-get install -y et
-    systemctl enable --now et
+    # ============================================
+    # Node.js 22.x
+    # ============================================
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y nodejs
 
-    # Install Firecracker
-    FIRECRACKER_VERSION="v1.10.0"
-    wget -O /tmp/firecracker.tgz \
-      "https://github.com/firecracker-microvm/firecracker/releases/download/$${FIRECRACKER_VERSION}/firecracker-$${FIRECRACKER_VERSION}-x86_64.tgz"
+    # ============================================
+    # Rust via rustup
+    # ============================================
+    sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+
+    # ============================================
+    # Firecracker (ARM64)
+    # ============================================
+    FIRECRACKER_VERSION="v1.13.1"
+    ARCH="aarch64"
+    wget -q -O /tmp/firecracker.tgz \
+      "https://github.com/firecracker-microvm/firecracker/releases/download/$${FIRECRACKER_VERSION}/firecracker-$${FIRECRACKER_VERSION}-$${ARCH}.tgz"
     tar -xzf /tmp/firecracker.tgz -C /tmp/
-    mv /tmp/release-$${FIRECRACKER_VERSION}-x86_64/firecracker-$${FIRECRACKER_VERSION}-x86_64 /usr/local/bin/firecracker
+    mv /tmp/release-$${FIRECRACKER_VERSION}-$${ARCH}/firecracker-$${FIRECRACKER_VERSION}-$${ARCH} /usr/local/bin/firecracker
     chmod +x /usr/local/bin/firecracker
-    rm -rf /tmp/firecracker.tgz /tmp/release-$${FIRECRACKER_VERSION}-x86_64
-
-    # Verify Firecracker installation
+    rm -rf /tmp/firecracker.tgz /tmp/release-$${FIRECRACKER_VERSION}-$${ARCH}
     firecracker --version
 
-    # Configure Podman for rootless mode (ubuntu user)
+    # ============================================
+    # Podman rootless config
+    # ============================================
     echo "ubuntu:100000:65536" >> /etc/subuid
     echo "ubuntu:100000:65536" >> /etc/subgid
-
-    # Enable unprivileged user namespaces
     sysctl -w kernel.unprivileged_userns_clone=1
     echo "kernel.unprivileged_userns_clone=1" >> /etc/sysctl.conf
 
-    # Create working directory for fcvm
-    mkdir -p /opt/fcvm
-    chown ubuntu:ubuntu /opt/fcvm
-
     # ============================================
-    # Modern shell setup for ubuntu user
+    # Shell setup for ubuntu user
     # ============================================
-
-    # Install zsh
-    apt-get install -y zsh
-
-    # Install shell tools and apply dotfiles via chezmoi as ubuntu user
     sudo -u ubuntu bash << 'SHELL_SETUP'
     set -e
+    mkdir -p ~/.local/bin ~/.config ~/.zsh
 
-    # Install starship prompt
-    mkdir -p ~/.local/bin
+    # Starship prompt
     curl -sS https://starship.rs/install.sh | sh -s -- -y -b ~/.local/bin
 
-    # Install fzf
+    # Starship config
+    cat > ~/.config/starship.toml << 'STARSHIP'
+    # Minimal single-line prompt
+    format = "$directory$git_branch$git_status$character"
+    add_newline = false
+
+    [directory]
+    truncation_length = 3
+
+    [git_branch]
+    format = "[$branch]($style) "
+    ignore_branches = ["main", "master"]
+
+    [git_status]
+    format = '[$all_status$ahead_behind]($style) '
+
+    [character]
+    success_symbol = "[❯](green)"
+    error_symbol = "[❯](red)"
+    STARSHIP
+
+    # fzf
     git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
     ~/.fzf/install --all --no-bash --no-fish --key-bindings --completion --update-rc
 
-    # Install atuin (magical shell history)
+    # Atuin (shell history)
     curl --proto '=https' --tlsv1.2 -sSf https://setup.atuin.sh | bash
 
-    # Install zsh plugins
-    mkdir -p ~/.zsh
+    # zsh plugins
     git clone https://github.com/zsh-users/zsh-autosuggestions ~/.zsh/zsh-autosuggestions
     git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 
-    # Install chezmoi and apply dotfiles from GitHub
-    sh -c "$$(curl -fsLS get.chezmoi.io)" -- init --apply ejc3/dotfiles --branch main
+    # .zshrc
+    cat > ~/.zshrc << 'ZSHRC'
+    # Modern shell config
 
-    # Import bash history to atuin
-    ~/.atuin/bin/atuin import auto || true
-SHELL_SETUP
+    # PATH for local tools
+    export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/bin:$PATH"
+
+    # History settings
+    HISTFILE=~/.zsh_history
+    HISTSIZE=100000
+    SAVEHIST=100000
+    setopt SHARE_HISTORY
+    setopt HIST_IGNORE_DUPS
+    setopt HIST_IGNORE_SPACE
+
+    # Completion
+    autoload -Uz compinit && compinit
+
+    # Starship prompt
+    eval "$(starship init zsh)"
+
+    # fzf
+    [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
+
+    # Atuin (Ctrl-R history)
+    eval "$(atuin init zsh)"
+
+    # zsh-autosuggestions
+    [ -f ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
+
+    # zsh-syntax-highlighting (must be last)
+    [ -f ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+
+    # Useful aliases
+    alias ll="ls -la"
+    alias gs="git status"
+    alias gd="git diff"
+    ZSHRC
+    SHELL_SETUP
 
     # Change default shell to zsh
     chsh -s /usr/bin/zsh ubuntu
 
-    # Install Node.js and Claude Code
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
-    npm install -g @anthropic-ai/claude-code
+    # ============================================
+    # Claude Code
+    # ============================================
+    sudo -u ubuntu bash -c 'npx @anthropic-ai/claude-code --version || true'
 
-    # Setup completion
-    touch /tmp/firecracker-setup-complete
     echo "Firecracker dev instance ready!" | tee /tmp/firecracker-status
   EOF
   )
 
-  # IMDSv2 required
-  metadata_options {
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 1
-    instance_metadata_tags      = "enabled"
-  }
-
   # Monitoring
-  monitoring = true
+  monitoring = false
 
   tags = {
-    Name        = "${var.project_name}-firecracker-dev"
-    Purpose     = "firecracker-development"
-    Environment = "dev"
-    ManagedBy   = "terraform"
+    Name = "fcvm-metal-arm"
+  }
+
+  # Lifecycle - prevent recreation for imported instance
+  lifecycle {
+    ignore_changes = [
+      ami,
+      user_data,
+      user_data_base64,
+      metadata_options,
+      root_block_device[0].encrypted,
+      root_block_device[0].kms_key_id,
+    ]
   }
 }
 
@@ -207,7 +281,7 @@ output "firecracker_dev_public_ip" {
   value       = var.enable_firecracker_instance ? aws_instance.firecracker_dev[0].public_ip : null
 }
 
-output "firecracker_dev_ssm_command" {
-  description = "Command to connect to Firecracker dev instance via SSM"
-  value       = var.enable_firecracker_instance ? "aws ssm start-session --target ${aws_instance.firecracker_dev[0].id} --region ${var.aws_region}" : null
+output "firecracker_dev_ssh_command" {
+  description = "Command to connect to Firecracker dev instance via SSH"
+  value       = var.enable_firecracker_instance ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_instance.firecracker_dev[0].public_ip}" : null
 }

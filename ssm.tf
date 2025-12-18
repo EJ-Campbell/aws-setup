@@ -39,14 +39,3 @@ resource "aws_ssm_parameter" "version_server_image_tag" {
     ignore_changes = [value] # CI owns value updates, prevent Terraform drift
   }
 }
-
-# Outputs for reference
-output "ssm_runner_image_tag_parameter" {
-  description = "SSM parameter name for runner image tag"
-  value       = aws_ssm_parameter.runner_image_tag.name
-}
-
-output "ssm_version_server_image_tag_parameter" {
-  description = "SSM parameter name for version-server image tag"
-  value       = aws_ssm_parameter.version_server_image_tag.name
-}

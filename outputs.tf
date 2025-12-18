@@ -126,13 +126,13 @@ output "ssm_version_server_image_tag_parameter" {
 output "current_runner_image_tag" {
   description = "Current runner image tag from Parameter Store"
   value       = aws_ssm_parameter.runner_image_tag.value
-  sensitive   = false
+  sensitive   = true
 }
 
 output "current_version_server_image_tag" {
   description = "Current version-server image tag from Parameter Store"
   value       = aws_ssm_parameter.version_server_image_tag.value
-  sensitive   = false
+  sensitive   = true
 }
 
 # ALB Outputs
