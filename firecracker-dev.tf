@@ -87,6 +87,9 @@ resource "aws_instance" "firecracker_dev" {
   vpc_security_group_ids      = [aws_security_group.firecracker_dev[0].id]
   associate_public_ip_address = true
 
+  # IAM role for SSM access
+  iam_instance_profile = aws_iam_instance_profile.dev[0].name
+
   # Root volume
   root_block_device {
     volume_size           = var.firecracker_volume_size
@@ -264,6 +267,7 @@ resource "aws_instance" "firecracker_dev" {
       user_data,
       user_data_base64,
       metadata_options,
+      iam_instance_profile,
       root_block_device[0].encrypted,
       root_block_device[0].kms_key_id,
     ]
