@@ -26,10 +26,10 @@ resource "aws_autoscaling_group" "buckman" {
   target_group_arns = [aws_lb_target_group.proxy[0].arn]
 
   # Health checks
-  health_check_type         = "ELB"        # Use ALB health checks
-  health_check_grace_period = 300          # 5 minutes for instance bootstrap
-  default_cooldown          = 60           # 1 minute between scaling actions
-  wait_for_capacity_timeout = "10m"        # Wait up to 10 minutes for instances
+  health_check_type         = "ELB" # Use ALB health checks
+  health_check_grace_period = 300   # 5 minutes for instance bootstrap
+  default_cooldown          = 60    # 1 minute between scaling actions
+  wait_for_capacity_timeout = "10m" # Wait up to 10 minutes for instances
 
   # Instance refresh configuration (zero-downtime deployments)
   instance_refresh {

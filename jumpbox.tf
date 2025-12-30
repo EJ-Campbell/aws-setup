@@ -79,7 +79,7 @@ resource "aws_volume_attachment" "jumpbox_home" {
 # Jumpbox instance
 resource "aws_instance" "jumpbox" {
   count         = var.enable_jumpbox ? 1 : 0
-  ami           = var.firecracker_ami  # Same Ubuntu ARM64 AMI
+  ami           = var.firecracker_ami # Same Ubuntu ARM64 AMI
   instance_type = "t4g.large"
   key_name      = var.firecracker_key_name
 

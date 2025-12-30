@@ -5,13 +5,13 @@
 variable "enable_firecracker_instance" {
   description = "Enable standalone Firecracker development instance"
   type        = bool
-  default     = true  # Enabled - instance is imported
+  default     = true # Enabled - instance is imported
 }
 
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "c7g.metal"  # ARM64 Graviton3 metal for nested virt
+  default     = "c7g.metal" # ARM64 Graviton3 metal for nested virt
 }
 
 variable "firecracker_volume_size" {
@@ -30,7 +30,7 @@ variable "firecracker_key_name" {
 variable "firecracker_ami" {
   description = "AMI ID for Firecracker instance"
   type        = string
-  default     = "ami-002a311ff44607e17"  # Ubuntu ARM64
+  default     = "ami-002a311ff44607e17" # Ubuntu ARM64
 }
 
 # Security group for Firecracker dev instance

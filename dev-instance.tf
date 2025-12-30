@@ -145,12 +145,12 @@ resource "aws_vpc_endpoint" "s3" {
 
 # SSM endpoints (Interface type) for remote access
 resource "aws_vpc_endpoint" "ssm" {
-  count             = var.enable_dev_instance ? 1 : 0
-  vpc_id            = local.vpc_id
-  service_name      = "com.amazonaws.${var.aws_region}.ssm"
-  vpc_endpoint_type = "Interface"
-  subnet_ids        = [aws_subnet.subnet_a.id]
-  security_group_ids = [aws_security_group.vpc_endpoints[0].id]
+  count               = var.enable_dev_instance ? 1 : 0
+  vpc_id              = local.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
   private_dns_enabled = true
 
   tags = {
@@ -159,12 +159,12 @@ resource "aws_vpc_endpoint" "ssm" {
 }
 
 resource "aws_vpc_endpoint" "ssmmessages" {
-  count             = var.enable_dev_instance ? 1 : 0
-  vpc_id            = local.vpc_id
-  service_name      = "com.amazonaws.${var.aws_region}.ssmmessages"
-  vpc_endpoint_type = "Interface"
-  subnet_ids        = [aws_subnet.subnet_a.id]
-  security_group_ids = [aws_security_group.vpc_endpoints[0].id]
+  count               = var.enable_dev_instance ? 1 : 0
+  vpc_id              = local.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
   private_dns_enabled = true
 
   tags = {
@@ -173,12 +173,12 @@ resource "aws_vpc_endpoint" "ssmmessages" {
 }
 
 resource "aws_vpc_endpoint" "ec2messages" {
-  count             = var.enable_dev_instance ? 1 : 0
-  vpc_id            = local.vpc_id
-  service_name      = "com.amazonaws.${var.aws_region}.ec2messages"
-  vpc_endpoint_type = "Interface"
-  subnet_ids        = [aws_subnet.subnet_a.id]
-  security_group_ids = [aws_security_group.vpc_endpoints[0].id]
+  count               = var.enable_dev_instance ? 1 : 0
+  vpc_id              = local.vpc_id
+  service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = [aws_subnet.subnet_a.id]
+  security_group_ids  = [aws_security_group.vpc_endpoints[0].id]
   private_dns_enabled = true
 
   tags = {

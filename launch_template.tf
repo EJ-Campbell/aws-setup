@@ -32,8 +32,8 @@ resource "aws_launch_template" "buckman" {
       volume_type           = "gp3"
       delete_on_termination = true # ASG instances are ephemeral
       encrypted             = true
-      iops                  = 3000  # gp3 baseline
-      throughput            = 125   # gp3 baseline (MB/s)
+      iops                  = 3000 # gp3 baseline
+      throughput            = 125  # gp3 baseline (MB/s)
     }
   }
 

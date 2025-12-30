@@ -11,13 +11,13 @@ variable "enable_github_runner" {
 variable "github_runner_instance_type" {
   description = "Instance type for GitHub runner"
   type        = string
-  default     = "c7g.metal"  # Same as dev instance for consistency
+  default     = "c7g.metal" # Same as dev instance for consistency
 }
 
 variable "github_runner_spot_price" {
   description = "Maximum spot price (leave empty for on-demand price cap)"
   type        = string
-  default     = ""  # No cap - pay market price
+  default     = "" # No cap - pay market price
 }
 
 # Spot instance request for GitHub runner
@@ -40,7 +40,7 @@ resource "aws_spot_instance_request" "github_runner" {
 
   # Root volume
   root_block_device {
-    volume_size           = 100  # Smaller than dev instance
+    volume_size           = 100 # Smaller than dev instance
     volume_type           = "gp3"
     delete_on_termination = true
     iops                  = 3000
@@ -152,4 +152,60 @@ output "github_runner_spot_request_id" {
 output "github_runner_ssh_command" {
   description = "SSH command for GitHub runner"
   value       = var.enable_github_runner ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_spot_instance_request.github_runner[0].public_ip}" : null
+}
+
+# ============================================
+# IAM User for GitHub Actions to start runner
+# ============================================
+
+resource "aws_iam_user" "github_runner_starter" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "github-runner-starter"
+
+  tags = {
+    Name = "github-runner-starter"
+  }
+}
+
+resource "aws_iam_user_policy" "github_runner_starter" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "StartRunnerEC2"
+  user  = aws_iam_user.github_runner_starter[0].name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:StartInstances"
+        ]
+        Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/${aws_spot_instance_request.github_runner[0].spot_instance_id}"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_access_key" "github_runner_starter" {
+  count = var.enable_github_runner ? 1 : 0
+  user  = aws_iam_user.github_runner_starter[0].name
+}
+
+output "github_runner_starter_access_key_id" {
+  description = "Access key ID for GitHub Actions"
+  value       = var.enable_github_runner ? aws_iam_access_key.github_runner_starter[0].id : null
+  sensitive   = true
+}
+
+output "github_runner_starter_secret_access_key" {
+  description = "Secret access key for GitHub Actions"
+  value       = var.enable_github_runner ? aws_iam_access_key.github_runner_starter[0].secret : null
+  sensitive   = true
 }
