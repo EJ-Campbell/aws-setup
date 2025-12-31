@@ -183,7 +183,7 @@ dev-start: .aws-login
 		-v $(AWS_DIR):/root/.aws:ro \
 		$(CONTAINER_ENV_ARGS) \
 		aws-dev \
-		output -raw dev_instance_id 2>/dev/null) && \
+		output -raw firecracker_dev_instance_id 2>/dev/null) && \
 	if [ -z "$$INSTANCE_ID" ] || [ "$$INSTANCE_ID" = "null" ]; then \
 		echo "Dev instance not deployed. Run: make apply" && exit 1; \
 	fi && \
@@ -207,7 +207,7 @@ dev-stop: .check-aws-cli .container-built
 		-v $(AWS_DIR):/root/.aws:ro \
 		$(CONTAINER_ENV_ARGS) \
 		aws-dev \
-		output -raw dev_instance_id 2>/dev/null) && \
+		output -raw firecracker_dev_instance_id 2>/dev/null) && \
 	if [ -z "$$INSTANCE_ID" ] || [ "$$INSTANCE_ID" = "null" ]; then \
 		echo "Dev instance not deployed" && exit 1; \
 	fi && \
@@ -221,7 +221,7 @@ dev-ssh: .check-aws-cli .container-built
 		-v $(AWS_DIR):/root/.aws:ro \
 		$(CONTAINER_ENV_ARGS) \
 		aws-dev \
-		output -raw dev_instance_id 2>/dev/null) && \
+		output -raw firecracker_dev_instance_id 2>/dev/null) && \
 	if [ -z "$$INSTANCE_ID" ] || [ "$$INSTANCE_ID" = "null" ]; then \
 		echo "Dev instance not deployed. Run: make apply" && exit 1; \
 	fi && \
@@ -234,7 +234,7 @@ dev-status: .check-aws-cli .container-built
 		-v $(AWS_DIR):/root/.aws:ro \
 		$(CONTAINER_ENV_ARGS) \
 		aws-dev \
-		output -raw dev_instance_id 2>/dev/null) && \
+		output -raw firecracker_dev_instance_id 2>/dev/null) && \
 	if [ -z "$$INSTANCE_ID" ] || [ "$$INSTANCE_ID" = "null" ]; then \
 		echo "Dev instance not deployed"; \
 	else \
