@@ -18,6 +18,28 @@ This project is opinionated and minimal:
 2. **No Options**: Device code flow only, 0 ACU auto-pause only, us-west-1 only
 3. **Sensible Defaults**: Everything pre-configured for maximum cost savings
 4. **No Extra Docs**: README.md is the only user-facing documentation
+5. **ALL AWS CHANGES VIA TERRAFORM**: Never use AWS CLI to create/modify/delete resources. Always update .tf files and run `make apply`
+
+## CRITICAL: Terraform Only
+
+**NEVER make AWS changes directly via CLI.** All infrastructure changes MUST go through Terraform:
+
+- ❌ `aws ec2 run-instances` - NO
+- ❌ `aws ec2 modify-instance-attribute` - NO
+- ❌ `aws ec2 create-volume` - NO
+- ❌ Any `aws` command that creates/modifies/deletes resources - NO
+
+- ✅ Edit `.tf` files, then `make apply` - YES
+- ✅ `aws` commands for READ-ONLY queries (describe, list, get) - OK
+
+**Why?** Direct CLI changes cause terraform state drift. The state becomes out of sync with reality, leading to confusing errors and potential data loss.
+
+**If you need to make a quick fix:**
+1. Update the terraform files first
+2. Run `make apply` (or `terraform apply`)
+3. Verify the change worked
+
+**Exception:** Disaster recovery only - if terraform is broken and you need to urgently restore service.
 
 ## Project Overview
 

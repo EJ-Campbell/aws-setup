@@ -90,13 +90,26 @@ resource "aws_instance" "firecracker_dev" {
   # IAM role for SSM access
   iam_instance_profile = aws_iam_instance_profile.jumpbox_admin[0].name
 
-  # Root volume
+  # Spot instance - ~70% cheaper than on-demand
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      instance_interruption_behavior = "stop"
+      spot_instance_type             = "persistent"
+    }
+  }
+
+  # Root volume - PERSISTENT (survives instance termination)
   root_block_device {
     volume_size           = var.firecracker_volume_size
     volume_type           = "gp3"
-    delete_on_termination = true
+    delete_on_termination = false  # Keep EBS when instance terminates
     iops                  = 3000
     throughput            = 125
+    tags = {
+      Name   = "firecracker-dev-root"
+      Backup = "daily"
+    }
   }
 
   # User data - captures current instance setup for reproducibility

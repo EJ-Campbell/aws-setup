@@ -1,0 +1,30 @@
+name: Terraform Drift Detection
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # 8am UTC daily
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::928413605543:role/github-actions-terraform
+          aws-region: us-west-1
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Check for Drift
+        run: terraform plan -detailed-exitcode
