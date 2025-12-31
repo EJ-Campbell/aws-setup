@@ -1,7 +1,6 @@
 # Cost Monitoring
 # 1. Daily email with yesterday's spend (8am UTC / midnight PST)
 # 2. Alert if daily spend exceeds $200
-# 3. SMS alert for both
 
 # ============================================
 # Secrets in SSM Parameter Store
@@ -18,19 +17,8 @@ resource "aws_ssm_parameter" "alert_email" {
   }
 }
 
-resource "aws_ssm_parameter" "alert_phone" {
-  name        = "/alerts/phone"
-  type        = "String"
-  value       = "PLACEHOLDER"
-  description = "Phone for SMS alerts (E.164 format)"
-
-  lifecycle {
-    ignore_changes = [value]
-  }
-}
-
 # ============================================
-# Daily Email Report via Lambda + SES + SNS
+# Daily Email Report via Lambda + SES
 # ============================================
 
 data "archive_file" "cost_report" {
@@ -41,18 +29,14 @@ data "archive_file" "cost_report" {
     content  = <<-PYTHON
 import boto3
 import json
-import os
 from datetime import datetime, timedelta
 
 def handler(event, context):
     ce = boto3.client('ce', region_name='us-east-1')
     ses = boto3.client('ses', region_name='us-west-1')
-    sns = boto3.client('sns', region_name='us-west-1')
     ssm = boto3.client('ssm', region_name='us-west-1')
 
-    # Get secrets from SSM
     email = ssm.get_parameter(Name='/alerts/email')['Parameter']['Value']
-    phone = ssm.get_parameter(Name='/alerts/phone')['Parameter']['Value']
 
     today = datetime.utcnow().date()
     yesterday = today - timedelta(days=1)
@@ -80,7 +64,6 @@ def handler(event, context):
     lines.extend(["", "-" * 40, "TOTAL: $" + format(total, '.2f')])
     body = "\n".join(lines)
 
-    # Send email
     ses.send_email(
         Source=email,
         Destination={'ToAddresses': [email]},
@@ -88,12 +71,6 @@ def handler(event, context):
             'Subject': {'Data': 'AWS Daily Cost: $' + format(total, '.2f') + ' (' + yesterday.isoformat() + ')'},
             'Body': {'Text': {'Data': body}}
         }
-    )
-
-    # Send SMS
-    sns.publish(
-        PhoneNumber=phone,
-        Message='AWS ' + yesterday.isoformat() + ': $' + format(total, '.2f')
     )
 
     return {'statusCode': 200, 'body': json.dumps({'total': total})}
@@ -144,16 +121,8 @@ resource "aws_iam_role_policy" "cost_report" {
       },
       {
         Effect   = "Allow"
-        Action   = ["sns:Publish"]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = ["ssm:GetParameter"]
-        Resource = [
-          aws_ssm_parameter.alert_email.arn,
-          aws_ssm_parameter.alert_phone.arn
-        ]
+        Action   = ["ssm:GetParameter"]
+        Resource = [aws_ssm_parameter.alert_email.arn]
       },
       {
         Effect   = "Allow"
@@ -184,19 +153,12 @@ resource "aws_lambda_permission" "cost_report" {
 }
 
 # ============================================
-# Budget Alert (>$200/day) - Email + SMS
+# Budget Alert (>$200/day)
 # ============================================
 
-# Note: AWS Budgets doesn't support SSM parameters directly,
-# so we use SNS with subscriptions that read from SSM at creation time
 data "aws_ssm_parameter" "alert_email" {
   name       = aws_ssm_parameter.alert_email.name
   depends_on = [aws_ssm_parameter.alert_email]
-}
-
-data "aws_ssm_parameter" "alert_phone" {
-  name       = aws_ssm_parameter.alert_phone.name
-  depends_on = [aws_ssm_parameter.alert_phone]
 }
 
 resource "aws_sns_topic" "cost_alerts" {
@@ -207,12 +169,6 @@ resource "aws_sns_topic_subscription" "cost_alerts_email" {
   topic_arn = aws_sns_topic.cost_alerts.arn
   protocol  = "email"
   endpoint  = data.aws_ssm_parameter.alert_email.value
-}
-
-resource "aws_sns_topic_subscription" "cost_alerts_sms" {
-  topic_arn = aws_sns_topic.cost_alerts.arn
-  protocol  = "sms"
-  endpoint  = data.aws_ssm_parameter.alert_phone.value
 }
 
 resource "aws_budgets_budget" "daily_cost" {
