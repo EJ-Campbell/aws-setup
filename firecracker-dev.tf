@@ -88,7 +88,7 @@ resource "aws_instance" "firecracker_dev" {
   associate_public_ip_address = true
 
   # IAM role for SSM access
-  iam_instance_profile = aws_iam_instance_profile.dev[0].name
+  iam_instance_profile = aws_iam_instance_profile.jumpbox_admin[0].name
 
   # Root volume
   root_block_device {
