@@ -24,22 +24,24 @@ resource "aws_iam_role" "github_actions_terraform" {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:ejc3/aws:*"
+          # Allow both aws and firepod repos
+          "token.actions.githubusercontent.com:sub" = ["repo:ejc3/aws:*", "repo:ejc3/firepod:*"]
         }
       }
     }]
   })
 }
 
-# Read-only policy for drift detection
+# Policy for drift detection and AMI builds
 resource "aws_iam_role_policy" "github_actions_terraform" {
-  name = "terraform-read-only"
+  name = "github-actions-policy"
   role = aws_iam_role.github_actions_terraform.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
+        Sid    = "ReadOnly"
         Effect = "Allow"
         Action = [
           "ec2:Describe*",
@@ -70,9 +72,30 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = "s3:GetObject"
+        Sid    = "TerraformState"
+        Effect = "Allow"
+        Action = "s3:GetObject"
         Resource = "arn:aws:s3:::aws-infrastructure-*-tf-state/*"
+      },
+      {
+        Sid    = "AMIBuilder"
+        Effect = "Allow"
+        Action = [
+          "ec2:RunInstances",
+          "ec2:StopInstances",
+          "ec2:TerminateInstances",
+          "ec2:CreateImage",
+          "ec2:CreateTags",
+          "ec2:RegisterImage",
+          "ec2:DeregisterImage"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "PassRole"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.jumpbox_admin[0].arn
       }
     ]
   })
