@@ -289,6 +289,9 @@ locals {
     sort -u /etc/subuid > /tmp/subuid && mv /tmp/subuid /etc/subuid
     sort -u /etc/subgid > /tmp/subgid && mv /tmp/subgid /etc/subgid
 
+    # Enable linger so user processes survive SSH logout
+    loginctl enable-linger ubuntu
+
     # Install SSM agent via deb (snap doesn't work - kernel lacks squashfs)
     # Remove broken snap installation first
     systemctl stop snapd 2>/dev/null || true
