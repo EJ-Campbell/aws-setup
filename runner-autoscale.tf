@@ -39,25 +39,35 @@ data "archive_file" "runner_webhook" {
           return count
 
       def launch_runner():
-          """Launch a new spot runner instance"""
-          response = ec2.request_spot_instances(
-              InstanceCount=1,
-              LaunchSpecification={
-                  'ImageId': os.environ['AMI_ID'],
-                  'InstanceType': os.environ['INSTANCE_TYPE'],
-                  'KeyName': os.environ['KEY_NAME'],
-                  'SubnetId': os.environ['SUBNET_ID'],
-                  'SecurityGroupIds': [os.environ['SECURITY_GROUP_ID']],
-                  'IamInstanceProfile': {'Name': os.environ['INSTANCE_PROFILE']},
-                  'BlockDeviceMappings': [{
-                      'DeviceName': '/dev/sda1',
-                      'Ebs': {'VolumeSize': 100, 'VolumeType': 'gp3'}
-                  }],
-                  'UserData': os.environ['USER_DATA']
+          """Launch a new spot runner instance with tags"""
+          import base64
+          response = ec2.run_instances(
+              MinCount=1,
+              MaxCount=1,
+              ImageId=os.environ['AMI_ID'],
+              InstanceType=os.environ['INSTANCE_TYPE'],
+              KeyName=os.environ['KEY_NAME'],
+              SubnetId=os.environ['SUBNET_ID'],
+              SecurityGroupIds=[os.environ['SECURITY_GROUP_ID']],
+              IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
+              BlockDeviceMappings=[{
+                  'DeviceName': '/dev/sda1',
+                  'Ebs': {'VolumeSize': 100, 'VolumeType': 'gp3', 'DeleteOnTermination': True}
+              }],
+              UserData=os.environ['USER_DATA'],
+              InstanceMarketOptions={
+                  'MarketType': 'spot',
+                  'SpotOptions': {'SpotInstanceType': 'one-time'}
               },
-              Type='one-time'
+              TagSpecifications=[{
+                  'ResourceType': 'instance',
+                  'Tags': [
+                      {'Key': 'Name', 'Value': 'github-runner-autoscale'},
+                      {'Key': 'Role', 'Value': 'github-runner'}
+                  ]
+              }]
           )
-          return response['SpotInstanceRequests'][0]['SpotInstanceRequestId']
+          return response['Instances'][0]['InstanceId']
 
       def handler(event, context):
           # Parse webhook
@@ -159,8 +169,9 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
-          "ec2:RequestSpotInstances",
+          "ec2:RunInstances",
           "ec2:StopInstances",
+          "ec2:TerminateInstances",
           "ec2:CreateTags",
           "iam:PassRole",
           "cloudwatch:GetMetricStatistics"
@@ -241,9 +252,8 @@ locals {
     #!/bin/bash
     set -euxo pipefail
 
-    # Tag this instance as a runner
+    # Get instance ID for runner naming
     INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-    aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Role,Value=github-runner Key=Name,Value=github-runner-autoscale --region us-west-1
 
     # System packages
     apt-get update && apt-get upgrade -y
