@@ -248,45 +248,11 @@ output "runner_webhook_url" {
 # ============================================
 
 locals {
+  # Minimal user_data that fetches and runs the full setup script from GitHub
   runner_user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
-
-    # Get instance ID for runner naming
-    INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-
-    # System packages
-    apt-get update && apt-get upgrade -y
-    apt-get install -y curl wget git jq build-essential podman uidmap slirp4netns fuse-overlayfs containernetworking-plugins
-
-    # Node.js 22.x
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
-
-    # Rust
-    sudo -u ubuntu bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
-
-    # GitHub Actions Runner
-    mkdir -p /opt/actions-runner && cd /opt/actions-runner
-    RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
-    curl -o actions-runner-linux-arm64.tar.gz -L "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-arm64-$RUNNER_VERSION.tar.gz"
-    tar xzf actions-runner-linux-arm64.tar.gz && rm actions-runner-linux-arm64.tar.gz
-    chown -R ubuntu:ubuntu /opt/actions-runner
-    ./bin/installdependencies.sh
-
-    # Podman rootless
-    echo "ubuntu:100000:65536" >> /etc/subuid
-    echo "ubuntu:100000:65536" >> /etc/subgid
-
-    # Get GitHub PAT and generate registration token
-    PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
-    if [ -n "$PAT" ]; then
-      TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-        https://api.github.com/repos/ejc3/firepod/actions/runners/registration-token | jq -r '.token')
-      sudo -u ubuntu ./config.sh --url https://github.com/ejc3/firepod --token "$TOKEN" --name "runner-$INSTANCE_ID" --labels self-hosted,Linux,ARM64 --unattended
-      ./svc.sh install ubuntu
-      ./svc.sh start
-    fi
+    curl -fsSL https://raw.githubusercontent.com/ejc3/firepod/main/scripts/setup-runner.sh | bash
   EOF
 }
 
