@@ -189,6 +189,11 @@ resource "aws_iam_role_policy" "runner_lambda" {
           "cloudwatch:GetMetricStatistics"
         ]
         Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:us-west-1:928413605543:parameter/github-runner/*"
       }
     ]
   })
@@ -347,10 +352,11 @@ data "archive_file" "runner_cleanup" {
           try:
               resp = ssm.get_parameter(Name='/github-runner/pat', WithDecryption=True)
               pat = resp['Parameter']['Value']
+              print(f'SSM PAT value starts with: {pat[:10] if pat else "None"}...')
               if pat and pat != 'placeholder':
                   return pat
-          except Exception:
-              pass
+          except Exception as e:
+              print(f'SSM get_parameter failed: {e}')
           return None
 
       def get_runners(pat):
@@ -382,11 +388,39 @@ data "archive_file" "runner_cleanup" {
               print(f'Failed to deregister runner {runner_id}: {e}')
           return False
 
+      def get_instance_state(instance_id):
+          """Check if instance exists and is running"""
+          try:
+              resp = ec2.describe_instances(InstanceIds=[instance_id])
+              for res in resp['Reservations']:
+                  for inst in res['Instances']:
+                      return inst['State']['Name']
+          except Exception:
+              pass
+          return None
+
       def handler(event, context):
           pat = get_github_pat()
+          print(f'PAT available: {bool(pat)}')
           runners = get_runners(pat) if pat else {}
+          print(f'Found {len(runners)} runners from GitHub')
 
-          # Find auto-scaled runners
+          # Phase 1: Clean up orphaned GitHub runners (instances gone)
+          orphans_cleaned = []
+          for runner_name, runner_info in runners.items():
+              if not runner_name.startswith('runner-i-'):
+                  print(f'Skipping {runner_name} (not runner-i- pattern)')
+                  continue
+              instance_id = runner_name.replace('runner-', '')
+              state = get_instance_state(instance_id)
+              print(f'Runner {runner_name}: instance state={state}')
+              # If instance doesn't exist or is terminated, deregister runner
+              if state is None or state in ('terminated', 'shutting-down'):
+                  print(f'Cleaning orphan: {runner_name} (state={state})')
+                  if deregister_runner(runner_info['id'], pat):
+                      orphans_cleaned.append(runner_name)
+
+          # Phase 2: Find idle running instances to terminate
           response = ec2.describe_instances(
               Filters=[
                   {'Name': 'tag:Role', 'Values': ['github-runner']},
@@ -428,13 +462,14 @@ data "archive_file" "runner_cleanup" {
                   if metrics['Datapoints']:
                       avg_cpu = sum(d['Average'] for d in metrics['Datapoints']) / len(metrics['Datapoints'])
                       if avg_cpu < 5:
+                          print(f'Terminating idle: {instance_id} (cpu={avg_cpu:.1f}%)')
                           # Deregister from GitHub first
                           if runner_info.get('id'):
                               deregister_runner(runner_info['id'], pat)
                           ec2.terminate_instances(InstanceIds=[instance_id])
                           terminated.append(instance_id)
 
-          return {'terminated': terminated, 'skipped_busy': skipped_busy}
+          return {'terminated': terminated, 'skipped_busy': skipped_busy, 'orphans_cleaned': orphans_cleaned}
     EOF
     filename = "lambda_function.py"
   }
