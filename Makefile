@@ -1,4 +1,4 @@
-.PHONY: help shell init plan apply destroy output clean test connect connect-iam dev-start dev-stop dev-ssh dev-status runners .aws-login .check-aws-cli .check-podman
+.PHONY: help shell init plan apply destroy output clean test connect fmt dev-start dev-stop dev-ssh dev-status runners .aws-login .check-aws-cli .check-podman
 
 # Container runtime (podman or docker)
 CONTAINER_RUNTIME := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null || echo /opt/homebrew/bin/podman)
@@ -27,6 +27,7 @@ help:
 	@echo "  make destroy     - Destroy the infrastructure"
 	@echo "  make shell       - Start an interactive shell"
 	@echo "  make clean       - Clean everything"
+	@echo "  make test        - Test container tools"
 	@echo ""
 	@echo "Development Instance:"
 	@echo "  make dev-start   - Start dev instance (creates if needed)"
