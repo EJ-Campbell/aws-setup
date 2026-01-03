@@ -307,6 +307,15 @@ ${local.gh_and_claude_sync_script}
   tags = {
     Name = "fcvm-metal-x86"
   }
+
+  # Lifecycle - prevent recreation for imported instance
+  lifecycle {
+    ignore_changes = [
+      ami,
+      user_data,
+      user_data_base64,
+    ]
+  }
 }
 
 # ============================================

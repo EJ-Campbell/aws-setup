@@ -9,6 +9,14 @@ terraform {
       version = "~> 2.0"
     }
   }
+
+  backend "s3" {
+    bucket         = "ejc3-terraform-state"
+    key            = "aws-infrastructure/terraform.tfstate"
+    region         = "us-west-1"
+    dynamodb_table = "ejc3-terraform-locks"
+    encrypt        = true
+  }
 }
 
 provider "aws" {
