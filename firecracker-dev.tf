@@ -303,6 +303,30 @@ resource "aws_instance" "firecracker_dev" {
     # ============================================
     sudo -u ubuntu bash -c 'npm install -g @anthropic-ai/claude-code'
 
+    # ============================================
+    # Claude Code Sync (conversation history backup)
+    # ============================================
+    sudo -u ubuntu bash << 'CLAUDE_SYNC_SETUP'
+    set -euxo pipefail
+
+    # Clone and build from feature branch
+    git clone -b feature/non-interactive-init https://github.com/ejc3/claude-code-sync.git ~/src/claude-code-sync
+    cd ~/src/claude-code-sync
+    ~/.cargo/bin/cargo install --path .
+
+    # Create init config for non-interactive setup
+    cat > ~/.claude-code-sync-init.toml << 'INITCFG'
+repo_path = "~/claude-history-sync"
+remote_url = "https://github.com/ejc3/claude-code-history.git"
+clone = true
+exclude_attachments = true
+enable_lfs = true
+INITCFG
+
+    # Initialize (will clone the history repo)
+    ~/.cargo/bin/claude-code-sync init || true
+    CLAUDE_SYNC_SETUP
+
     echo "Firecracker dev instance ready!" | tee /tmp/firecracker-status
   EOF
   )
