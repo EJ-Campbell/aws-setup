@@ -154,6 +154,7 @@ resource "aws_instance" "x86_dev" {
       libsodium-dev \
       libcurl4-openssl-dev \
       libutempter-dev \
+      libssl-dev \
       unzip \
       zip
 
