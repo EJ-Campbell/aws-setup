@@ -159,6 +159,37 @@ resource "aws_instance" "x86_dev" {
       zip
 
     # ============================================
+    # Eternal Terminal (build from source for latest fixes)
+    # ============================================
+    git clone --recurse-submodules --depth 1 https://github.com/MisterTea/EternalTerminal.git /tmp/EternalTerminal
+    cd /tmp/EternalTerminal
+    mkdir build && cd build
+    cmake ..
+    make -j$(nproc)
+    make install
+    cd / && rm -rf /tmp/EternalTerminal
+
+    # Create systemd service for etserver
+    cat > /etc/systemd/system/et.service << 'ETSERVICE'
+[Unit]
+Description=Eternal Terminal Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etserver
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+ETSERVICE
+
+    systemctl daemon-reload
+    systemctl enable et.service
+    systemctl start et.service
+
+    # ============================================
     # GitHub CLI
     # ============================================
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
