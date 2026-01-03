@@ -379,6 +379,25 @@ resource "aws_cloudwatch_metric_alarm" "firecracker_dev_idle" {
   }
 }
 
+# ============================================
+# Elastic IP for static address
+# ============================================
+
+resource "aws_eip" "firecracker_dev" {
+  count  = var.enable_firecracker_instance ? 1 : 0
+  domain = "vpc"
+
+  tags = {
+    Name = "fcvm-metal-arm-eip"
+  }
+}
+
+resource "aws_eip_association" "firecracker_dev" {
+  count         = var.enable_firecracker_instance ? 1 : 0
+  instance_id   = aws_instance.firecracker_dev[0].id
+  allocation_id = aws_eip.firecracker_dev[0].id
+}
+
 # Output the instance ID and connection command
 output "firecracker_dev_instance_id" {
   description = "Instance ID of Firecracker dev instance"
@@ -386,11 +405,11 @@ output "firecracker_dev_instance_id" {
 }
 
 output "firecracker_dev_public_ip" {
-  description = "Public IP of Firecracker dev instance"
-  value       = var.enable_firecracker_instance ? aws_instance.firecracker_dev[0].public_ip : null
+  description = "Public IP of Firecracker dev instance (Elastic IP)"
+  value       = var.enable_firecracker_instance ? aws_eip.firecracker_dev[0].public_ip : null
 }
 
 output "firecracker_dev_ssh_command" {
   description = "Command to connect to Firecracker dev instance via SSH"
-  value       = var.enable_firecracker_instance ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_instance.firecracker_dev[0].public_ip}" : null
+  value       = var.enable_firecracker_instance ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_eip.firecracker_dev[0].public_ip}" : null
 }

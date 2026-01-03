@@ -155,6 +155,25 @@ resource "aws_backup_selection" "jumpbox" {
   ]
 }
 
+# ============================================
+# Elastic IP for static address
+# ============================================
+
+resource "aws_eip" "jumpbox" {
+  count  = var.enable_jumpbox ? 1 : 0
+  domain = "vpc"
+
+  tags = {
+    Name = "jumpbox-eip"
+  }
+}
+
+resource "aws_eip_association" "jumpbox" {
+  count         = var.enable_jumpbox ? 1 : 0
+  instance_id   = aws_instance.jumpbox[0].id
+  allocation_id = aws_eip.jumpbox[0].id
+}
+
 # Outputs
 output "jumpbox_instance_id" {
   description = "Instance ID of jumpbox"
@@ -162,16 +181,16 @@ output "jumpbox_instance_id" {
 }
 
 output "jumpbox_public_ip" {
-  description = "Public IP of jumpbox"
-  value       = var.enable_jumpbox ? aws_instance.jumpbox[0].public_ip : null
+  description = "Public IP of jumpbox (Elastic IP)"
+  value       = var.enable_jumpbox ? aws_eip.jumpbox[0].public_ip : null
 }
 
 output "jumpbox_ssh_command" {
   description = "SSH to jumpbox"
-  value       = var.enable_jumpbox ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_instance.jumpbox[0].public_ip}" : null
+  value       = var.enable_jumpbox ? "ssh -i ~/.ssh/${var.firecracker_key_name} ubuntu@${aws_eip.jumpbox[0].public_ip}" : null
 }
 
 output "jumpbox_to_firecracker_command" {
   description = "SSH from jumpbox to firecracker dev instance"
-  value       = var.enable_jumpbox && var.enable_firecracker_instance ? "ssh -J ubuntu@${aws_instance.jumpbox[0].public_ip} ubuntu@${aws_instance.firecracker_dev[0].private_ip}" : null
+  value       = var.enable_jumpbox && var.enable_firecracker_instance ? "ssh -J ubuntu@${aws_eip.jumpbox[0].public_ip} ubuntu@${aws_instance.firecracker_dev[0].private_ip}" : null
 }
