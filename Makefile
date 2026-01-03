@@ -263,24 +263,30 @@ runners:
 		--query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value|[0],InstanceId,InstanceType,State.Name,PrivateIpAddress,LaunchTime]' \
 		--output table --region us-west-1
 
-# Direct SSH to dev instances (uses Elastic IPs from terraform output)
+# Direct SSH to dev instances (uses AWS CLI to get Elastic IPs by instance tag)
 ssh-jumpbox:
-	@IP=$$(terraform output -raw jumpbox_public_ip 2>/dev/null) && \
-	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
-		echo "Jumpbox not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	@IP=$$(aws ec2 describe-instances --region us-west-1 \
+		--filters "Name=tag:Name,Values=jumpbox" "Name=instance-state-name,Values=running" \
+		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "None" ]; then \
+		echo "Jumpbox not running or no public IP."; exit 1; \
 	fi && \
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
 
 ssh-arm:
-	@IP=$$(terraform output -raw firecracker_dev_public_ip 2>/dev/null) && \
-	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
-		echo "ARM instance not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	@IP=$$(aws ec2 describe-instances --region us-west-1 \
+		--filters "Name=tag:Name,Values=fcvm-metal-arm" "Name=instance-state-name,Values=running" \
+		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "None" ]; then \
+		echo "ARM instance not running or no public IP."; exit 1; \
 	fi && \
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
 
 ssh-x86:
-	@IP=$$(terraform output -raw x86_dev_public_ip 2>/dev/null) && \
-	if [ -z "$$IP" ] || [ "$$IP" = "null" ]; then \
-		echo "x86 instance not deployed or no Elastic IP. Run: make apply"; exit 1; \
+	@IP=$$(aws ec2 describe-instances --region us-west-1 \
+		--filters "Name=tag:Name,Values=fcvm-metal-x86" "Name=instance-state-name,Values=running" \
+		--query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) && \
+	if [ -z "$$IP" ] || [ "$$IP" = "None" ]; then \
+		echo "x86 instance not running or no public IP."; exit 1; \
 	fi && \
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$$IP
