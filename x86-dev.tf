@@ -296,6 +296,8 @@ resource "aws_instance" "x86_dev" {
     # ============================================
     npm install -g @anthropic-ai/claude-code
 
+${local.gh_and_claude_sync_script}
+
     echo "x86 dev instance ready!" | tee /tmp/x86-dev-status
   EOF
   )
