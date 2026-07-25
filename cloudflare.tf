@@ -8,9 +8,15 @@
 # imported here so the whole thing is reproducible from `terraform apply` rather than
 # living only in someone's shell history.
 #
-# CREDENTIALS: the API token lives in Secrets Manager (cloudflare-tunnel-token), minted
-# with exactly four permission groups -- Tunnel Write, Access Apps and Policies Write,
-# DNS Write, Zone Read. It is never written to disk or into the repo.
+# CREDENTIALS: the API token lives in Secrets Manager (cloudflare-tunnel-token), scoped to
+# this account with only what the resources below need -- Tunnel Write, Access Apps and
+# Policies Write, Access Organizations/Identity Providers Write, DNS Write, Zone Read/Write.
+# It is never written to disk or into the repo.
+#
+# The IdP permission is the non-obvious one: without it `terraform import` on the identity
+# provider fails with a bare "auth.forbidden" that reads like a malformed import ID rather
+# than a missing scope. If you re-mint this token, include it or the login method below
+# becomes unmanageable.
 
 data "aws_secretsmanager_secret_version" "cloudflare_token" {
   secret_id = "cloudflare-tunnel-token"
@@ -83,6 +89,20 @@ resource "cloudflare_dns_record" "cc_games_wildcard" {
 # This is the only thing standing between the dev servers and the open internet, since
 # the tunnel terminates inside Cloudflare.
 # ---------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------
+# Login method. Without this the only identity provider on a fresh Zero Trust account is
+# type "cloudflare", which means "must be a member of the Cloudflare account" -- everyone
+# else got "Cloudflare sign-in is restricted to members of the account" and had no way in.
+# One-time PIN emails a code to whatever address is entered, and the policy above decides
+# whether that address is allowed, so plain Gmail works with no Google OAuth app to set up.
+# ---------------------------------------------------------------------------------
+resource "cloudflare_zero_trust_access_identity_provider" "onetimepin" {
+  account_id = var.cloudflare_account_id
+  name       = "One-time PIN"
+  type       = "onetimepin"
+  config     = {}
+}
+
 resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
   account_id       = var.cloudflare_account_id
   name             = "cc-games dev servers"
