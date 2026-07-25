@@ -279,6 +279,19 @@ set -as terminal-features ",xterm-256color:RGB"
 set -g set-clipboard on
 set -sg escape-time 10
 set -g focus-events on
+# Let the inner program's title and notifications reach the outer terminal (ghostty/cmux),
+# so a rename inside Claude renames the cmux tab. Claude sets its title with OSC 0; tmux only
+# forwards a title to the client when set-titles is on, and the string is just the pane title
+# so the tab shows exactly what the program set. Measured through nosync-wrap: set-titles off
+# -> 0 title escapes reach the client; on -> the client receives ESC]0;<claude title>BEL.
+# allow-passthrough lets OSC 9 / OSC 777 desktop-notification escapes through; monitor-bell
+# surfaces Claude's attention bell.
+set -g set-titles on
+set -g set-titles-string "#{pane_title}"
+set -g allow-passthrough on
+set -g monitor-bell on
+set -g bell-action any
+set -g visual-bell off
 TMUXCONF
 mkdir -p ~/.config
 # t-claude and nosync-wrap now live in their own repo: github.com/ejc3/t-claude
