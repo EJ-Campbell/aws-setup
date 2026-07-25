@@ -329,6 +329,8 @@ chsh -s /usr/bin/zsh ubuntu
 # presence meant anything able to read the file could SSH to the jumpbox -- where the AWS
 # admin session lives -- from a box that runs agents with --dangerously-skip-permissions.
 ${local.dev_hop_setup}
+
+${local.codex_remote_control}
 SHELLSETUP
 
   # ARM dev server (c7gd.metal) full setup script

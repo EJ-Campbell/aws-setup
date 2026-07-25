@@ -484,6 +484,16 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
 fi
 command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude install failed"
 
+# Vercel CLI. The project deploys to Vercel (the git integration on CoderColton/colton-games
+# builds main automatically), and both kids are members of the Pro team that owns it, so
+# they can also deploy and inspect from the box directly.
+#
+# Only the CLI is installed here. `vercel login` is an interactive device-code flow and
+# each account must authenticate as ITSELF, so it cannot be baked in -- the tokens live in
+# ~/.local/share/com.vercel.cli/auth.json, which is on the persistent volume and survives
+# reboots and instance replacement.
+command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel install failed"
+
 # ---------------------------------------------------------------- dev-server hops
 # Runs as root (it installs into /home/ubuntu as the ubuntu user) and only touches the
 # ubuntu account -- colton and connor get no key to the Firecracker boxes, and cannot read
