@@ -177,6 +177,85 @@ printf '%s\n' "$DIR"
 ADIR
 chmod 755 /usr/local/bin/agent-dir
 
+# Regenerates a user's ~/Documents/Codex/AGENTS.md from the repos actually on disk.
+# GENERATED because a kid can add a second project at any time, and a hardcoded path would
+# then be wrong. Runs at boot and from the nightly updater.
+cat > /usr/local/bin/kid-agents-refresh <<'KIDAGENTS'
+#!/bin/bash
+set -uo pipefail
+WHO="$${1:?usage: kid-agents-refresh <user>}"
+id "$WHO" >/dev/null 2>&1 || { echo "no such user $WHO" >&2; exit 1; }
+HOMEDIR="/home/$WHO"
+OUT="$HOMEDIR/Documents/Codex/AGENTS.md"
+install -d -o "$WHO" -g "$WHO" -m 755 "$HOMEDIR/Documents/Codex"
+
+HOST=""; PORT=""
+[ -f "/var/lib/ndev/$WHO.env" ] && . "/var/lib/ndev/$WHO.env"
+
+# git must run AS the user: root gets "dubious ownership" on a user-owned repo and every
+# command returns empty, which silently produces a project list with no projects in it.
+#
+# Built in this loop rather than inside `sudo -u ... bash -c '...'`. In that form the
+# markdown backticks landed inside double quotes in the inner shell and were executed as
+# command substitution -- `~/%s` became an attempt to run /home/<user>/%s, and one repo
+# came out as three garbled lines. Here the backticks are backslash-escaped and never
+# reach a nested shell.
+BT='`'
+REPOS=""
+for d in "$HOMEDIR"/*/; do
+  [ -d "$d/.git" ] || continue
+  n=$(basename "$d")
+  r=$(sudo -u "$WHO" git -C "$d" remote get-url origin 2>/dev/null | sed 's|https://github.com/||;s|\.git$||')
+  b=$(sudo -u "$WHO" git -C "$d" branch --show-current 2>/dev/null)
+  REPOS="$${REPOS}- $${BT}~/$${n}$${BT} — $${r:-no remote} (branch $${BT}$${b:-detached}$${BT})
+"
+done
+REPOS=$(printf '%s' "$REPOS")
+
+# Fail loudly rather than shipping an empty list. The metal-box generator produced one on
+# its first run and `|| true` hid it; the file looked fine and told an agent nothing.
+if [ -z "$REPOS" ]; then
+  echo "kid-agents-refresh: found no git repos for $WHO -- keeping existing AGENTS.md" >&2
+  [ -s "$OUT" ] && exit 0
+  REPOS="- (no git repositories yet -- ask the user what to work on)"
+fi
+
+TMP=$(mktemp)
+{
+  printf '# Read this first\n\n'
+  printf 'You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.\n'
+  printf '**That folder is not the project.** The real work is in one of these:\n\n'
+  printf '%s\n\n' "$REPOS"
+  printf 'They are writable inside your sandbox. Run commands from the project directory.\n\n'
+  printf '## The dev server is already running -- do not start one\n\n'
+  if [ -n "$HOST" ]; then
+    printf 'This project is live at https://%s on port %s.\n\n' "$HOST" "$PORT"
+  fi
+  printf 'It is a systemd service that starts at boot and restarts if it crashes. Running\n'
+  printf '`next dev` or `npm run dev` yourself collides on the port and breaks the live site.\n\n'
+  printf '**Your sandbox may have no network access, even to localhost.** When it does not,\n'
+  printf '`curl http://localhost:...` fails identically whether the server is healthy or truly\n'
+  printf 'stopped, so it tells you nothing. Never conclude from a failed curl that it is down.\n'
+  printf 'Check the service instead -- these need no network:\n\n'
+  printf '```bash\n'
+  printf 'systemctl is-active ndev@%s      # "active" means the site is up\n' "$WHO"
+  printf 'journalctl -u ndev@%s -n 50      # recent output, including compile errors\n' "$WHO"
+  printf 'sudo systemctl restart ndev@%s   # only if a change needs a full restart\n' "$WHO"
+  printf '```\n\n'
+  printf 'Next.js hot-reloads on save, so most edits need no restart at all.\n\n'
+  printf '## This machine\n\n'
+  printf -- '- You have **full passwordless sudo**. Install whatever you need.\n'
+  printf -- '- Your home directory persists across reboots and is backed up daily.\n'
+  printf -- '- `git` is authenticated as your own GitHub account, and `vercel` as your own\n'
+  printf '  Vercel account. Both kids share one Vercel project, so pushing to `main`\n'
+  printf '  deploys the shared site.\n'
+} > "$TMP"
+install -m 644 -o "$WHO" -g "$WHO" "$TMP" "$OUT"
+rm -f "$TMP"
+echo "wrote $OUT ($(wc -c < "$OUT") bytes, $(printf '%s' "$REPOS" | grep -c '^- ') repo(s))"
+KIDAGENTS
+chmod 755 /usr/local/bin/kid-agents-refresh
+
 cat > /usr/local/bin/agents-start <<'AGENTS'
 #!/bin/bash
 set -euo pipefail
@@ -407,7 +486,8 @@ for u in ${join(" ", local.nextjs_users)}; do
   # by walking UP from its cwd -- so this reaches sessions the host cannot otherwise
   # configure. It is the only lever over app-created sessions besides writable_roots.
   install -d -o "$u" -g "$u" -m 755 "/home/$u/Documents/Codex"
-  cat > "/home/$u/Documents/Codex/AGENTS.md" <<AGENTSMD
+  /usr/local/bin/kid-agents-refresh "$u" || echo "WARNING: AGENTS.md generation failed for $u"
+  cat > "/home/$u/Documents/Codex/AGENTS.md.static" <<AGENTSMD
 # Read this first
 
 You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.
@@ -459,6 +539,81 @@ AGENTSMD
   # Re-enable a previously published project (ndev-register wrote the env file).
   [ -s "/var/lib/ndev/$u.env" ] && systemctl enable --now "ndev@$u.service" 2>/dev/null || true
 done
+
+# ---------------------------------------------------------------- nightly agent update
+# Keeps Claude and Codex current and bounces the units so the new binaries are actually in
+# use -- an updated package does nothing while the old process is still running.
+#
+# Scheduled at 08:00 UTC (01:00 Pacific) because restarting claude-rc kills whatever
+# conversation is open in it. RandomizedDelaySec spreads it so both kids' agents are not
+# torn down in the same second. Persistent=true means a box that was off overnight catches
+# up on the next boot rather than skipping a week of updates.
+cat > /usr/local/bin/agent-update <<'AGENTUPD'
+#!/bin/bash
+# Update Claude Code, Codex and Vercel, then restart the agent services.
+set -uo pipefail
+export DEBIAN_FRONTEND=noninteractive
+echo "=== agent-update $(date -u '+%F %T UTC') ==="
+
+BEFORE_CLAUDE=$(claude --version 2>/dev/null | head -1)
+npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude update failed"
+npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel update failed"
+echo "claude: $${BEFORE_CLAUDE:-none} -> $(claude --version 2>/dev/null | head -1)"
+
+for u in colton connor ej; do
+  id "$u" >/dev/null 2>&1 || continue
+  # Codex ships its own installer and self-updates the standalone bundle; re-running it is
+  # the supported refresh. Must run AS the user from a directory they can read -- from
+  # elsewhere it dies in `find` after creating releases/ but before current/.
+  if [ -s "/home/$u/.codex/auth.json" ]; then
+    B=$(sudo -u "$u" -H /home/$u/.local/bin/codex --version 2>/dev/null | head -1)
+    sudo -u "$u" -H sh -c "cd /home/$u && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 \
+      || echo "WARNING: codex update failed for $u"
+    echo "codex[$u]: $${B:-none} -> $(sudo -u "$u" -H /home/$u/.local/bin/codex --version 2>/dev/null | head -1)"
+  fi
+  # Refresh the project list too, so a repo added during the day shows up.
+  /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
+done
+
+for u in colton connor ej; do
+  id "$u" >/dev/null 2>&1 || continue
+  for s in claude-rc codex-rc; do
+    systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
+    systemctl restart "$s@$u" && echo "restarted $s@$u"
+  done
+done
+
+# ndev is deliberately NOT restarted: nothing here changes Next.js, and bouncing it would
+# drop the live site for no reason.
+echo "=== done ==="
+AGENTUPD
+chmod 755 /usr/local/bin/agent-update
+
+cat > /etc/systemd/system/agent-update.service <<'UNIT'
+[Unit]
+Description=Update Claude/Codex and restart the agent services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-update
+UNIT
+
+cat > /etc/systemd/system/agent-update.timer <<'UNIT'
+[Unit]
+Description=Nightly Claude/Codex update
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now agent-update.timer >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- swap
 # 8GB is comfortable for two kids, but each `next dev` compile spikes hard and there are
