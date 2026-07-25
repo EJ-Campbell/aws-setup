@@ -238,7 +238,16 @@ RemainAfterExit=yes
 User=%i
 Environment=HOME=/home/%i
 WorkingDirectory=/home/%i
-ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; CX="/home/%i/.local/bin/codex"; OPTS="-c approval_policy=\\"never\\" -c sandbox_mode=\\"danger-full-access\\""; eval "$CX remote-control start $OPTS" >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do eval "$CX remote-control start $OPTS --json" 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
+# No -c overrides here on purpose. `remote-control start` DISCARDS them: only the bare
+# foreground `codex remote-control` forwards root config overrides. And even if it did
+# forward them they would lose -- the ChatGPT client sends approvalPolicy and sandbox with
+# each thread/start, and codex merges them as
+#   sandbox_mode_override.or(self.sandbox_mode)
+# i.e. client beats config.toml (SessionFlags layer 30 > user config layer 20). Verified
+# on this box: a session rollout recorded approval_policy="on-request" and
+# sandbox_policy=workspace-write while config.toml said never/danger-full-access.
+# The approval mode is the app's to choose; nothing host-side can outrank it.
+ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; CX="/home/%i/.local/bin/codex"; "$CX" remote-control start >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do "$CX" remote-control start --json 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
 ExecStop=-/home/%i/.local/bin/codex remote-control stop
 
 [Install]
@@ -411,6 +420,88 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
   fi
 fi
 command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude install failed"
+
+# ---------------------------------------------------------------- codex sandbox
+# Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor. Codex's sandbox is bwrap,
+# which needs a userns to bring up its loopback interface; it cannot, so EVERY sandboxed
+# command fails and the model asks permission to run outside the sandbox instead. That is
+# the "May I run ... outside the sandbox? The sandbox failed to initialize its loopback
+# interface" prompt, on every single command.
+#
+# Verified on this host with the real bundled binary:
+#   .../codex-resources/bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev /bin/true
+#   -> bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+#
+# Do NOT test this with `unshare` -- it exits 0 here even while bwrap fails, because
+# unconfined shells are exempt from the restriction. Testing unshare is what led me to the
+# wrong conclusion the first time.
+#
+# Turning the restriction off is defensible on this box specifically: the EC2 instance IS
+# the isolation boundary. It holds only these projects, exposes no inbound web ports, and
+# its IAM role can read exactly one S3 object and one secret. Note this re-enables
+# unprivileged userns for every process here, not just codex. 20- beats Ubuntu's own
+# /usr/lib/sysctl.d/10-apparmor.conf, which is the override name Ubuntu recommends.
+if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" != "0" ]; then
+  echo 'kernel.apparmor_restrict_unprivileged_userns = 0' > /etc/sysctl.d/20-apparmor-userns.conf
+  sysctl --system >/dev/null 2>&1 || true
+  echo "userns restriction now: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------- eternal terminal
+# So the phone can reach THIS box directly, not only via the jumpbox. The security group
+# has always opened 2022, but nothing was listening: ET was never installed here, so that
+# rule was open to no purpose and the only way in was plain ssh on 22.
+#
+# Same vendored 7.x build the other dev boxes run (ejc3/EternalTerminal, binaries-7.x),
+# fetched prebuilt rather than compiled -- building ET from source takes minutes on a
+# 2 vCPU box and this script runs on every boot.
+if ! /usr/bin/etserver --version 2>/dev/null | grep -q "7\."; then
+  # The prebuilt binaries are dynamically linked. The metal dev boxes happen to have
+  # protobuf because they build it, but this box never did, so etserver died with
+  # "error while loading shared libraries: libprotobuf.so.32". Install the runtime first
+  # -- the version probe below correctly refuses to install a binary that cannot run, so
+  # without this ET silently never appears.
+  apt-get install -y libprotobuf32t64 libsodium23 >/dev/null 2>&1 || \
+    apt-get install -y libprotobuf32t64 >/dev/null 2>&1 || \
+    echo "WARNING: could not install ET runtime deps"
+  EARCH=$(uname -m)
+  if curl -fsSL --retry 3 "https://github.com/ejc3/EternalTerminal/releases/download/binaries-7.x/et-$EARCH.tar.gz" -o /tmp/et.tgz && [ -s /tmp/et.tgz ]; then
+    if tar xzf /tmp/et.tgz -C /tmp && [ -s /tmp/etserver ]; then
+      # Prove it runs on this box before installing over anything. Check the OUTPUT, not
+      # the exit status: this build prints its version and then aborts non-zero, so
+      # `if /tmp/etserver --version` silently takes the failure branch and skips the
+      # install even though the binary is fine. (dev-selfupdate.tf hit the same trap.)
+      chmod +x /tmp/et /tmp/etserver /tmp/etterminal 2>/dev/null
+      if /tmp/etserver --version 2>&1 </dev/null | grep -q "7\."; then
+        install -m 755 /tmp/et /tmp/etserver /tmp/etterminal /usr/bin/
+      else
+        echo "WARNING: downloaded etserver did not report a 7.x version; leaving ET uninstalled"
+      fi
+    fi
+    rm -f /tmp/et.tgz /tmp/et /tmp/etserver /tmp/etterminal
+  else
+    echo "WARNING: could not fetch Eternal Terminal binary"
+  fi
+fi
+
+if [ -x /usr/bin/etserver ]; then
+cat > /etc/systemd/system/etserver.service <<'UNIT'
+[Unit]
+Description=Eternal Terminal Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etserver --port 2022
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now etserver.service 2>/dev/null || true
+fi
 curl -fsSL --retry 3 https://raw.githubusercontent.com/ejc3/t-claude/main/nosync-wrap -o /tmp/nw \
   && [ -s /tmp/nw ] && install -m 755 /tmp/nw /usr/local/bin/nosync-wrap && rm -f /tmp/nw
 
