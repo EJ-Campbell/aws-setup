@@ -96,9 +96,13 @@ session = project group, window = project, pane = your splits. **t-claude organi
 linked-view displays.**
 
 ## Where it lives
-- `t-claude.zsh` — the function itself (this repo, editable).
-- `dev-user-data.tf` → `local.shell_setup` writes `~/.tmux.conf` and decodes
-  `base64encode(file("t-claude.zsh"))` to `~/.config/t-claude.zsh` (sourced from `~/.zshrc`)
-  on every box. `local.tclaude_b64` is the base64 (base64 so terraform never touches the
-  function's `${...}`).
-- The running jumpbox + dev boxes already have it; recreated boxes inherit it from terraform.
+- **`t-claude.zsh` and `nosync-wrap` now live in their own repo:
+  [github.com/ejc3/t-claude](https://github.com/ejc3/t-claude).** They used to be vendored
+  here; see `t-claude.MOVED.md`. Edit them there, not in this repo.
+- `dev-user-data.tf` → `local.shell_setup` writes `~/.tmux.conf` and **fetches**
+  `t-claude.zsh` (→ `~/.config/t-claude.zsh`, sourced from `~/.zshrc`) and `nosync-wrap`
+  (→ `/usr/local/bin`) from the raw GitHub URLs at boot. The fetch is guarded (non-empty
+  check) and non-fatal: on failure the source line no-ops and t-claude falls back to bare
+  claude.
+- The running jumpbox + dev boxes already have it; recreated boxes fetch it on setup, and
+  the self-update service re-fetches so boxes track the repo's `main`.
