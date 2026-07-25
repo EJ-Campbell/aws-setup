@@ -103,6 +103,60 @@ resource "cloudflare_zero_trust_access_identity_provider" "onetimepin" {
   config     = {}
 }
 
+# ---------------------------------------------------------------------------------
+# Optional: "Sign in with Google" as a second login method.
+#
+# WHY THIS IS NOT ON BY DEFAULT: Cloudflare's generic "google" IdP is not a checkbox --
+# it needs an OAuth 2.0 client created in Google Cloud Console, which can only be done
+# in a browser signed in as the Google account. So it cannot be bootstrapped from here.
+# One-time PIN above needs nothing and already works, hence it stays as the fallback.
+#
+# The two IdPs coexist: the login page lists both, so turning this on cannot lock anyone
+# out, and turning it back off leaves OTP still working.
+#
+# TO ENABLE:
+#   1. console.cloud.google.com -> new project -> APIs & Services -> Credentials
+#      -> Create OAuth client ID -> Web application
+#   2. Authorized redirect URI (exactly, no trailing slash):
+#        https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback
+#      NOTE: this is the ORG AUTH DOMAIN, which is not the same as the org display name
+#      ("white-base-038e.cloudflareaccess.com"). Using the display name silently produces
+#      redirect_uri_mismatch at login time.
+#   3. On the OAuth consent screen pick "External" and add the three addresses in
+#      var.dev_allowed_emails as test users. Google only requires app verification for
+#      apps serving users beyond the test list, so a named handful stays unverified and
+#      still works -- they just see an "unverified app" interstitial once.
+#   4. Store both halves, then flip the variable:
+#        aws secretsmanager create-secret --name cloudflare-google-idp --region us-west-1 \
+#          --secret-string '{"client_id":"...","client_secret":"..."}'
+#        terraform apply -var enable_google_login=true
+#
+# Access still authorizes on the email allowlist in the policy below, identically for
+# either provider -- the IdP only proves the address, it never grants access by itself.
+# ---------------------------------------------------------------------------------
+variable "enable_google_login" {
+  description = "Offer 'Sign in with Google' alongside one-time PIN. Requires the cloudflare-google-idp secret; see the steps above."
+  type        = bool
+  default     = false
+}
+
+data "aws_secretsmanager_secret_version" "google_idp" {
+  count     = var.enable_google_login ? 1 : 0
+  secret_id = "cloudflare-google-idp"
+}
+
+resource "cloudflare_zero_trust_access_identity_provider" "google" {
+  count      = var.enable_google_login ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "Google"
+  type       = "google"
+
+  config = {
+    client_id     = jsondecode(data.aws_secretsmanager_secret_version.google_idp[0].secret_string)["client_id"]
+    client_secret = jsondecode(data.aws_secretsmanager_secret_version.google_idp[0].secret_string)["client_secret"]
+  }
+}
+
 resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
   account_id       = var.cloudflare_account_id
   name             = "cc-games dev servers"
