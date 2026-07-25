@@ -183,6 +183,18 @@ resource "aws_instance" "nextjs_dev" {
   }
 }
 
+locals {
+  # Root volume of the Next.js box, for AWS Backup. It holds everything that is NOT
+  # reproducible from terraform: both kids' projects and git history, their separate
+  # GitHub logins, and the Claude and Codex credentials. Losing it means redoing every
+  # login by hand, so it needs the same protection as the other dev volumes.
+  #
+  # Resolved from the instance rather than hardcoded like the metal boxes' volumes: a spot
+  # replacement mints a new volume id, and a hardcoded ARN would keep backing up the old
+  # detached one while the live disk silently went unprotected.
+  nextjs_root_volume_arn = var.enable_nextjs_dev ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.nextjs_dev[0].root_block_device[0].volume_id}" : ""
+}
+
 resource "aws_eip" "nextjs_dev" {
   count  = var.enable_nextjs_dev ? 1 : 0
   domain = "vpc"

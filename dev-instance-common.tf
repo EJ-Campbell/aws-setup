@@ -601,8 +601,11 @@ resource "aws_backup_selection" "dev_servers" {
   plan_id      = aws_backup_plan.dev_servers.id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
-  resources = [
+  # compact() drops the Next.js entry when that box is disabled, rather than passing an
+  # empty string that AWS Backup rejects as a malformed ARN.
+  resources = compact([
     local.arm_persistent_volume_arn,
-    local.x86_persistent_volume_arn
-  ]
+    local.x86_persistent_volume_arn,
+    local.nextjs_root_volume_arn,
+  ])
 }

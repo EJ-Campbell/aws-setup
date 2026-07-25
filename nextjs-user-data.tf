@@ -238,7 +238,7 @@ RemainAfterExit=yes
 User=%i
 Environment=HOME=/home/%i
 WorkingDirectory=/home/%i
-ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; /home/%i/.local/bin/codex remote-control start >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do /home/%i/.local/bin/codex remote-control start --json 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
+ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; CX="/home/%i/.local/bin/codex"; OPTS="-c approval_policy=\\"never\\" -c sandbox_mode=\\"danger-full-access\\""; eval "$CX remote-control start $OPTS" >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do eval "$CX remote-control start $OPTS --json" 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
 ExecStop=-/home/%i/.local/bin/codex remote-control stop
 
 [Install]
