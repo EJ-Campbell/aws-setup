@@ -176,8 +176,12 @@ sysctl -p /etc/sysctl.d/99-fcvm.conf \
 PODMANSYS
 
   # Interactive shell setup: starship, fzf, atuin, zsh plugins, .zshrc (identical on both arches)
-  shell_setup = <<-SHELLSETUP
-sudo -u ubuntu bash << 'SHELL'
+  # Per-user interactive shell environment: starship, fzf, atuin, zsh plugins, .zshrc,
+  # .tmux.conf and t-claude. Deliberately user-AGNOSTIC -- every path is ~-relative, so
+  # the same body sets up whichever account runs it. dev boxes run it for ubuntu; the
+  # Next.js box runs it for every account (ubuntu, ej, colton, connor) so each kid gets
+  # the same shell, history and t-claude without duplicating any of it here.
+  user_shell_env = <<-USERENV
 set -e
 mkdir -p ~/.local/bin ~/.config ~/.zsh
 curl -sS https://starship.rs/install.sh | sh -s -- -y -b ~/.local/bin
@@ -305,10 +309,18 @@ else
   echo "WARNING: could not fetch t-claude.zsh from $TCRAW (keeping any existing copy)"
 fi
 if curl -fsSL --retry 3 "$TCRAW/nosync-wrap" -o /tmp/nosync-wrap && [ -s /tmp/nosync-wrap ]; then
-  sudo install -m 755 /tmp/nosync-wrap /usr/local/bin/nosync-wrap && rm -f /tmp/nosync-wrap
+  # `|| true`: on multi-user boxes the non-admin accounts have no general sudo, and the
+  # binary is installed once as root anyway -- a failure here must not abort their setup.
+  sudo install -m 755 /tmp/nosync-wrap /usr/local/bin/nosync-wrap 2>/dev/null || true
+  rm -f /tmp/nosync-wrap
 else
   echo "WARNING: could not fetch nosync-wrap from $TCRAW (native scrollback may be off)"
 fi
+USERENV
+
+  shell_setup = <<-SHELLSETUP
+sudo -u ubuntu bash << 'SHELL'
+${local.user_shell_env}
 SHELL
 chsh -s /usr/bin/zsh ubuntu
 SHELLSETUP
