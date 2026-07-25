@@ -162,15 +162,31 @@ UNIT
 # piping it anywhere makes it fall into --print mode and exit. systemd gives a service no
 # pty, so it runs inside tmux, on a dedicated socket so it never collides with the
 # interactive t-claude session the kid may also have open.
+# Where the agents should sit: the project the user actually published, so that the thing
+# being served and the thing being edited are the same directory by construction. Falls
+# back to $HOME, which matters on a fresh box -- before anyone has run ndev there is no
+# project, and a unit pointed at a non-existent directory refuses to start at all.
+cat > /usr/local/bin/agent-dir <<'ADIR'
+#!/bin/bash
+WHO="$1"
+ENVF="/var/lib/ndev/$WHO.env"
+DIR=""
+[ -f "$ENVF" ] && . "$ENVF"
+[ -n "$DIR" ] && [ -d "$DIR" ] || DIR="/home/$WHO"
+printf '%s\n' "$DIR"
+ADIR
+chmod 755 /usr/local/bin/agent-dir
+
 cat > /usr/local/bin/agents-start <<'AGENTS'
 #!/bin/bash
 set -euo pipefail
 WHO="$1"
 export HOME="/home/$WHO"
-cd "$HOME"
+WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
+cd "$WORKDIR"
 TM="/usr/local/bin/tmux -L agents"
 $TM has-session -t claude 2>/dev/null && exit 0
-$TM new-session -d -s claude -c "$HOME" \
+$TM new-session -d -s claude -c "$WORKDIR" \
   "claude --dangerously-skip-permissions --remote-control; exec bash -l"
 AGENTS
 chmod 755 /usr/local/bin/agents-start
@@ -222,7 +238,7 @@ RemainAfterExit=yes
 User=%i
 Environment=HOME=/home/%i
 WorkingDirectory=/home/%i
-ExecStart=/bin/sh -c '/home/%i/.local/bin/codex remote-control start >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do /home/%i/.local/bin/codex remote-control start --json 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
+ExecStart=/bin/sh -c 'cd "$(/usr/local/bin/agent-dir %i)" || cd /home/%i; /home/%i/.local/bin/codex remote-control start >/dev/null 2>&1 || true; for i in 1 2 3 4 5; do /home/%i/.local/bin/codex remote-control start --json 2>/dev/null | grep -q "\\"status\\":\\"connected\\"" && exit 0; sleep 5; done; exit 1'
 ExecStop=-/home/%i/.local/bin/codex remote-control stop
 
 [Install]
@@ -341,6 +357,32 @@ for u in ${join(" ", local.nextjs_users)}; do
   # releases/ but BEFORE creating current/ -- leaving a half-install that looks plausible.
   CODEX_STANDALONE="/home/$u/.codex/packages/standalone/current/codex"
   [ -x "$CODEX_STANDALONE" ] || sudo -u "$u" -H sh -c "cd /home/$u && curl -fsSL https://chatgpt.com/codex/install.sh | sh" >/dev/null 2>&1 || true
+
+  # Codex's counterpart to Claude's --dangerously-skip-permissions. Deliberate: the EC2
+  # instance IS the sandbox. It holds nothing but these projects, has no inbound web
+  # ports, and its IAM role can read exactly one S3 object and one secret -- so a second
+  # sandbox inside it buys approval prompts and no real containment. Codex's own help
+  # says this mode is "intended solely for running in environments that are externally
+  # sandboxed", which is this.
+  #
+  # Edited in place rather than appended: config.toml ends with [projects."..."] sections,
+  # so a naive >> would bury these keys INSIDE a section and silently not apply. Missing
+  # keys are inserted at line 1, above any section header.
+  CFG="/home/$u/.codex/config.toml"
+  if [ -f "$CFG" ]; then
+    sed -i 's|^ *approval_policy *=.*|approval_policy = "never"|' "$CFG"
+    sed -i 's|^ *sandbox_mode *=.*|sandbox_mode = "danger-full-access"|' "$CFG"
+    grep -q '^approval_policy' "$CFG" || sed -i '1i approval_policy = "never"' "$CFG"
+    grep -q '^sandbox_mode' "$CFG" || sed -i '1i sandbox_mode = "danger-full-access"' "$CFG"
+  else
+    install -d -o "$u" -g "$u" -m 700 "/home/$u/.codex"
+    printf 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n' > "$CFG"
+  fi
+  # Pre-trust the published project so it never stops to ask on first use.
+  PDIR=$(/usr/local/bin/agent-dir "$u" 2>/dev/null || echo "/home/$u")
+  grep -qF "[projects.\"$PDIR\"]" "$CFG" 2>/dev/null || \
+    printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$PDIR" >> "$CFG"
+  chown "$u:$u" "$CFG" 2>/dev/null || true
   { [ -s "/home/$u/.codex/auth.json" ] && [ -x "$CODEX_STANDALONE" ]; } && systemctl enable --now "codex-rc@$u.service" 2>/dev/null || true
   # Re-enable a previously published project (ndev-register wrote the env file).
   [ -s "/var/lib/ndev/$u.env" ] && systemctl enable --now "ndev@$u.service" 2>/dev/null || true
