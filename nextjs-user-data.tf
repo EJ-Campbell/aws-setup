@@ -748,6 +748,41 @@ USERSHELL
   chsh -s /usr/bin/zsh "$u" 2>/dev/null || true
 done
 
+# ---------------------------------------------------------------- git identity
+# Derived from `gh api user`, never hardcoded, so it cannot drift from the account that is
+# actually logged in.
+#
+# WHY THIS MATTERS: without user.name/user.email git refuses to commit at all --
+# "Author identity unknown / Please tell me who you are". An agent that hits this reports
+# it as "you are not logged in to GitHub", which sends you looking at `gh auth` (which is
+# fine) instead of at git config. Both kids had working gh auth AND a working credential
+# helper and still could not commit.
+#
+# Uses GitHub's noreply address (<id>+<login>@users.noreply.github.com) so commits still
+# attribute to their accounts without publishing a child's real email address in public
+# commit history. Any per-repo override is cleared for the same reason -- a local
+# user.email silently wins over this and re-exposes the real address.
+for u in ${join(" ", local.nextjs_users)}; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  GH_ID=$(sudo -u "$u" -H env HOME="/home/$u" gh api user --jq '.id' 2>/dev/null)
+  GH_LOGIN=$(sudo -u "$u" -H env HOME="/home/$u" gh api user --jq '.login' 2>/dev/null)
+  GH_NAME=$(sudo -u "$u" -H env HOME="/home/$u" gh api user --jq '.name // .login' 2>/dev/null)
+  if [ -n "$GH_ID" ] && [ -n "$GH_LOGIN" ]; then
+    sudo -u "$u" -H env HOME="/home/$u" git config --global user.name "$GH_NAME"
+    sudo -u "$u" -H env HOME="/home/$u" git config --global user.email "$GH_ID+$GH_LOGIN@users.noreply.github.com"
+    # git needs a credential helper of its own; gh being authenticated is not enough.
+    sudo -u "$u" -H env HOME="/home/$u" gh auth setup-git >/dev/null 2>&1 || true
+    for r in /home/$u/*/; do
+      [ -d "$r/.git" ] || continue
+      sudo -u "$u" -H env HOME="/home/$u" git -C "$r" config --unset user.email 2>/dev/null || true
+      sudo -u "$u" -H env HOME="/home/$u" git -C "$r" config --unset user.name 2>/dev/null || true
+    done
+    echo "git identity[$u]: $GH_NAME <$GH_ID+$GH_LOGIN@users.noreply.github.com>"
+  else
+    echo "git identity[$u]: not logged in to gh yet -- run 'gh auth login'"
+  fi
+done
+
 # GitHub CLI, so each user can `gh auth login` under their own account
 if ! command -v gh >/dev/null 2>&1; then
   curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
