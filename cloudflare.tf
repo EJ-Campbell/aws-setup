@@ -104,40 +104,51 @@ resource "cloudflare_zero_trust_access_identity_provider" "onetimepin" {
 }
 
 # ---------------------------------------------------------------------------------
-# Optional: "Sign in with Google" as a second login method.
+# "Sign in with Google" -- the primary login method. One click for anyone already signed
+# in to Google in their browser, which is the whole point for the kids' accounts.
 #
-# WHY THIS IS NOT ON BY DEFAULT: Cloudflare's generic "google" IdP is not a checkbox --
-# it needs an OAuth 2.0 client created in Google Cloud Console, which can only be done
-# in a browser signed in as the Google account. So it cannot be bootstrapped from here.
-# One-time PIN above needs nothing and already works, hence it stays as the fallback.
+# The OAuth client itself lives in Google Cloud Console and CANNOT be created from
+# terraform -- it needs an interactive browser session as the Google account. So this
+# resource consumes credentials that were made by hand once; the secret is the only
+# manual artifact in the whole cc-games setup.
 #
-# The two IdPs coexist: the login page lists both, so turning this on cannot lock anyone
-# out, and turning it back off leaves OTP still working.
+#   redirect URI configured on the Google client:
+#     https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback
 #
-# TO ENABLE:
-#   1. console.cloud.google.com -> new project -> APIs & Services -> Credentials
-#      -> Create OAuth client ID -> Web application
-#   2. Authorized redirect URI (exactly, no trailing slash):
-#        https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback
-#      NOTE: this is the ORG AUTH DOMAIN, which is not the same as the org display name
-#      ("white-base-038e.cloudflareaccess.com"). Using the display name silently produces
-#      redirect_uri_mismatch at login time.
-#   3. On the OAuth consent screen pick "External" and add the three addresses in
-#      var.dev_allowed_emails as test users. Google only requires app verification for
-#      apps serving users beyond the test list, so a named handful stays unverified and
-#      still works -- they just see an "unverified app" interstitial once.
-#   4. Store both halves, then flip the variable:
-#        aws secretsmanager create-secret --name cloudflare-google-idp --region us-west-1 \
-#          --secret-string '{"client_id":"...","client_secret":"..."}'
-#        terraform apply -var enable_google_login=true
+#   That is the org AUTH DOMAIN, which is NOT the org display name
+#   ("white-base-038e.cloudflareaccess.com"). Getting this wrong is invisible until a
+#   user actually tries to log in, then fails with redirect_uri_mismatch.
+#
+#   To check the Google side WITHOUT a browser or anyone's password -- ask Google to
+#   authorize and read the error it hands back. A registered URI redirects on toward a
+#   sign-in page; an unregistered one comes back with authError:
+#
+#     CID=$(aws secretsmanager get-secret-value --secret-id cloudflare-google-idp \
+#            --region us-west-1 --query SecretString --output text | jq -r .client_id)
+#     curl -s -o /dev/null -w '%{redirect_url}\n' \
+#       "https://accounts.google.com/o/oauth2/v2/auth?client_id=$CID&response_type=code&scope=openid%20email&redirect_uri=https%3A%2F%2Fejc3.cloudflareaccess.com%2Fcdn-cgi%2Faccess%2Fcallback"
+#
+#   The authError payload is base64 and decodes to the real reason. "invalid_client"
+#   means the client id is wrong; "redirect_uri_mismatch" means the id is fine and only
+#   the URI is unregistered. Google also takes 5 minutes to a few hours to propagate
+#   console changes, so a fresh edit can read as mismatched for a while.
+#
+#   The consent screen is "External" with var.dev_allowed_emails as test users. Google
+#   only demands app verification once an app serves users beyond that list, so a named
+#   handful stays unverified and works -- with a one-time "unverified app" interstitial.
+#
+# ONE-TIME PIN IS DELIBERATELY LEFT IN PLACE alongside this. Both providers are offered
+# on the login page, so a broken or expired OAuth client degrades to "type your email,
+# get a code" rather than locking everyone out of every dev server at once.
 #
 # Access still authorizes on the email allowlist in the policy below, identically for
-# either provider -- the IdP only proves the address, it never grants access by itself.
+# either provider -- an IdP only proves the address, it never grants access by itself.
+# So adding a login method does not widen who can get in.
 # ---------------------------------------------------------------------------------
 variable "enable_google_login" {
-  description = "Offer 'Sign in with Google' alongside one-time PIN. Requires the cloudflare-google-idp secret; see the steps above."
+  description = "Offer 'Sign in with Google' alongside one-time PIN. Needs the cloudflare-google-idp secret (client_id + client_secret)."
   type        = bool
-  default     = false
+  default     = true
 }
 
 data "aws_secretsmanager_secret_version" "google_idp" {
