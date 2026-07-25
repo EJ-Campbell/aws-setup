@@ -107,6 +107,92 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 
+# ---------------------------------------------------------------- session pointer
+# ~/Documents/Codex is the parent of every remote-control session's scratch directory
+# (~/Documents/Codex/<date>/<task-name>/), and codex reads AGENTS.md by walking UP from its
+# cwd -- so a file here reaches sessions the host cannot otherwise configure. Together with
+# writable_roots it is the only lever over app-created sessions.
+#
+# GENERATED, not static: this box carries ~26 repositories and the interesting ones change.
+# A hardcoded project list would be wrong within weeks, so it is rebuilt from what is
+# actually on disk, newest first. Regenerate any time with `codex-agents-refresh`.
+cat > /usr/local/bin/codex-agents-refresh <<'GENAGENTS'
+#!/bin/bash
+# Rebuild ~/Documents/Codex/AGENTS.md from the repos currently on this box.
+set -uo pipefail
+OUT=/home/ubuntu/Documents/Codex/AGENTS.md
+install -d -o ubuntu -g ubuntu -m 755 /home/ubuntu/Documents/Codex
+TMP=$(mktemp)
+{
+  cat <<'HEAD'
+# Read this first
+
+You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.
+**That folder is not a project and is not where the work is.**
+
+This machine is a development server with many repositories. There is no single default
+project, so unless the task names one, ask which repository to work in rather than
+guessing or working in the scratch directory.
+
+## Repositories
+
+Checked out under `/home/ubuntu/`, most recently committed first:
+
+HEAD
+  for d in /home/ubuntu/*/; do
+    [ -d "$d/.git" ] || continue
+    n=$(basename "$d")
+    case "$n" in actions-runner*) continue ;; esac
+    ts=$(git -C "$d" log -1 --format=%ct 2>/dev/null) || continue
+    date=$(git -C "$d" log -1 --format=%cd --date=short 2>/dev/null)
+    remote=$(git -C "$d" remote get-url origin 2>/dev/null | sed 's|https://github.com/||;s|git@github.com:||;s|\.git$||')
+    printf '%s|%s|%s|%s\n' "$${ts:-0}" "$n" "$date" "$${remote:-no remote}"
+  done | sort -rn | head -14 | while IFS='|' read -r _ n date remote; do
+    printf -- '- `~/%s` — %s (last commit %s)\n' "$n" "$remote" "$date"
+  done
+  cat <<'TAIL'
+
+Repositories under `github.com/ejc3/` are the user's own. Others are upstream forks —
+treat those as read-only unless explicitly asked to change them.
+
+## This machine
+
+- `fcvm-metal-arm`: 64 vCPU ARM64 bare metal, running a custom nested-virtualisation
+  kernel. Build in parallel — `make -j$(nproc)` and `cargo build -j$(nproc)` are expected.
+- You have **full passwordless sudo**. The VM is the isolation boundary, so install
+  whatever you need.
+- It is a **spot instance**: it can be reclaimed and restarted at any time. Anything not
+  committed and pushed can disappear. Push work in progress to a branch rather than
+  leaving it only on disk.
+- `/home/ubuntu` is on a persistent EBS volume, backed up daily. **`/mnt/fcvm-btrfs` is
+  instance NVMe and is wiped on stop/start** — use it for build caches and VM images, never
+  for anything you cannot regenerate.
+
+## Other machines
+
+Reachable from here as `ubuntu` with a dedicated hop key, no password:
+
+```bash
+ssh nextjs      # the kids' Next.js box (cc-games.dev)
+ssh fcvm-x86    # x86 metal dev server
+```
+
+There is deliberately **no key to the jumpbox** on this machine. Do not try to add one.
+
+## Long jobs
+
+Builds and test suites here can run for many minutes. Run them under `tmux` or `nohup` so
+they survive your session ending, and avoid unbounded recursive searches over `/home/ubuntu`
+— it holds multiple kernel trees and node_modules directories.
+TAIL
+} > "$TMP"
+install -m 644 -o ubuntu -g ubuntu "$TMP" "$OUT"
+rm -f "$TMP"
+echo "codex: wrote $OUT ($(wc -c < "$OUT") bytes)"
+GENAGENTS
+chmod 755 /usr/local/bin/codex-agents-refresh
+/usr/local/bin/codex-agents-refresh || true
+
 # Guarded on credentials: on a fresh box nobody has logged in to Codex yet, and enabling
 # the unit then would just fail on every boot until someone does.
 if [ -s /home/ubuntu/.codex/auth.json ] && [ -x "$CODEX_STANDALONE" ]; then
