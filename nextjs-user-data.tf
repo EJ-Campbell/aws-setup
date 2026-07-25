@@ -421,6 +421,12 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
 fi
 command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude install failed"
 
+# ---------------------------------------------------------------- dev-server hops
+# Runs as root (it installs into /home/ubuntu as the ubuntu user) and only touches the
+# ubuntu account -- colton and connor get no key to the Firecracker boxes, and cannot read
+# /home/ubuntu anyway since it is 0700.
+${local.dev_hop_setup}
+
 # ---------------------------------------------------------------- codex sandbox
 # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor. Codex's sandbox is bwrap,
 # which needs a userns to bring up its loopback interface; it cannot, so EVERY sandboxed

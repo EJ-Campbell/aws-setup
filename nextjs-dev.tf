@@ -29,9 +29,9 @@ variable "enable_nextjs_dev" {
 }
 
 variable "nextjs_instance_type" {
-  description = "t4g.large: 2 vCPU / 8GB Graviton, burstable. Enough for a handful of `next dev` processes (~0.5-1GB each)."
+  description = "t4g.medium: 2 vCPU / 4GB Graviton, burstable. Holds two `next dev` processes plus Claude and Codex per kid; the 4GB swapfile absorbs compile spikes."
   type        = string
-  default     = "t4g.large"
+  default     = "t4g.medium"
 }
 
 variable "nextjs_volume_size" {
@@ -74,11 +74,25 @@ resource "aws_iam_role_policy" "nextjs_dev" {
         Resource = "${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs.sh"
       },
       {
-        # The tunnel credential only. Scoped to this one secret, not the whole store.
-        Sid      = "ReadCloudflareTunnelCredential"
+        # Two secrets, named individually rather than by a broad prefix.
+        Sid    = "ReadOwnSecrets"
+        Effect = "Allow"
+        Action = "secretsmanager:GetSecretValue"
+        Resource = [
+          "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-tunnel-*",
+          # Hop key for reaching the other dev servers. Grants nothing beyond them: its
+          # public half is never installed on the jumpbox. See dev-hop-key.tf.
+          aws_secretsmanager_secret.dev_hop.arn,
+        ]
+      },
+      {
+        # devhop-refresh resolves the other dev servers' private IPs at boot, because they
+        # are spot instances and a reclaim changes the address. Read-only, and Describe*
+        # cannot be resource-scoped in EC2.
+        Sid      = "DescribeInstancesForHopAliases"
         Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-tunnel-*"
+        Action   = "ec2:DescribeInstances"
+        Resource = "*"
       }
     ]
   })
@@ -128,15 +142,20 @@ resource "aws_instance" "nextjs_dev" {
   vpc_security_group_ids = [aws_security_group.nextjs_dev.id]
   iam_instance_profile   = aws_iam_instance_profile.nextjs_dev.name
 
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      # Same shape as the other dev boxes: stop (not terminate) on interruption so the
-      # persistent root volume -- and every project on it -- survives.
-      spot_instance_type             = "persistent"
-      instance_interruption_behavior = "stop"
-    }
-  }
+  # ON-DEMAND, deliberately. This box ran as spot until 2026-07-25, when it was reclaimed
+  # SIX times in one day and then could not come back at all:
+  #   spot request status: capacity-not-available
+  #   "There is no Spot capacity available that matches your request."
+  # The kids' URLs were simply down, with no ETA. Spot placement score for this shape was
+  # 3/10 in every US region and for every alternative instance type (t4g/m7g/m6g/c7g/c6g,
+  # even x86 t3), so neither moving region nor changing family was a way out.
+  #
+  # The systemd units still matter and are not made redundant by this: on-demand instances
+  # reboot for host maintenance and kernel updates too. This changes how OFTEN the box goes
+  # away, not whether it comes back cleanly.
+  #
+  # Sized down from large to medium at the same time, so the durable option costs about
+  # what the unreliable one did (~$29/mo vs ~$24/mo spot) rather than $58/mo.
 
   root_block_device {
     volume_size           = var.nextjs_volume_size

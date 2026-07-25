@@ -108,9 +108,22 @@ REFRESH
   chmod 755 /usr/local/bin/devhop-refresh
   /usr/local/bin/devhop-refresh || true
 
+  # Include must be the FIRST line: ssh takes the first value it sees for any keyword, so
+  # an Include placed after an existing `Host *` block would be shadowed by it.
+  #
+  # Prepend with cat, NOT `sed -i '1i'` -- sed's insert is a no-op on an empty file (there
+  # is no line 1 to insert before). That silently did nothing on the Next.js box, whose
+  # config had just been created empty, while working on the metal box whose config already
+  # had content. The failure mode is invisible: the aliases file exists and looks right,
+  # but ssh never reads it.
   touch /home/ubuntu/.ssh/config
-  grep -qxF "Include ~/.ssh/config.d-devhop" /home/ubuntu/.ssh/config 2>/dev/null || \
-    sed -i '1i Include ~/.ssh/config.d-devhop' /home/ubuntu/.ssh/config
+  if ! grep -qxF "Include ~/.ssh/config.d-devhop" /home/ubuntu/.ssh/config 2>/dev/null; then
+    TMPCFG=$(mktemp)
+    printf 'Include ~/.ssh/config.d-devhop\n\n' > "$TMPCFG"
+    cat /home/ubuntu/.ssh/config >> "$TMPCFG"
+    cat "$TMPCFG" > /home/ubuntu/.ssh/config
+    rm -f "$TMPCFG"
+  fi
   chown ubuntu:ubuntu /home/ubuntu/.ssh/config
   chmod 600 /home/ubuntu/.ssh/config
 

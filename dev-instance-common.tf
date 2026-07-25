@@ -114,10 +114,15 @@ resource "aws_iam_role_policy" "dev_server" {
         ]
       },
       {
-        Sid      = "SecretsManagerGitHubPAT"
-        Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
-        Resource = "arn:aws:secretsmanager:us-west-1:928413605543:secret:github-pat-ejc3*"
+        Sid    = "SecretsManagerGitHubPAT"
+        Effect = "Allow"
+        Action = "secretsmanager:GetSecretValue"
+        Resource = [
+          "arn:aws:secretsmanager:us-west-1:928413605543:secret:github-pat-ejc3*",
+          # Dev-server-to-dev-server hop key. Reaches only other dev boxes -- it is
+          # deliberately not authorized on the jumpbox. See dev-hop-key.tf.
+          aws_secretsmanager_secret.dev_hop.arn,
+        ]
       },
       {
         Sid    = "EC2ReadOnly"

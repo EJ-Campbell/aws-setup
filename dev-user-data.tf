@@ -323,6 +323,12 @@ sudo -u ubuntu bash << 'SHELL'
 ${local.user_shell_env}
 SHELL
 chsh -s /usr/bin/zsh ubuntu
+
+# Dev-server-to-dev-server hops. Also DELETES ~/.ssh/fcvm-ec2 from this box: that is the
+# jumpbox's key, nothing here used it (runner access goes via ~/.ssh/runner_key), and its
+# presence meant anything able to read the file could SSH to the jumpbox -- where the AWS
+# admin session lives -- from a box that runs agents with --dangerously-skip-permissions.
+${local.dev_hop_setup}
 SHELLSETUP
 
   # ARM dev server (c7gd.metal) full setup script
