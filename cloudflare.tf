@@ -217,9 +217,67 @@ resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
   # The policy attachment MUST be declared here. Leaving it out makes terraform drop the
   # link on the next apply -- which would leave every *.cc-games.dev hostname reachable
   # with no Google login at all. Caught by reading the plan before applying.
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.cc_games_allowed.id
-    precedence = 1
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.cc_games_allowed.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.cc_games_service.id
+      precedence = 2
+    },
+  ]
+}
+
+# ---------------------------------------------------------------------------------
+# Service token: non-interactive access, for anything that cannot sit through a Google
+# login -- scripts, health checks, or an agent that wants to fetch the running site.
+#
+# It is a client id + secret pair sent as CF-Access-Client-Id / CF-Access-Client-Secret
+# headers. Cloudflare validates them at the edge and skips the IdP entirely.
+#
+# SECURITY: this is a bearer credential that bypasses the Gmail allowlist completely.
+# Anyone holding it reaches every *.cc-games.dev host. It is therefore:
+#   - kept in its own policy with decision = "non_identity", so it is auditable
+#     separately from the humans rather than hidden inside the allow rule
+#   - written to Secrets Manager, never to disk or the repo
+#   - given a finite lifetime so a leak expires on its own
+# Revoke by deleting the resource; `terraform apply` invalidates it immediately.
+resource "cloudflare_zero_trust_access_service_token" "cc_games_automation" {
+  account_id = var.cloudflare_account_id
+  name       = "cc-games-automation"
+
+  # Cloudflare only returns client_secret at creation. terraform keeps it in state, and
+  # the copy in Secrets Manager below is what anything else should read.
+  duration = "8760h" # 1 year
+}
+
+resource "aws_secretsmanager_secret" "cc_games_service_token" {
+  name        = "cc-games-access-service-token"
+  description = "Cloudflare Access service token for non-interactive access to *.cc-games.dev"
+  tags        = { Name = "cc-games-access-service-token", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "cc_games_service_token" {
+  secret_id = aws_secretsmanager_secret.cc_games_service_token.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.cc_games_automation.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.cc_games_automation.client_secret
+  })
+}
+
+# Separate policy, NOT folded into the human allowlist. decision = "non_identity" is what
+# tells Access to accept a service token instead of requiring a logged-in user.
+resource "cloudflare_zero_trust_access_policy" "cc_games_service" {
+  account_id       = var.cloudflare_account_id
+  name             = "automation service token"
+  decision         = "non_identity"
+  session_duration = "24h"
+
+  include = [{
+    service_token = {
+      token_id = cloudflare_zero_trust_access_service_token.cc_games_automation.id
+    }
   }]
 }
 

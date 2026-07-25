@@ -334,19 +334,29 @@ for u in ${join(" ", local.nextjs_users)}; do
   chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
   chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
 
-  # Publishing a hostname, plus control of ONLY their own three units. Each systemctl verb
-  # is spelled out with the unit name baked in rather than allowing `systemctl *`, which
-  # would let any of them stop cloudflared or restart another kid's server.
-  {
-    echo "$u ALL=(root) NOPASSWD: /usr/local/bin/ndev-register"
-    for unit in "ndev@$u" "claude-rc@$u" "codex-rc@$u"; do
-      for verb in start stop restart status; do
-        echo "$u ALL=(root) NOPASSWD: /usr/bin/systemctl $verb $unit.service"
-      done
-    done
-  } > "/etc/sudoers.d/ndev-$u"
-  chmod 440 "/etc/sudoers.d/ndev-$u"
-  visudo -cf "/etc/sudoers.d/ndev-$u" >/dev/null || rm -f "/etc/sudoers.d/ndev-$u"
+  # FULL passwordless sudo, deliberately.
+  #
+  # This box IS the sandbox: it holds nothing but these projects, exposes no inbound web
+  # ports, and its IAM role can read exactly one S3 object and two secrets. There is
+  # nothing here worth protecting the kids from, and no credential they could reach that
+  # they do not already own.
+  #
+  # The earlier version allowed only ndev-register plus their own three systemd units.
+  # That looked tidy and cost real work: `sudo npx playwright install-deps` failed, so
+  # Chromium could not launch, and an agent working in their account hits a wall it cannot
+  # explain or escape. Every such wall becomes a support request rather than a safeguard.
+  #
+  # The protections that actually matter are elsewhere and unaffected: Cloudflare Access
+  # still gates every URL, the instance still has no inbound web ports, and the jumpbox
+  # key is no longer on any dev server.
+  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$u" > "/etc/sudoers.d/ndev-$u.new"
+  if visudo -cf "/etc/sudoers.d/ndev-$u.new" >/dev/null 2>&1; then
+    mv "/etc/sudoers.d/ndev-$u.new" "/etc/sudoers.d/ndev-$u"
+    chmod 440 "/etc/sudoers.d/ndev-$u"
+  else
+    rm -f "/etc/sudoers.d/ndev-$u.new"
+    echo "WARNING: sudoers for $u failed validation; leaving previous file in place"
+  fi
 
   # Let their user services and tmux survive logout / start without a login session.
   loginctl enable-linger "$u" 2>/dev/null || true
@@ -391,6 +401,44 @@ for u in ${join(" ", local.nextjs_users)}; do
   PDIR=$(/usr/local/bin/agent-dir "$u" 2>/dev/null || echo "/home/$u")
   grep -qF "[projects.\"$PDIR\"]" "$CFG" 2>/dev/null || \
     printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$PDIR" >> "$CFG"
+
+  # Guidance for remote-control sessions. ~/Documents/Codex is the parent of every
+  # session's scratch dir (~/Documents/Codex/<date>/<task-name>), and codex reads AGENTS.md
+  # by walking UP from its cwd -- so this reaches sessions the host cannot otherwise
+  # configure. It is the only lever over app-created sessions besides writable_roots.
+  install -d -o "$u" -g "$u" -m 755 "/home/$u/Documents/Codex"
+  cat > "/home/$u/Documents/Codex/AGENTS.md" <<AGENTSMD
+# Read this first
+
+You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.
+That folder is NOT the project.
+
+The project is a Next.js game at:
+
+    $PDIR
+
+Work there: read, search and edit files in that directory and run commands from it. It is
+a git repository, and it is writable inside your sandbox.
+
+## The dev server is already running -- do not start one
+
+It is a systemd service, not something you launch. It is published at
+https://$u.cc-games.dev and listens on 127.0.0.1 only.
+
+**Your sandbox has no network access, so \`curl http://localhost:...\` WILL FAIL even
+though the server is running fine.** A failed curl does not mean the server is down. Do
+not conclude that it stopped, and do not start your own \`next dev\` -- two servers on one
+port just breaks the site.
+
+To check on it, use these instead. They need no network:
+
+    systemctl is-active ndev@$u          # "active" means it is up
+    journalctl -u ndev@$u -n 50          # recent output, including compile errors
+    sudo systemctl restart ndev@$u       # pick up a change that needs a restart
+
+Next.js hot-reloads on save, so most edits need no restart at all.
+AGENTSMD
+  chown "$u:$u" "/home/$u/Documents/Codex/AGENTS.md"
 
   # THIS is what actually stops the endless "Always approve" prompts.
   #
