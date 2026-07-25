@@ -168,6 +168,45 @@ resource "cloudflare_zero_trust_access_identity_provider" "google" {
   }
 }
 
+# ---------------------------------------------------------------------------------
+# The OAuth client cannot be managed as code -- Google publishes no API for "Web
+# application" clients or their redirect URIs, so no terraform provider can wrap it.
+# (google_iap_client looks like the answer and is not: the IAP OAuth Admin API was shut
+# down in March 2026, and even before that the resource had no redirect-URI field.)
+#
+# What CAN be codified is noticing when the manual half is wrong. Without this, a missing
+# redirect URI is invisible to terraform and only surfaces when a person clicks
+# "Sign in with Google" and gets redirect_uri_mismatch.
+# ---------------------------------------------------------------------------------
+locals {
+  # One source of truth for the callback: the org AUTH DOMAIN, not the display name.
+  cf_access_callback = "https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback"
+}
+
+data "external" "google_redirect_uri" {
+  count   = var.enable_google_login ? 1 : 0
+  program = ["${path.module}/scripts/check-google-redirect.sh"]
+
+  query = {
+    client_id    = jsondecode(data.aws_secretsmanager_secret_version.google_idp[0].secret_string)["client_id"]
+    redirect_uri = local.cf_access_callback
+  }
+}
+
+check "google_oauth_redirect_uri_registered" {
+  assert {
+    condition = !var.enable_google_login || contains(
+      ["ok", "unreachable"], # unreachable = network blip, not a real regression
+      data.external.google_redirect_uri[0].result.status
+    )
+    error_message = format(
+      "Google is not accepting %s (status: %s). Add it under Authorized redirect URIs at https://console.cloud.google.com/auth/clients?project=669386542811 and Save; propagation takes 5min-a few hours. 'Sign in with Google' stays broken until then -- one-time PIN still works, so nobody is locked out.",
+      local.cf_access_callback,
+      try(data.external.google_redirect_uri[0].result.status, "unknown")
+    )
+  }
+}
+
 resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
   account_id       = var.cloudflare_account_id
   name             = "cc-games dev servers"
