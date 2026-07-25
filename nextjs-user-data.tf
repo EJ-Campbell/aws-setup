@@ -391,6 +391,21 @@ for u in ${join(" ", local.nextjs_users)}; do
   PDIR=$(/usr/local/bin/agent-dir "$u" 2>/dev/null || echo "/home/$u")
   grep -qF "[projects.\"$PDIR\"]" "$CFG" 2>/dev/null || \
     printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$PDIR" >> "$CFG"
+
+  # THIS is what actually stops the endless "Always approve" prompts.
+  #
+  # The ChatGPT app sends sandbox="workspace-write" per session and that beats
+  # sandbox_mode here -- the client always wins. But it sends the MODE, not the roots:
+  # in workspace-write the writable set is the session cwd PLUS whatever config lists.
+  # Remote-control sessions start in a throwaway ~/Documents/Codex/<date>/<task>/ dir, so
+  # without this every single edit to the actual project is outside the sandbox and
+  # escalates for approval.
+  #
+  # Appending a new [table] header is safe -- unlike bare keys, it cannot be swallowed by
+  # a preceding [projects."..."] section.
+  if ! grep -q '^\[sandbox_workspace_write\]' "$CFG" 2>/dev/null; then
+    printf '\n[sandbox_workspace_write]\nwritable_roots = ["%s"]\nnetwork_access = true\n' "$PDIR" >> "$CFG"
+  fi
   chown "$u:$u" "$CFG" 2>/dev/null || true
   { [ -s "/home/$u/.codex/auth.json" ] && [ -x "$CODEX_STANDALONE" ]; } && systemctl enable --now "codex-rc@$u.service" 2>/dev/null || true
   # Re-enable a previously published project (ndev-register wrote the env file).
