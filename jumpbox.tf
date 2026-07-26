@@ -8,9 +8,21 @@ variable "enable_jumpbox" {
   default     = true
 }
 
+# Shared by both jumpbox and jumpbox-2 (jumpbox2.tf reuses this instance profile directly
+# rather than keeping a parallel AdministratorAccess copy in sync by hand). Gating these on
+# enable_jumpbox alone was a real bug caught by codex review of jumpbox-2's PR: with
+# enable_jumpbox=false and enable_jumpbox_2=true, aws_iam_instance_profile.jumpbox_admin[0]
+# does not exist, so jumpbox-2's reference to it fails to evaluate -- meaning the backup
+# admin box could not survive, or even be created fresh, if the original jumpbox were ever
+# disabled or lost. That defeats the entire purpose of having a second, independent admin
+# box, so this needs BOTH toggles, not just the original one.
+locals {
+  jumpbox_admin_iam_needed = var.enable_jumpbox || var.enable_jumpbox_2
+}
+
 # IAM role with admin access for AWS CLI operations
 resource "aws_iam_role" "jumpbox_admin" {
-  count = var.enable_jumpbox ? 1 : 0
+  count = local.jumpbox_admin_iam_needed ? 1 : 0
   name  = "jumpbox-admin-role"
 
   assume_role_policy = jsonencode({
@@ -33,21 +45,21 @@ resource "aws_iam_role" "jumpbox_admin" {
 
 # Attach AdministratorAccess for full AWS CLI access
 resource "aws_iam_role_policy_attachment" "jumpbox_admin" {
-  count      = var.enable_jumpbox ? 1 : 0
+  count      = local.jumpbox_admin_iam_needed ? 1 : 0
   role       = aws_iam_role.jumpbox_admin[0].name
   policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
 # Attach SSM for remote access
 resource "aws_iam_role_policy_attachment" "jumpbox_ssm" {
-  count      = var.enable_jumpbox ? 1 : 0
+  count      = local.jumpbox_admin_iam_needed ? 1 : 0
   role       = aws_iam_role.jumpbox_admin[0].name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 # Instance profile
 resource "aws_iam_instance_profile" "jumpbox_admin" {
-  count = var.enable_jumpbox ? 1 : 0
+  count = local.jumpbox_admin_iam_needed ? 1 : 0
   name  = "jumpbox-admin-profile"
   role  = aws_iam_role.jumpbox_admin[0].name
 }
@@ -115,7 +127,7 @@ resource "aws_instance" "jumpbox" {
 
 # Backup plan for jumpbox home volume
 resource "aws_backup_plan" "jumpbox" {
-  count = var.enable_jumpbox ? 1 : 0
+  count = local.jumpbox_admin_iam_needed ? 1 : 0 # shared plan; see the comment above enable_jumpbox
   name  = "jumpbox-backup-plan"
 
   rule {
@@ -173,16 +185,23 @@ resource "aws_backup_plan" "jumpbox" {
   }
 }
 
-# Backup selection for jumpbox home volume
+# Backup selection for jumpbox home volume, and jumpbox-2's root volume (jumpbox2.tf) --
+# same plan, same schedule and retention. compact() drops the jumpbox-2 entry cleanly if
+# it is ever disabled, rather than passing an empty string AWS Backup would reject.
 resource "aws_backup_selection" "jumpbox" {
-  count        = var.enable_jumpbox ? 1 : 0
+  count        = local.jumpbox_admin_iam_needed ? 1 : 0
   name         = "jumpbox-home-volume"
   plan_id      = aws_backup_plan.jumpbox[0].id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
-  resources = [
-    aws_ebs_volume.jumpbox_home[0].arn
-  ]
+  resources = compact([
+    # aws_ebs_volume.jumpbox_home is still gated on enable_jumpbox alone (correctly -- it
+    # is jumpbox-1-specific), so this reference has to stay conditional too: with
+    # enable_jumpbox=false, jumpbox_home[0] does not exist either, and this whole
+    # selection resource now exists whenever enable_jumpbox_2 alone is true.
+    var.enable_jumpbox ? aws_ebs_volume.jumpbox_home[0].arn : "",
+    var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
+  ])
 }
 
 # ============================================
