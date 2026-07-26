@@ -256,38 +256,69 @@ echo "wrote $OUT ($(wc -c < "$OUT") bytes, $(printf '%s' "$REPOS" | grep -c '^- 
 KIDAGENTS
 chmod 755 /usr/local/bin/kid-agents-refresh
 
+# Runs t-claude itself, on the user's DEFAULT tmux socket -- deliberately not a separate
+# "-L agents" socket. Earlier this ran bare `claude --remote-control` isolated on its own
+# socket specifically to avoid colliding with an interactive t-claude session; the isolation
+# is no longer wanted -- the remote-control session from the phone and a session opened by
+# SSHing in and running `t-claude` should be the SAME session, not two independent ones.
+# Since t-claude computes the session name from the folder path (no explicit name given
+# here), the phone-launched session and one opened later by hand in the same directory
+# resolve to the identical tmux session and are picked up, not duplicated.
+#
+# `t-claude --remote-control` passes --remote-control straight through to claude
+# (t-claude.zsh, ejc3/t-claude) -- everything it does not itself recognise is relayed
+# verbatim rather than silently dropped.
 cat > /usr/local/bin/agents-start <<'AGENTS'
 #!/bin/bash
-set -euo pipefail
+# NOT set -e: t-claude's final step attaches to the tmux session, which fails harmlessly
+# here ("open terminal failed: not a terminal") since systemd gives this no tty -- by that
+# point the session, window and claude launch have already succeeded. -e would treat that
+# expected failure as agents-start itself having failed.
+set -uo pipefail
 WHO="$1"
 export HOME="/home/$WHO"
 WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
-cd "$WORKDIR"
-TM="/usr/local/bin/tmux -L agents"
-$TM has-session -t claude 2>/dev/null && exit 0
-$TM new-session -d -s claude -c "$WORKDIR" \
-  "claude --dangerously-skip-permissions --remote-control; exec bash -l"
+zsh -c "
+  source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
+  cd '$WORKDIR' || exit 1
+  t-claude --remote-control
+"
+echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
 AGENTS
 chmod 755 /usr/local/bin/agents-start
 
 cat > /etc/systemd/system/claude-rc@.service <<'UNIT'
 [Unit]
-Description=Claude Code with remote control for %i
+Description=Claude Code (t-claude) with remote control for %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-# forking, not simple: tmux daemonises a server and the launching process exits. systemd
-# then tracks the surviving server, so if Claude dies the unit restarts it.
-Type=forking
+# oneshot + RemainAfterExit, not forking -- same fix as codex-rc@ below and for the same
+# reason: t-claude's `tmux new-session` daemonises the tmux SERVER independently of the
+# process that called it, so the launching zsh/bash returns quickly regardless of whether
+# any child survives. Type=forking expects a forked child for systemd to adopt; there
+# isn't one, so the unit flips to failed even though the session was created successfully.
+Type=oneshot
+RemainAfterExit=yes
 User=%i
 Environment=HOME=/home/%i
 Environment=TERM=xterm-256color
 WorkingDirectory=/home/%i
 ExecStart=/usr/local/bin/agents-start %i
-ExecStop=/usr/local/bin/tmux -L agents kill-server
-Restart=always
-RestartSec=15
+# No Restart=, matching codex-rc@ below exactly -- checked its LIVE deployed unit rather
+# than trust memory of it, and confirmed the source here has none either. Caught the hard
+# way: `systemd-analyze verify` refuses Restart=always/on-success on a Type=oneshot service
+# outright ("isn't allowed"), so an earlier version of this unit with that combination
+# would never have started at all. codex-rc@'s actual resilience comes from the nightly
+# agent-update.timer calling `systemctl restart` explicitly, which works on a oneshot unit
+# regardless of Restart= -- that already covers this unit too, so nothing else is needed.
+#
+# No ExecStop either: there is no "stop remote control" operation to run here the way
+# codex has one. Killing the tmux server on stop would end every OTHER session in it too,
+# including ones opened by hand over SSH -- exactly the collision this unification is
+# meant to avoid, not reintroduce on the stop path. `systemctl stop` just marks the unit
+# inactive; the tmux session and claude process are untouched and still reachable.
 
 [Install]
 WantedBy=multi-user.target

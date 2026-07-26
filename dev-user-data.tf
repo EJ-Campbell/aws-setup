@@ -218,65 +218,15 @@ alias ll="ls -la" gs="git status" gd="git diff"
 [ -f ~/.config/t-claude.zsh ] && source ~/.config/t-claude.zsh
 ZSH
 cat > ~/.tmux.conf << 'TMUXCONF'
-# Goal: scrolling behaves as if tmux were not running -- a swipe in Panic Prompt (iOS)
-# scrolls the terminal's OWN scrollback. No copy-mode, no key chords.
-#
-# THE MECHANISM (deterministic, 4/4 across burst and paced output):
-#   default config    -> tmux emits ESC[?1049h, terminal enters the ALTERNATE screen
-#   with smcup@ below -> no ESC[?1049h, tmux stays on the PRIMARY screen
-#
-# The alternate screen has no scrollback by definition, so anything scrolling out of the
-# pane is discarded by the terminal and there is nothing for a swipe to reach. Staying on
-# the primary screen means output lands in the terminal's own scrollback, as with no tmux.
-#
-# CORRECTION: an earlier version of this file claimed "0 of 36 scrolled-off lines ever
-# reached the terminal". That was a capture-flush artifact of a single test run. Re-measured
-# it is 36/36 in BOTH configs -- the bytes always arrive; what differs is whether the
-# terminal RETAINS them, which is decided solely by the alternate screen. Same conclusion,
-# but do not trust the old byte-count reasoning.
-#
-# Verified separately: Prompt on iOS implements xterm mouse "click-only" (Panic's own docs),
-# so it sends no wheel events and `mouse on` can never scroll here. Full-screen apps inside
-# tmux (vim/htop) still work and their alt-screen does not leak outward.
-#
-# KNOWN WART: reattaching redraws the visible screen, so roughly one screenful (measured up
-# to ~3x for some rows) is re-emitted into scrollback per attach. Inherent to primary-screen
-# operation; the tradeoff for having any scrollback at all.
-
-# THE KEY LINES. Native scrollback needs BOTH:
-#  1. smcup@/rmcup@ -- stay on the primary screen (the alt screen has no scrollback).
-#  2. status off -- keep the pane the FULL terminal height. With a status line the pane
-#     is one row short, so tmux scrolls inside a DECSTBM region (ESC[1;H-1r), and lines
-#     scrolled out of a restricted region are DISCARDED by the terminal, not saved.
-#     Byte-capture verified: status on emits ESC[1;23r on every scroll; status off emits
-#     only a full-screen region at startup and scrolls with bare linefeeds, identical to
-#     a bare shell. Splits break this too -- single pane only. Never set status-position
-#     top: a top status shifts the region top off row 0, which kills scrollback in every
-#     emulator (xterm/VTE feed scrollback only when the region top is row 0, full width).
-set -ga terminal-overrides ',*:smcup@:rmcup@'
-set -g status off
-# NOTE: these three settings are necessary but NOT sufficient for Claude Code. Claude
-# wraps its repaints in synchronized-output mode (CSI ?2026h/l); tmux buffers grid
-# updates during sync and emits only a viewport redraw, so scrolled lines never reach
-# native scrollback. t-claude launches claude under `nosync-wrap`, which strips those
-# sequences. Plain shell output needs only the three settings above.
-# 3. indn@ -- scroll with bare linefeeds ONLY, never CSI S. tmux batches multi-line
-#    scrolls into the indn capability (ESC[nS) when the terminal advertises it, and
-#    Prompt on iOS saves LF-scrolled lines to its scrollback but discards CSI-S-scrolled
-#    ones (side-by-side verified: seq output scrolled by LF survives a swipe; Claude's
-#    Ink commits scrolled by CSI S vanish). Disabling indn forces a plain LF loop.
-set -as terminal-overrides ',*:indn@'
-
-# Mouse OFF, and PINNED deliberately: `mouse on` makes tmux capture wheel events into
-# copy-mode and steal them from the terminal. tmux 3.8 changes the DEFAULT to on, so
-# leaving it unset would silently break native scrolling on a future upgrade.
-set -g mouse off
-
-# Lowered from 50000: tmux history costs ~310 bytes/line plus ~27 bytes per used cell and
-# has no byte cap (tmux#4859), so 50k dense lines is ~120MB per pane. The terminal owns
-# scrollback now, so this is only a copy-mode fallback (Ctrl-b [ , arrows, q).
-# To extract a full pane regardless: tmux capture-pane -J -S - -p > file.txt
-set -g history-limit 10000
+# Native (swipe/wheel) scrollback in Panic Prompt on iOS -- smcup@/rmcup@, status off,
+# indn@, mouse off, history-limit -- is NOT set here. t-claude (github.com/ejc3/t-claude)
+# asserts those itself at runtime on every invocation, scoped to the session it manages,
+# so it works from a bare host with nothing but zsh and tmux and cannot go stale the way a
+# static file here could. See t-claude.zsh's APPLY_SCROLLBACK_SETTINGS for the mechanism,
+# measurements and the tmux option-scope research behind each choice. A tmux opened WITHOUT
+# ever running t-claude on this server will not have native scrollback -- run `t-claude`
+# once and every session on the server picks it up (they are global-within-server session
+# options), or scroll with the copy-mode fallback (Ctrl-b [, arrows, q).
 
 set -g default-terminal "tmux-256color"
 set -as terminal-features ",xterm-256color:RGB"
