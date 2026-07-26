@@ -173,16 +173,19 @@ resource "aws_backup_plan" "jumpbox" {
   }
 }
 
-# Backup selection for jumpbox home volume
+# Backup selection for jumpbox home volume, and jumpbox-2's root volume (jumpbox2.tf) --
+# same plan, same schedule and retention. compact() drops the jumpbox-2 entry cleanly if
+# it is ever disabled, rather than passing an empty string AWS Backup would reject.
 resource "aws_backup_selection" "jumpbox" {
   count        = var.enable_jumpbox ? 1 : 0
   name         = "jumpbox-home-volume"
   plan_id      = aws_backup_plan.jumpbox[0].id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
-  resources = [
-    aws_ebs_volume.jumpbox_home[0].arn
-  ]
+  resources = compact([
+    aws_ebs_volume.jumpbox_home[0].arn,
+    var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
+  ])
 }
 
 # ============================================
