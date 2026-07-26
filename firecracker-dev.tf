@@ -147,7 +147,8 @@ BOOTSTRAP
   monitoring = true # 1-minute detailed monitoring
 
   tags = {
-    Name = "fcvm-metal-arm"
+    Name   = "fcvm-metal-arm"
+    DevEBS = "true"
   }
 
   # Lifecycle - prevent recreation for imported instance

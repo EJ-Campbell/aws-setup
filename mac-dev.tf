@@ -113,6 +113,7 @@ resource "aws_ec2_host" "mac" {
     Name      = "mac-dev-temp"
     Temporary = "true"
     Purpose   = "cmux-build-24h"
+    DevEBS    = "true"
   }
 }
 
@@ -211,6 +212,7 @@ MACINIT
     Name      = "mac-dev-temp"
     Temporary = "true"
     Purpose   = "cmux-build-24h"
+    DevEBS    = "true"
   }
 }
 

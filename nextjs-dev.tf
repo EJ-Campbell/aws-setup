@@ -199,6 +199,7 @@ resource "aws_instance" "nextjs_dev" {
   tags = {
     Name    = "nextjs-dev"
     Purpose = "Next.js dev servers behind a Cloudflare Tunnel"
+    DevEBS  = "true"
   }
 }
 

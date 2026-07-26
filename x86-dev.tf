@@ -147,7 +147,8 @@ BOOTSTRAP
   monitoring = true # 1-minute detailed monitoring
 
   tags = {
-    Name = "fcvm-metal-x86"
+    Name   = "fcvm-metal-x86"
+    DevEBS = "true"
   }
 
   # Lifecycle - prevent recreation for imported instance

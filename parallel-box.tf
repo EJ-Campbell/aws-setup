@@ -129,6 +129,7 @@ resource "aws_instance" "parallel_box" {
   availability_zone      = var.parallel_box_az
   subnet_id              = "subnet-095349c0fcef8c47f" # default VPC, us-west-2d
   vpc_security_group_ids = [aws_security_group.parallel_box.id]
+  iam_instance_profile   = aws_iam_instance_profile.dev_ebs_only.name
 
   instance_market_options {
     market_type = "spot"
@@ -204,6 +205,10 @@ resource "aws_instance" "parallel_box" {
     apt-get update
     apt-get install -y parallel build-essential git htop
 
+    # Shared bulk scratch/cache on the separate i8ge I/O box. This is an automount, so
+    # the parallel box still boots cleanly when the I/O box is stopped.
+    ${local.io_box_client_setup}
+
     # Raise the file-descriptor ceiling: 192-way fan-out hits the 1024 default fast.
     echo "* soft nofile 1048576" >> /etc/security/limits.conf
     echo "* hard nofile 1048576" >> /etc/security/limits.conf
@@ -214,6 +219,13 @@ resource "aws_instance" "parallel_box" {
   tags = {
     Name    = "parallel-box"
     Purpose = "on-demand embarrassingly-parallel compute"
+    DevEBS  = "true"
+  }
+
+  lifecycle {
+    # The root is disposable and a live run must never be stopped just because its
+    # next-launch bootstrap changed. count=0 -> 1 still uses the newest user_data.
+    ignore_changes = [user_data]
   }
 }
 

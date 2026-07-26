@@ -83,6 +83,14 @@ resource "aws_route_table" "public" {
     gateway_id      = aws_internet_gateway.main.id
   }
 
+  # Private path to the shared us-west-2 I/O box. This route must stay inline:
+  # mixing aws_route resources with inline routes on the same table makes the
+  # AWS provider fight itself and causes recurring drift.
+  route {
+    cidr_block                = data.aws_vpc.west2_default.cidr_block
+    vpc_peering_connection_id = aws_vpc_peering_connection.io_box.id
+  }
+
   tags = {
     Name = "${var.project_name}-public-rt"
   }

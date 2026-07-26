@@ -280,6 +280,9 @@ chsh -s /usr/bin/zsh ubuntu
 # admin session lives -- from a box that runs agents with --dangerously-skip-permissions.
 ${local.dev_hop_setup}
 
+# Private NFSv4 automount for the shared us-west-2 NVMe scratch box.
+${local.io_box_client_setup}
+
 ${local.codex_remote_control}
 SHELLSETUP
 

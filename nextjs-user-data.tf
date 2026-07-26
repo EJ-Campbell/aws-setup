@@ -686,6 +686,9 @@ command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || ec
 # /home/ubuntu anyway since it is 0700.
 ${local.dev_hop_setup}
 
+# Private NFSv4 automount for the shared us-west-2 NVMe scratch box.
+${local.io_box_client_setup}
+
 # ---------------------------------------------------------------- codex sandbox
 # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor. Codex's sandbox is bwrap,
 # which needs a userns to bring up its loopback interface; it cannot, so EVERY sandboxed
