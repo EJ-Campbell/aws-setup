@@ -108,6 +108,15 @@ resource "aws_instance" "jumpbox_2" {
   BOOTSTRAP
   )
 
+  # The bootstrap above references the S3 object by a literal path string, not by
+  # attribute (${aws_s3_object.jumpbox_2_user_data[0].id}), so terraform's dependency
+  # graph has no edge between them from that reference alone -- caught by codex review: on
+  # a from-scratch apply, the object upload and the instance boot could run concurrently,
+  # and if cloud-init's `aws s3 cp` reaches the object before the upload finishes, the
+  # fetch fails and the rest of the bootstrap never runs. depends_on makes the ordering
+  # explicit instead of relying on apply-order luck.
+  depends_on = [aws_s3_object.jumpbox_2_user_data]
+
   lifecycle {
     prevent_destroy = true
     ignore_changes = [
