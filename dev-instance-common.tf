@@ -122,6 +122,9 @@ resource "aws_iam_role_policy" "dev_server" {
           # Dev-server-to-dev-server hop key. Reaches only other dev boxes -- it is
           # deliberately not authorized on the jumpbox. See dev-hop-key.tf.
           aws_secretsmanager_secret.dev_hop.arn,
+          # Restricted, forced-command-only key for pbox's dev-box -> jumpbox
+          # delegation. See pbox-key.tf.
+          aws_secretsmanager_secret.pbox.arn,
         ]
       },
       {

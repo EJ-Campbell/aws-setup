@@ -200,10 +200,17 @@ cat > /usr/local/bin/pbox <<'PBOX'
 #
 # An idle watchdog terminates the box automatically after 30 min below 5% CPU, because
 # it costs roughly 50x a dev box per hour. Losing it costs nothing: /mnt/work persists.
+#
+# Two different keys, deliberately: JUMPBOX_KEY is forced-command-only on the jumpbox
+# side (pbox-key.tf) and can do nothing there but run parallel-box.sh -- this box holds
+# no key capable of an admin shell on the jumpbox (see dev-hop-key.tf for why). KEY
+# (dev_hop) is what parallel-box's own authorized_keys trusts for the direct hop once
+# it's up.
 set -euo pipefail
 JUMPBOX=10.0.1.72
-KEY="$HOME/.ssh/fcvm-ec2"
-JB() { ssh -i "$KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" "cd ~/aws && ./scripts/parallel-box.sh $*"; }
+JUMPBOX_KEY="$HOME/.ssh/pbox"
+KEY="$HOME/.ssh/dev_hop"
+JB() { ssh -i "$JUMPBOX_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" "$*"; }
 
 case "$${1:-status}" in
   up|want)

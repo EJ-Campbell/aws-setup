@@ -153,6 +153,17 @@ resource "aws_instance" "parallel_box" {
     #!/bin/bash
     set -uxo pipefail
 
+    # Authorize the dev-hop key (dev-hop-key.tf) for direct login. This box is launched
+    # and used from a dev box (fcvm-metal-arm/x86), which holds no key to the jumpbox and
+    # no fcvm-ec2 key at all (dev-hop-key.tf) -- dev_hop is the ONLY key those boxes carry
+    # that reaches another host, so it has to be what this box trusts too.
+    install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
+    touch /home/ubuntu/.ssh/authorized_keys
+    grep -qxF "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" /home/ubuntu/.ssh/authorized_keys || \
+      echo "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
+    chmod 600 /home/ubuntu/.ssh/authorized_keys
+    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
+
     # Mount the persistent work volume.
     #
     # SAFETY: this must never reformat a disk that already holds data, and must never

@@ -343,6 +343,8 @@ npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
 
+${local.pbox_key_setup}
+
 ${local.pbox_setup}
 
 ${local.selfupdate_setup}
@@ -408,6 +410,8 @@ ${local.shell_setup}
 npm install -g @anthropic-ai/claude-code
 
 ${local.gh_and_claude_sync_script}
+
+${local.pbox_key_setup}
 
 ${local.pbox_setup}
 

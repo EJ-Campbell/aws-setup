@@ -177,7 +177,10 @@ ssh nextjs      # the kids' Next.js box (cc-games.dev)
 ssh fcvm-x86    # x86 metal dev server
 ```
 
-There is deliberately **no key to the jumpbox** on this machine. Do not try to add one.
+There is deliberately **no general-purpose key to the jumpbox** on this machine. The one
+exception is a forced-command key used only by `pbox` (see pbox-key.tf) -- it can trigger
+`scripts/parallel-box.sh` on the jumpbox and nothing else, no matter what is sent over it.
+Do not add any other key to the jumpbox.
 
 ## Long jobs
 

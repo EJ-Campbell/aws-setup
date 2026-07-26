@@ -19,7 +19,6 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KEY="${HOME}/.ssh/fcvm-ec2"
 REGION="us-west-2"
 JUMPBOX="10.0.1.72"
 
@@ -38,9 +37,24 @@ TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xla
 # state lives on the jumpbox, so delegate the terraform half rather than widening
 # dev-box permissions.
 on_jumpbox() { [ -d "$REPO/.terraform" ] && command -v terraform >/dev/null 2>&1; }
+
+# KEY differs by where this script is actually running:
+#   - on the jumpbox: fcvm-ec2, which every box in the fleet trusts for inbound SSH
+#   - on a dev box: dev_hop -- the only key dev boxes hold that reaches another host
+#     (fcvm-ec2 is deliberately absent from dev boxes; see dev-hop-key.tf). parallel-box's
+#     own authorized_keys carries the dev_hop public key for exactly this reason
+#     (parallel-box.tf), so this is what a dev box uses for the direct hop once it's up.
+# JUMPBOX_KEY is different again: a forced-command-only key (pbox-key.tf) that lets a dev
+# box trigger THIS script on the jumpbox without holding anything admin-capable.
+if on_jumpbox; then
+  KEY="${HOME}/.ssh/fcvm-ec2"
+else
+  KEY="${HOME}/.ssh/dev_hop"
+fi
+JUMPBOX_KEY="${HOME}/.ssh/pbox"
+
 delegate() {
-  ssh -i "$KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" \
-    "cd ~/aws && ./scripts/parallel-box.sh $*"
+  ssh -i "$JUMPBOX_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" "$*"
 }
 
 cd "$REPO" 2>/dev/null || true
