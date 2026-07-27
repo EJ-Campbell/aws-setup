@@ -280,26 +280,43 @@ resource "aws_iam_role_policy" "dev_server" {
 }
 
 locals {
-  # GitHub CLI authentication from Secrets Manager
+  # GitHub CLI authentication from Secrets Manager -- ONLY if not already logged in.
+  #
+  # THE BUG THIS FIXES: this used to unconditionally overwrite ~/.config/gh/hosts.yml
+  # every time it ran -- which is every boot, AND every dev-selfupdate.sh
+  # re-convergence. That silently destroyed any real personal `gh auth login` session
+  # (the broad repo/workflow/gist-scoped token a human gets from the interactive device
+  # flow) and replaced it with this single-repo sync PAT, with zero warning. Caught live:
+  # running dev-selfupdate.sh to deploy an unrelated fix clobbered a working personal
+  # login mid-session, made GitHub push access look broken when it never was, and cost a
+  # long debugging detour to trace back to this line.
+  #
+  # THE FIX: only set up the PAT-based login if `gh` is not ALREADY authenticated. A
+  # fresh box still gets a working `gh` for free (first boot, nobody has logged in yet).
+  # Once a human runs `gh auth login` themselves -- on this box or any box -- that login
+  # is never touched again, on this boot or any future one. claude-code-sync's own auth
+  # no longer depends on this at all; see claude_sync_git_credential_script below.
   gh_auth_script = <<-SCRIPT
     # ============================================
-    # GitHub CLI authentication (from Secrets Manager)
+    # GitHub CLI authentication (from Secrets Manager, skipped if already logged in)
     # ============================================
     sudo -u ubuntu bash << 'GH_AUTH_SETUP'
-    # NOTE: deliberately NO -x here. This block expands a GitHub PAT, and xtrace would
-    # echo `GH_TOKEN=github_pat_...` verbatim into the setup log.
     set -euo pipefail
 
-    # Fetch GitHub PAT from Secrets Manager
-    GH_TOKEN=$(aws secretsmanager get-secret-value \
-      --secret-id github-pat-ejc3 \
-      --region us-west-1 \
-      --query SecretString \
-      --output text)
+    if gh auth status >/dev/null 2>&1; then
+      echo "gh already authenticated -- leaving the existing login alone"
+    else
+      # NOTE: deliberately NO -x for this branch. It expands a GitHub PAT, and xtrace
+      # would echo `GH_TOKEN=github_pat_...` verbatim into the setup log.
+      set +x
+      GH_TOKEN=$(aws secretsmanager get-secret-value \
+        --secret-id github-pat-ejc3 \
+        --region us-west-1 \
+        --query SecretString \
+        --output text)
 
-    # Configure gh CLI
-    mkdir -p ~/.config/gh
-    cat > ~/.config/gh/hosts.yml << EOF
+      mkdir -p ~/.config/gh
+      cat > ~/.config/gh/hosts.yml << EOF
 github.com:
     users:
         ejc3:
@@ -308,14 +325,40 @@ github.com:
     user: ejc3
 EOF
 
-    # Set up git credential helper
-    gh auth setup-git
+      gh auth setup-git
+    fi
 # NOTE: this terminator MUST stay at column 0. The heredoc above is `<< 'GH_AUTH_SETUP'`
 # (no dash), so bash only accepts an unindented terminator -- and terraform's `<<-SCRIPT`
 # strips the COMMON indentation of this block, which is 0 because the inner EOF body
 # below is unindented. An indented terminator here silently swallows the entire rest of
 # the setup script into `sudo -u ubuntu bash`, running it as ubuntu instead of root.
 GH_AUTH_SETUP
+  SCRIPT
+
+  # Scoped git credential for claude-code-sync, INDEPENDENT of gh entirely.
+  #
+  # WHY THIS EXISTS SEPARATELY FROM gh_auth_script: claude-code-sync's automated cron
+  # push/pull (claude_sync_cron_script) must always be able to reach
+  # ejc3/claude-code-history, regardless of whatever `gh`'s login happens to be --
+  # including nothing at all, since gh_auth_script above now leaves a personal login
+  # alone rather than guaranteeing the PAT is in place. Scoping this to ONE exact URL via
+  # git's own credential.<url>.helper, rather than gh's global hosts.yml/credential
+  # helper, means it can never be clobbered by and never clobbers a personal `gh auth
+  # login`, and never grants anything beyond that single repo. The token is fetched live
+  # on every credential request, never written to disk, so a rotation takes effect
+  # immediately with no re-run needed.
+  #
+  # claude-code-sync shells out to the real `git` binary (src/scm/git.rs), so it honors
+  # this exactly the way plain `git push` does -- confirmed by reading its source.
+  claude_sync_git_credential_script = <<-SCRIPT
+    # ============================================
+    # Scoped git credential for claude-code-sync (independent of gh auth)
+    # ============================================
+    sudo -u ubuntu bash << 'CCS_CRED_SETUP'
+    set -euo pipefail
+    git config --global credential."https://github.com/ejc3/claude-code-history.git".helper \
+      '!f() { echo username=x-access-token; echo "password=$(aws secretsmanager get-secret-value --secret-id github-pat-ejc3 --region us-west-1 --query SecretString --output text)"; }; f'
+CCS_CRED_SETUP
   SCRIPT
 
   # Claude Code Sync installation and initialization
@@ -515,6 +558,7 @@ RUNNER_SSH_SETUP
   gh_and_claude_sync_script = join("\n", [
     local.console_logging_script,
     local.gh_auth_script,
+    local.claude_sync_git_credential_script,
     local.claude_sync_script,
     local.ghostty_terminfo_script,
     local.claude_sync_cron_script,
