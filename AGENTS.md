@@ -1,6 +1,7 @@
-# CLAUDE.md
+# AWS infrastructure agent guide
 
-This file provides guidance to Claude Code when working with this repository.
+This file provides guidance to automation agents working with this repository. Read
+`README.md` first for the operator-facing system map and first-session runbook.
 
 ## Nested Virtualization (NV2) Kernel
 
@@ -32,18 +33,24 @@ sudo reboot
 **KISS - Keep It Simple, Stupid**
 
 This project is opinionated and minimal:
-- One way to do things (no options)
-- Make-driven (no manual commands)
-- Automatic dependencies (no setup steps)
-- Zero configuration (sensible defaults)
+- One supported control-plane workflow
+- Direct Terraform from an administration jumpbox
+- Agent-readable context and generated machine-local session seeds
+- Automatic convergence with sensible defaults
 
 ## Key Principles
 
-1. **Makefile Does Everything**: All setup, login, config creation is handled automatically via Makefile dependencies
-2. **No Options**: Device code flow only, 0 ACU auto-pause only, us-west-1 only
-3. **Sensible Defaults**: Everything pre-configured for maximum cost savings
-4. **No Extra Docs**: README.md is the only user-facing documentation
-5. **ALL AWS CHANGES VIA TERRAFORM**: Never use AWS CLI to create/modify/delete resources. Always update .tf files and run `terraform apply`. Read-only `aws` commands (describe/list/get) are fine.
+1. **Terraform is the source of truth**: Run Terraform directly; there is no Make or
+   container wrapper.
+2. **Agent-first operation**: Orient from `README.md`, this file, the current Terraform,
+   and live read-only state. Never rely on remembered instance IDs or stale plans.
+3. **Sensible defaults**: Keep the deployed path opinionated and minimize operator choices.
+4. **One user entry point**: Keep `README.md` complete enough for a new operator; put deep
+   runner internals in `GITHUB-RUNNERS.md` and agent-only safety constraints here.
+5. **MANAGED AWS CHANGES VIA TERRAFORM**: Never use the AWS CLI for ordinary
+   create/modify/delete operations. Read-only `describe`/`list`/`get` commands are fine.
+   The scoped `DevEBS=true` working-volume policy, automation Lambdas, and documented
+   break-glass recovery are deliberate exceptions; do not expand them casually.
 
 ## Preventing Terraform Drift
 
@@ -53,23 +60,25 @@ This project is opinionated and minimal:
 - Auto-stop uses Lambda instead of CloudWatch EC2 actions (works with spot instances)
 
 **Rules to prevent drift:**
-- **Never use `aws` CLI to create/modify/delete resources** - always edit `.tf` files
+- Make managed changes in `.tf` files, not with mutating AWS CLI commands
 - Run `terraform plan` before `terraform apply` to catch issues
 - Keep all infrastructure changes in git
 - Avoid resources that reference instance IDs directly (they change on spot recreation)
 
 ## Project Overview
 
-AWS infrastructure for a small set of personal dev boxes: a jumpbox, two Firecracker
-metal servers, and a Next.js box serving the kids' games behind Cloudflare Access.
+AWS infrastructure for a personal development fleet: two administration jumpboxes, two
+Firecracker metal servers, a Next.js box behind Cloudflare Access, ephemeral shared I/O
+and burst compute, autoscaled GitHub runners, and recovery/monitoring infrastructure.
 
 - Terraform infrastructure-as-code, S3 backend (`ejc3-terraform-state`) + DynamoDB locks
-- ~155 managed resources across us-west-1 (plus a DR backup vault in us-east-1)
+- Roughly 185 managed resources across `us-west-1`, `us-west-2`, `us-east-1`, the isolated
+  staging account, and Cloudflare
 - No Aurora, and no database of any kind -- that was removed; ignore older references
 
 ## User Workflow
 
-**Run terraform directly. Do not use `make` on the jumpbox.**
+**Run Terraform directly on a jumpbox.**
 
 ```bash
 cd ~/aws
@@ -77,11 +86,9 @@ terraform plan
 terraform apply
 ```
 
-The Makefile drives terraform inside a container and needs podman or docker. Neither is
-installed on the jumpbox, so every `make` target fails here. It was written for the Mac,
-which has since been decommissioned. The jumpbox has terraform, the AWS CLI and an
-instance role with the access it needs, so running terraform directly is the supported
-path -- not a workaround.
+The jumpboxes have Terraform, the AWS CLI, Git, and administrator instance roles. There is
+no AWS login or credential-refresh step on them. The obsolete Mac/container/Make workflow
+has been removed.
 
 Commit AND push every change: the live infrastructure, the terraform files and git must
 not drift apart.
@@ -92,30 +99,29 @@ not drift apart.
 
 Terraform runs directly on the jumpbox, against the S3 backend with DynamoDB locking. The
 instance role supplies credentials, so there is no login step and nothing to auto-refresh.
-
-The `Dockerfile`, `Makefile`, `.container-built` and `.aws-login` machinery in this repo
-predates that: it ran terraform inside a container from a Mac that no longer exists. It is
-kept only because deleting it has not been worth the churn. **Do not follow it** -- the
-jumpbox has no container runtime, so every `make` target fails here.
+Keep `.terraform.lock.hcl` tracked so both admin boxes resolve the same providers.
 
 ### Cost notes
 
 - The dev boxes are the cost. Two metal spot instances dominate; the small boxes are noise
-- `dev-auto-stop-lambda.tf` stops the metal boxes after 12h idle. nextjs-dev and the
-  jumpbox are deliberately excluded -- they are meant to stay up
+- `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
+  box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
+- `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
 - There is no database. Older notes about Aurora Serverless auto-pause no longer apply
 
 ### File Structure
 
 ```
 .
-├── Dockerfile              # Container with Terraform, AWS CLI, utilities
-├── Makefile               # Everything is a make target
-├── main.tf                # Infrastructure definition
-├── variables.tf           # Config with sensible defaults
-├── outputs.tf             # Output values
-├── terraform.tfvars       # User values (auto-created, gitignored)
-└── README.md             # Simple guide
+├── main.tf                         # Providers, backend, and primary network
+├── variables.tf                    # Opinionated variables and defaults
+├── firecracker-dev.tf/x86-dev.tf   # Persistent Spot metal boxes
+├── nextjs-dev.tf/cloudflare.tf      # Kids' environment and private ingress
+├── io-box.tf/parallel-box.tf        # Ephemeral I/O and burst compute
+├── runner-autoscale.tf              # Disposable GitHub runners
+├── .terraform.lock.hcl              # Shared provider selections
+├── README.md                        # Complete operator entry point
+└── AGENTS.md                        # Agent constraints and recovery detail
 ```
 
 ## When Working on This Project
@@ -125,37 +131,51 @@ jumpbox has no container runtime, so every `make` target fails here.
 - **Read the plan before applying.** It has caught real damage: an apply that would have
   dropped the Cloudflare Access policy and left every kid's dev URL publicly reachable
 - Maintain single opinionated way to do things
-- Keep README.md concise
+- Keep README.md accurate and sufficient for an unfamiliar operator
 - Test "wake up" scenario (expired sessions)
-- **Prefer Makefile targets over direct CLI commands** for reproducibility
+- Run `terraform fmt -recursive` and `terraform validate` before planning
 
 ### Don't:
 - Add options or alternatives
 - Create extra documentation files
-- Add manual setup steps
+- Add avoidable manual setup steps
 - Make users think about configuration
 - Cache auth state without re-checking (breaks session expiration)
-- **Use `make` on the jumpbox** - it needs a container runtime that is not installed here
+- Reintroduce a Make/container wrapper around Terraform
 - **NEVER add Claude Code attribution to git commits** - no "Generated with Claude Code" or "Co-Authored-By: Claude" in commit messages
 
 ### Common Pitfalls
 
-**File-based auth tracking**: Don't do `touch .aws-login` without making it PHONY. Sessions expire but files don't.
+**Credential ownership**: Personal Codex, Claude, GitHub, and Vercel device logins belong
+to one Unix user. Never seed them from Terraform, copy them between users, or overwrite a
+working personal login with a bootstrap token.
 
 **Stale plans**: `terraform plan` refreshes state against AWS, so a plan from before someone else's change is not safe to apply. Re-plan if the apply is not immediate.
 
-**Manual setup steps**: Don't make users copy/paste values. Extract from Terraform state automatically.
+**Cold-bootstrap inputs**: Some secrets, backend resources, and device logins necessarily
+pre-exist Terraform. Keep the exact prerequisite list and login sequence in `README.md`.
+
+**Drift CI is not currently healthy**: the scheduled workflow lacks Secrets Manager,
+Organizations, and CodeArtifact read access, and it does not supply
+`github_webhook_secret`. Do not describe the schedule as working drift protection until a
+live run succeeds.
+
+**Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
+also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
+Dedicated Host quota/capacity. Teardown deletes the Mac root.
 
 ## Development Instances
 
-Three "snowflake" dev instances with static Elastic IPs:
+The long-lived development and administration instances are:
 
 | Instance | Type | Purchase | Purpose | Terraform |
 |----------|------|----------|---------|-----------|
 | jumpbox | t4g.large (2 vCPU / 8GB) | on-demand | Remote management, admin AWS access | jumpbox.tf |
+| jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
 | fcvm-metal-arm | c7gd.metal (64 vCPU) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
 | nextjs-dev | t4g.medium (2 vCPU / 4GB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-dev.tf |
+| io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 
 **nextjs-dev is deliberately on-demand.** It ran as spot until 2026-07-25, when it was
 reclaimed six times in one day and then could not restart at all -- the spot request
@@ -187,15 +207,20 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
 - `cloudflare.tf` holds the tunnel, wildcard DNS, Access app and policies. A service token
   (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access
 - The kids have **full passwordless sudo**. The instance is the sandbox: no inbound web
-  ports, and an IAM role that reads one S3 object and two secrets. Don't re-narrow it
+  ports. Its IAM role reads one S3 object and two secrets, can describe instances for hop
+  aliases, and has the scoped `DevEBS=true` temporary-volume policy. Don't re-narrow it
 
 ### Hopping between dev servers
 
-Dev boxes reach each other with a dedicated key (`dev-hop-key.tf`), never the jumpbox key:
+ARM, x86, and the `ubuntu` account on Next.js receive a dedicated hop key
+(`dev-hop-key.tf`), never the jumpbox key. I/O and parallel boxes trust its public half for
+inbound access but do not receive the private half:
 
 ```bash
-ssh fcvm-arm      # aliases regenerated at boot by devhop-refresh from live private IPs
+ssh fcvm-arm      # stable EIP
+ssh fcvm-x86      # stable EIP
 ssh nextjs
+ssh io            # fixed private address across the inter-region VPC peer
 ```
 
 `~/.ssh/fcvm-ec2` is deliberately **absent** from the dev servers. It opens the jumpbox,
@@ -224,30 +249,26 @@ The home volume is backed up daily/weekly via AWS Backup.
 
 ### ARM Dev Server Storage (fcvm-metal-arm)
 
-The ARM dev server (c7gd.metal) has instance NVMe storage for fast I/O:
-- **Root volume**: 300GB EBS (`/dev/nvme2n1`) - OS, persistent data
-- **NVMe 1**: 1.7TB (`/dev/nvme0n1`) - instance storage (ephemeral)
-- **NVMe 2**: 1.7TB (`/dev/nvme1n1`) - instance storage, mounted at `/mnt/fcvm-btrfs`
+The ARM dev server (c7gd.metal) has a persistent 300GB EBS root and two ephemeral local
+NVMe disks. `nvme-btrfs.service` positively identifies instance-store devices and creates
+a Btrfs RAID0 across all of them at `/mnt/fcvm-btrfs`.
 
 **IMPORTANT**: The NVMe drives are ephemeral - data is lost on stop/start. Use for:
 - VM images and caches (`/mnt/fcvm-btrfs/image-cache`)
 - Build artifacts and temp files
 - Firecracker VM storage
 
-**Setup after instance start** (if NVMe not mounted):
+The service owns setup. Inspect it without modifying disks:
+
 ```bash
-# Check if already mounted
-mount | grep nvme1n1
-
-# If not mounted, format and mount:
-sudo mkfs.btrfs -f /dev/nvme1n1
-sudo mount /dev/nvme1n1 /mnt/fcvm-btrfs
-
-# Add to fstab (use nofail since ephemeral)
-echo '/dev/nvme1n1 /mnt/fcvm-btrfs btrfs defaults,nofail 0 0' | sudo tee -a /etc/fstab
+systemctl status nvme-btrfs.service --no-pager
+findmnt /mnt/fcvm-btrfs
+lsblk -o NAME,SIZE,TYPE,MODEL,FSTYPE,MOUNTPOINTS
 ```
 
-**DO NOT** use loop device images (`/var/fcvm-btrfs.img`) - use NVMe directly for performance.
+Never run `mkfs` against a guessed `/dev/nvme*` name. “Not mounted” does not prove a
+device is blank, and one disk may be a member of an existing array. Do not use loop-device
+images (`/var/fcvm-btrfs.img`) either.
 
 ### SSH Access
 
@@ -299,22 +320,28 @@ claude-code-sync pull   # Pull history from GitHub
 claude-code-sync        # Bidirectional sync (default)
 ```
 
-### Elastic IPs
+### Stable addressing
 
-All dev instances have Elastic IPs for static addressing:
+The ARM, x86, and Next.js dev instances have Elastic IPs for static addressing:
 - IPs persist across stop/start cycles
 - Defined in each instance's .tf file
-- Cost: ~$3.60/month per unused EIP (free when attached to running instance)
 
-### Auto-Stop Lambda
+`io-box` has no EIP and accepts SSH/NFS only from private fleet networks. It receives a
+transient public IPv4 while running for outbound package access, but clients use fixed
+private IP `172.31.48.10` across the inter-region VPC peer.
 
-Dev servers are automatically stopped after **12 hours** of idle time to save costs. This is handled by a Lambda function (`dev-auto-stop-lambda.tf`) that runs hourly.
+### Auto-Stop Lambdas
+
+An hourly Lambda in `dev-auto-stop-lambda.tf` applies an intended 12-hour CPU-idle policy
+to the two metal servers.
 
 **How it works:**
-- Checks CloudWatch CPU metrics (Maximum per hour, not average)
-- If **all** hours in the last 12 have peak CPU < 5%, stops the instance
+- Queries five-minute CloudWatch CPU maximums over the preceding 12-hour range
+- Any returned CPU point at or above 5% keeps the instance running
 - Only counts metrics since instance `LaunchTime` (prevents false positives after restart)
 - Sends SNS notification on stop (or if stop fails)
+- Currently requires only 12 returned CPU datapoints, not the roughly 144 in a complete
+  series. Treat it as a cost heuristic: missing periods can count as idle
 
 **Why Lambda instead of CloudWatch alarms:**
 - CloudWatch EC2 stop actions don't work reliably with spot instances
@@ -326,9 +353,24 @@ Dev servers are automatically stopped after **12 hours** of idle time to save co
 - `INSTANCE_IDS` - Comma-separated list of instances to monitor
 - `SNS_TOPIC_ARN` - For notifications
 
+The I/O-box invocation of the same Lambda also checks five-minute disk and network sums.
+Returned disk activity of at least 1 MiB or network activity of at least 64 MiB keeps it
+running, but a missing I/O series currently counts as zero. The parallel box uses
+`parallel-box-watchdog.tf` and terminates after 30 minutes below 5% CPU. `nextjs-dev` and
+the jumpboxes never idle-stop.
+
+### Backup boundary
+
+AWS Backup selects the ARM and x86 roots, the Next.js root, the original jumpbox home
+volume, and the `jumpbox-2` root. It does not cover instance-store NVMe, `io-box` scratch,
+the I/O-box root, the Mac root, or the parallel box's persistent `/mnt/work` volume.
+`prevent_destroy` on `/mnt/work` prevents a Terraform deletion; it does not provide
+versioned or offsite recovery.
+
 ### Persistent Root Volumes (Spot Instances)
 
-Dev instances use **spot instances** for ~70% cost savings, with persistent EBS root volumes to preserve data.
+The two metal dev instances use **spot instances** for cost savings, with persistent EBS
+root volumes to preserve data.
 
 **The Challenge**: Spot instances can be terminated by AWS at any time. When terraform recreates the instance, it creates a NEW root volume from the AMI, orphaning the old volume with user data.
 
@@ -336,6 +378,12 @@ Dev instances use **spot instances** for ~70% cost savings, with persistent EBS 
 1. Use spot with `persistent` type + `stop` interruption behavior
 2. Set `delete_on_termination = false` on root volume
 3. **Manual one-time volume swap** when instance is recreated
+
+The procedure below is destructive break-glass recovery, not the normal wake path. It
+stops an instance, detaches/attaches roots, deletes the disposable replacement root, and
+reassociates an address. Obtain explicit user authorization, resolve every current ID with
+read-only checks, and compare it with Terraform state immediately before running it. Never
+use it merely because a persistent Spot instance is stopped.
 
 **CRITICAL: Spot Instance Restart Timing**
 
@@ -418,27 +466,34 @@ echo "Done!"
 
 **Add a new Terraform variable**:
 1. Add to `variables.tf` with sensible default
-2. Add to `terraform.tfvars.example`
-3. Update README.md if user needs to change it
+2. Update `README.md` if an operator must supply or understand it
+3. Never commit a real value from the ignored `terraform.tfvars`
 
 **Change authentication**:
-Don't. Device code flow is the only way.
+Keep personal Codex, Claude, GitHub, and Vercel login interactive and per Unix user. The
+exact first-session sequence is in `README.md`.
 
 **Add alternative regions**:
-Don't. us-west-1 is the choice.
+Do not add a speculative option. Region placement is intentional: the main fleet is in
+`us-west-1`, the I/O/parallel/CodeArtifact resources are in `us-west-2`, and recovery
+copies use `us-east-1`.
 
 **Add deployment options**:
-Don't. 0 ACU auto-pause is the way.
+Prefer the deployed opinionated path. There is no database and no Aurora auto-pause.
 
 ## Philosophy in Action
 
 User says: "I want options for..."
-Answer: No. One opinionated way.
+First determine whether the live platform needs a new capability. If it does, model one
+clear supported path and document it.
 
-User says: "Can I use access keys instead of SSO?"
-Answer: No. Device code flow only.
+User says: "Can I mutate it with the AWS CLI?"
+Answer: Managed resources change through reviewed Terraform. Use read-only CLI inspection,
+or a narrowly documented runtime/recovery exception.
 
-User says: "I want to configure..."
-Answer: Makefile handles it automatically.
+User starts a Codex session from the app:
+The generated `~/Documents/Codex/AGENTS.md` points the agent to the real repositories and
+machine constraints; the scratch session directory is never treated as the project.
 
-The goal is zero decisions, zero configuration, maximum simplicity.
+The goal is low ambiguity, reproducible infrastructure, and enough context for an agent or
+new operator to act safely without tribal knowledge.
