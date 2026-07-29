@@ -188,7 +188,13 @@ parallel-box Terraform workflow and nothing else.
 
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
-daemon. Conversation history is synchronized through `claude-code-sync`.
+daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
+box, `fcvm-claude-rc.service` starts remote-control sessions at boot for the user's
+active repositories under `/home/ubuntu`. “Active” means t-claude was used for that
+repository on this host during the preceding 30 days, its local Git checkout has moved
+during that period, or its worktree has uncommitted changes. Only `github.com/ejc3/*`
+checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
+interactive launch attaches to the same work when run from that repository root.
 
 ## Start a Codex session
 
@@ -223,6 +229,24 @@ credentials, then also run:
 vercel login
 claude login
 ```
+
+Claude login is also personal and persistent on each metal box. After the first login,
+start the already-enabled boot service once if the machine is currently running:
+
+```bash
+claude login
+claude auth status
+sudo systemctl start fcvm-claude-rc.service
+systemctl status fcvm-claude-rc.service --no-pager
+```
+
+The service checks `claude auth status` on every boot and skips cleanly if the login is
+missing or expired. To seed a new repository, open it once with
+`t-claude --remote-control`; a host-local marker makes subsequent boots include it while
+it remains recent. All metal repositories share one tmux server and one aggregate service,
+so do not restart or stop this service just to refresh one repository: that can end every
+managed and interactive `t-claude` session on the host. Check the most recent aggregate
+result with `cat ~/.local/state/fcvm-claude/last-start`.
 
 Refresh the generated instructions that seed app-created Codex sessions:
 

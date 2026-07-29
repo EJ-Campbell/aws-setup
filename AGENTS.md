@@ -228,6 +228,24 @@ where the AWS admin session lives, and nothing on a dev box used it. The hop key
 half is authorized on dev servers only, so holding it gets you another dev box and nothing
 more. Verified: dev -> dev succeeds, dev -> jumpbox gives `Permission denied (publickey)`.
 
+### Metal Claude startup
+
+`fcvm-claude-rc.service` starts `t-claude --remote-control` at boot for host-local active
+repositories. Interactive t-claude use writes an unsynchronized marker; recent local HEAD
+reflog movement and dirty worktrees seed checkouts automatically. Do not use Claude's
+`history.jsonl` as the activity signal: `claude-code-sync` merges it across ARM and x86;
+the launcher reads it only as a bounded index of possible nested roots and still requires
+host-local Git activity. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
+uses t-claude's default path-derived sessions. It is guarded by a verified pinned
+t-claude implementation and live `claude auth status`, so credentials remain personal and
+Terraform never seeds or copies them.
+
+All metal repositories run as `ubuntu` and therefore share one tmux server. Keep one
+aggregate systemd service and one cgroup; do not create per-repository units. Stopping or
+restarting the aggregate can kill every managed and interactive t-claude session in that
+shared server. The Next.js box is different: Colton and Connor are separate Unix users,
+so their `claude-rc@` units own separate tmux servers.
+
 ### Do not run recursive greps on the jumpbox
 
 Its two volumes are gp3 capped at **125 MB/s**. On 2026-07-25 a
