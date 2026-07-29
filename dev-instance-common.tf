@@ -144,7 +144,17 @@ resource "aws_iam_role_policy" "dev_server" {
           "ec2:DescribeNetworkInterfaces",
           "ec2:DescribeNatGateways",
           "ec2:DescribeAddresses",
-          "ec2:DescribeRouteTables"
+          "ec2:DescribeRouteTables",
+          # Spot-market intel: price history, placement scores, and the instance-type
+          # catalog. Read-only market data -- lets pbox/agents on a dev box reason about
+          # capacity and cost BEFORE delegating a launch to the jumpbox, without widening
+          # the actual launch permissions (still no ec2:RunInstances here).
+          "ec2:DescribeSpotPriceHistory",
+          "ec2:GetSpotPlacementScores",
+          "ec2:DescribeSpotInstanceRequests",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeInstanceTypeOfferings",
+          "ec2:DescribeAvailabilityZones"
         ]
         Resource = "*"
       },
