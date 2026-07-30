@@ -145,7 +145,7 @@ creates its VNC password.
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
-| `parallel-box` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS at `/mnt/work`; root is disposable | Temporary fan-out compute. Terminates after 30 idle minutes; `pbox` recreates it. |
+| `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four per architecture maximum; idle/expired leases terminate. |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
@@ -360,23 +360,25 @@ not.
 
 ## On-demand parallel compute
 
-From ARM or x86:
+Two independent boxes (`parallel-box`, `parallel-box-2`), each with its own persistent
+100 GB work volume, so two jobs can run at once. From ARM or x86:
 
 ```bash
-pbox status
-pbox up       # launch through Terraform, then connect
-pbox ssh
-pbox down     # terminate compute; keep /mnt/work
+pbox status      # both boxes
+pbox up          # launch box 1 through Terraform, then connect
+pbox up 2        # launch box 2 (independent volume and lifecycle)
+pbox ssh [2]
+pbox down [2]    # terminate compute; keep that box's /mnt/work
 ```
 
 The launcher tries several 96/192-vCPU Graviton Spot pools in the availability zone that
-contains the persistent 100 GB work volume. A watchdog checks every five minutes and
-terminates the box after 30 minutes below 5% CPU.
+contains the persistent work volumes. One shared watchdog checks every five minutes and
+terminates either box after 30 minutes below 5% CPU.
 
-Use only `pbox` (or `scripts/parallel-box.sh` on a jumpbox) for this lifecycle. The Terraform
-default is `enable_parallel_box=false`; an unrelated full apply while the box is running
-can otherwise propose terminating it. Read the plan and never apply that change during a
-live job.
+Use only `pbox` (or `scripts/parallel-box.sh` on a jumpbox) for this lifecycle. The
+Terraform defaults are `enable_parallel_box=false` / `enable_parallel_box_2=false`; an
+unrelated full apply while a box is running can otherwise propose terminating it. Read
+the plan and never apply that change during a live job.
 
 ## Temporary EBS for agents
 

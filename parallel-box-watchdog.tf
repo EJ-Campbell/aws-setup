@@ -40,7 +40,8 @@ import os, json, datetime, boto3
 
 IDLE_MINUTES = int(os.environ.get("IDLE_MINUTES", "30"))
 IDLE_CPU     = float(os.environ.get("IDLE_CPU_PCT", "5"))
-TAG_NAME     = os.environ.get("TAG_NAME", "parallel-box")
+# Comma-separated: both parallel boxes (parallel-box2.tf) share this one watchdog.
+TAG_NAMES    = os.environ.get("TAG_NAMES", "parallel-box").split(",")
 SNS_TOPIC    = os.environ.get("SNS_TOPIC_ARN", "")
 # The SNS topic is in us-west-1; this lambda runs in us-west-2 next to the instance.
 SNS_REGION   = os.environ.get("SNS_REGION", "us-west-1")
@@ -62,7 +63,7 @@ def lambda_handler(event, context):
     # Find by TAG, not by a baked-in instance id: this box is created and destroyed
     # repeatedly, so its id is different every time it comes up.
     resp = ec2.describe_instances(Filters=[
-        {"Name": "tag:Name", "Values": [TAG_NAME]},
+        {"Name": "tag:Name", "Values": TAG_NAMES},
         {"Name": "instance-state-name", "Values": ["running"]},
     ])
     instances = [i for r in resp["Reservations"] for i in r["Instances"]]
@@ -105,15 +106,17 @@ def lambda_handler(event, context):
             results.append({"id": iid, "action": "busy", "peak_cpu": round(peak, 1)})
             continue
 
-        print("terminating idle parallel box %s (peak CPU %.1f%% over %dmin)" % (iid, peak, IDLE_MINUTES))
+        name = next((t["Value"] for t in inst.get("Tags", []) if t["Key"] == "Name"), "parallel-box")
+        up_cmd = "pbox up 2" if name.endswith("-2") else "pbox up"
+        print("terminating idle %s %s (peak CPU %.1f%% over %dmin)" % (name, iid, peak, IDLE_MINUTES))
         try:
             ec2.terminate_instances(InstanceIds=[iid])
             results.append({"id": iid, "action": "terminated", "peak_cpu": round(peak, 1)})
             notify(
-                "parallel-box auto-terminated (idle)",
-                "Instance %s was below %.1f%% CPU for %d minutes (peak %.1f%%) and was terminated.\n\n"
-                "The 100GB work volume is untouched -- bring the box back with:\n"
-                "  scripts/parallel-box.sh up\n" % (iid, IDLE_CPU, IDLE_MINUTES, peak),
+                "%s auto-terminated (idle)" % name,
+                "Instance %s (%s) was below %.1f%% CPU for %d minutes (peak %.1f%%) and was terminated.\n\n"
+                "Its 100GB work volume is untouched -- bring the box back with:\n"
+                "  %s\n" % (iid, name, IDLE_CPU, IDLE_MINUTES, peak, up_cmd),
             )
         except Exception as e:
             results.append({"id": iid, "action": "terminate_failed", "error": str(e)})
@@ -164,13 +167,14 @@ resource "aws_iam_role_policy" "parallel_watchdog" {
         Resource = "*"
       },
       {
-        # Scoped by tag so this role can only ever terminate the parallel box, never a
-        # dev box or the jumpbox.
+        # Scoped by tag so this role can only ever terminate the parallel boxes, never a
+        # dev box or the jumpbox. Explicit list, not a wildcard, so nothing else that
+        # happens to share the prefix can ever match.
         Effect   = "Allow"
         Action   = "ec2:TerminateInstances"
         Resource = "*"
         Condition = {
-          StringEquals = { "ec2:ResourceTag/Name" = "parallel-box" }
+          StringEquals = { "ec2:ResourceTag/Name" = ["parallel-box", "parallel-box-2"] }
         }
       },
       {
@@ -196,7 +200,7 @@ resource "aws_lambda_function" "parallel_watchdog" {
     variables = {
       IDLE_MINUTES  = tostring(var.parallel_box_idle_minutes)
       IDLE_CPU_PCT  = tostring(var.parallel_box_idle_cpu_pct)
-      TAG_NAME      = "parallel-box"
+      TAG_NAMES     = "parallel-box,parallel-box-2"
       SNS_REGION    = var.aws_region
       SNS_TOPIC_ARN = aws_sns_topic.cost_alerts.arn
     }
