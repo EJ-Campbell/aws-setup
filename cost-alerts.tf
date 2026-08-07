@@ -293,6 +293,33 @@ resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
   }
 }
 
+# Alert when the autoscaler refuses to launch while fewer runners than the cap
+# can take work. The webhook Lambda emits GitHubRunners/ScaleUpStarved from
+# runner-autoscale.tf on every scale-up decision; it is 1 only when the
+# per-architecture instance ceiling blocks a launch that healthy-runner
+# accounting would have allowed - capacity held by instances that cannot serve a
+# job. That state cannot occur in normal operation. On 2026-08-07 the equivalent
+# condition ran unnoticed for 3.5 hours because the only evidence was an
+# unstructured Lambda log line.
+resource "aws_cloudwatch_metric_alarm" "runner_scale_up_starved" {
+  alarm_name          = "runner-scale-up-starved"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2 # two consecutive 5-minute polls
+  threshold           = 0
+  alarm_description   = "Runner scale-up blocked while under the healthy-runner cap - slots held by instances that cannot take work"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "starved"
+    expression  = "SELECT MAX(ScaleUpStarved) FROM SCHEMA(\"GitHubRunners\", Architecture)"
+    label       = "Scale-up starved"
+    period      = 300
+    return_data = true
+  }
+}
+
 # Alert on high EC2 spend (estimated from running hours)
 resource "aws_cloudwatch_metric_alarm" "high_ec2_spend" {
   alarm_name          = "high-ec2-daily-spend"
