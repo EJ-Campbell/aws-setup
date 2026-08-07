@@ -735,16 +735,20 @@ data "archive_file" "runner_cleanup" {
               candidates.append((started or cutoff, run))
           candidates.sort(key=lambda c: c[0])
 
-          # Rotate the scan window across polls instead of pinning the same
+          # Rotate the scan WINDOW across polls instead of pinning the same
           # oldest-first prefix: with more than MAX_STUCK_SCAN_RUNS over-age runs,
           # a fixed prefix of stale hosted-only runs would starve a wedged
-          # self-hosted runner in position N+1 forever. The offset is derived from
-          # wall clock (stateless -- Lambda invocations share nothing), advances
-          # every 5-minute poll, and walks the whole candidate list within
-          # ceil(N / MAX_STUCK_SCAN_RUNS) polls.
+          # self-hosted runner in position N+1 forever. The window index is derived
+          # from wall clock (stateless -- Lambda invocations share nothing) and
+          # advances by a WHOLE window per 5-minute poll, so consecutive polls
+          # select disjoint chunks and every candidate is inspected within
+          # ceil(N / MAX_STUCK_SCAN_RUNS) polls. (Advancing the offset by one
+          # candidate per poll would overlap windows and stretch full coverage to
+          # N polls.)
           if len(candidates) > MAX_STUCK_SCAN_RUNS:
-              start = int(now.timestamp() // 300) % len(candidates)
-              window = (candidates + candidates)[start:start + MAX_STUCK_SCAN_RUNS]
+              num_windows = -(-len(candidates) // MAX_STUCK_SCAN_RUNS)  # ceil
+              start = (int(now.timestamp() // 300) % num_windows) * MAX_STUCK_SCAN_RUNS
+              window = candidates[start:start + MAX_STUCK_SCAN_RUNS]
           else:
               window = candidates
 
