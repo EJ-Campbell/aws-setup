@@ -505,6 +505,24 @@ data "archive_file" "runner_cleanup" {
       # Lease duration - busy runners get extended, idle runners expire
       LEASE_DURATION_MINUTES = 60
 
+      # Absolute ceiling on a runner instance's life, regardless of busy state.
+      # Renewal is only safe while 'busy' means "making progress". A wedged host
+      # (leaked VMs, load average in the hundreds, unkillable D-state processes)
+      # keeps its assigned job forever, so GitHub keeps reporting busy=true and the
+      # renewal loop below never lets the lease expire - the broken instance becomes
+      # immortal and permanently occupies one of MAX_RUNNERS slots per architecture.
+      #
+      # 12h is a deliberate LOCAL policy, not a platform limit. GitHub allows a
+      # self-hosted job to run for up to 5 days (the 6h cap is for GitHub-hosted
+      # runners only), and these runners are not ephemeral, so one instance can
+      # legitimately chain many short jobs past 12h of age. The policy trade, made
+      # explicitly: every ejc3/fcvm CI job finishes in well under 2 hours, so a
+      # 12h-old runner is overwhelmingly likely wedged. Worst case the cap kills one
+      # healthy in-flight job, which a re-run fixes; a wedged slot silently starves
+      # the whole pool indefinitely, which no re-run fixes. If a legitimately long
+      # job is ever added to fcvm CI, raise this.
+      MAX_INSTANCE_AGE_HOURS = 12
+
       def get_github_pat():
           """Get GitHub PAT from SSM"""
           try:
@@ -518,16 +536,19 @@ data "archive_file" "runner_cleanup" {
           return None
 
       def get_runners(pat):
-          """Get all runners from GitHub, returns dict of name -> {id, busy}"""
+          """Get all runners from GitHub, returns dict of name -> {id, busy, status}"""
           url = f'https://api.github.com/repos/{REPO}/actions/runners'
           req = urllib.request.Request(url, headers={
               'Authorization': f'token {pat}',
               'Accept': 'application/vnd.github.v3+json'
           })
           try:
-              with urllib.request.urlopen(req) as resp:
+              with urllib.request.urlopen(req, timeout=10) as resp:
                   data = json.loads(resp.read())
-                  return {r['name']: {'id': r['id'], 'busy': r['busy']} for r in data.get('runners', [])}
+                  # status is preserved as-absent when GitHub omits it (fail CLOSED:
+                  # a missing status must never count as online, or a wedged busy
+                  # runner with a flaky API response is renewed forever again).
+                  return {r['name']: {'id': r['id'], 'busy': r['busy'], 'status': r.get('status')} for r in data.get('runners', [])}
           except Exception as e:
               print(f'Failed to get runners: {e}')
           return {}
@@ -540,7 +561,7 @@ data "archive_file" "runner_cleanup" {
                   'Authorization': f'token {pat}',
                   'Accept': 'application/vnd.github.v3+json'
               })
-              urllib.request.urlopen(del_req)
+              urllib.request.urlopen(del_req, timeout=10)
               return True
           except Exception as e:
               print(f'Failed to deregister runner {runner_id}: {e}')
@@ -612,6 +633,7 @@ data "archive_file" "runner_cleanup" {
           terminated = []
           renewed = []
           expired = []
+          over_age = []
 
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
@@ -627,7 +649,25 @@ data "archive_file" "runner_cleanup" {
 
                   # Get runner status from GitHub
                   runner_info = runners.get(runner_name, {})
-                  is_busy = runner_info.get('busy', False)
+                  # Only treat a runner as busy while GitHub explicitly reports it
+                  # online. A host that wedged mid-job reports busy=true but goes
+                  # offline, and renewing on that keeps a dead slot alive. A MISSING
+                  # status also fails closed to not-busy: the runner then takes the
+                  # idle path, which is harmless on a blip (the existing lease gives
+                  # up to LEASE_DURATION_MINUTES of grace before anything is reaped)
+                  # but can never renew a lease forever on absent evidence.
+                  is_busy = runner_info.get('busy', False) and runner_info.get('status') == 'online'
+
+                  # Hard age cap: reap regardless of busy state (see MAX_INSTANCE_AGE_HOURS)
+                  age_hours = (now - launch_time).total_seconds() / 3600
+                  if age_hours > MAX_INSTANCE_AGE_HOURS:
+                      print(f'Terminating over-age: {instance_id} (age={age_hours:.1f}h > {MAX_INSTANCE_AGE_HOURS}h, busy={runner_info.get("busy", False)})')
+                      if runner_info.get('id'):
+                          deregister_runner(runner_info['id'], pat)
+                      ec2.terminate_instances(InstanceIds=[instance_id])
+                      terminated.append(instance_id)
+                      over_age.append(instance_id)
+                      continue
 
                   # Parse lease expiry
                   if lease_expires_str:
@@ -692,7 +732,7 @@ data "archive_file" "runner_cleanup" {
                       'Authorization': f'token {pat}',
                       'Accept': 'application/vnd.github.v3+json'
                   })
-                  with urllib.request.urlopen(req) as resp:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
                       data = json.loads(resp.read())
                       queued_runs = data.get('workflow_runs', [])
 
@@ -705,7 +745,7 @@ data "archive_file" "runner_cleanup" {
                               'Authorization': f'token {pat}',
                               'Accept': 'application/vnd.github.v3+json'
                           })
-                          with urllib.request.urlopen(jobs_req) as jobs_resp:
+                          with urllib.request.urlopen(jobs_req, timeout=10) as jobs_resp:
                               jobs_data = json.loads(jobs_resp.read())
                               for job in jobs_data.get('jobs', []):
                                   if job['status'] == 'queued':
@@ -739,7 +779,7 @@ data "archive_file" "runner_cleanup" {
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
     EOF
     filename = "lambda_function.py"
   }
