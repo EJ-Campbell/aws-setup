@@ -5,6 +5,8 @@
 # so two parallel jobs can run at once.
 #
 #   parallel-box.sh up [2]       launch box 1 (or 2); tries several instance types
+#   parallel-box.sh up [2] kvm   same box, METAL pools only: /dev/kvm for hypervisor
+#                                workloads (fcvm/firecracker). Boots in many minutes.
 #   parallel-box.sh down [2]     terminate it. Its work volume is KEPT.
 #   parallel-box.sh status       both boxes: running? cost? disk?
 #   parallel-box.sh status 2     just box 2
@@ -32,9 +34,15 @@ JUMPBOX="10.0.1.72"
 # Order matters:
 #   1. 192-core virtualized, cheapest family first (c8g < c8gn < m8g < r8g < r8gd)
 #   2. 96-core virtualized -- half the cores but a much likelier pool
-# Metal is excluded entirely: it boots in many minutes, which defeats fast startup, and
-# us-west-2d has enough virtualized pools that we should never need it.
+# Metal is excluded from the DEFAULT list: it boots in many minutes, which defeats fast
+# startup, and us-west-2d has enough virtualized pools that we should never need it.
+# KVM MODE ("up N kvm") is the deliberate exception: virtualized Graviton has no
+# /dev/kvm (AWS exposes KVM only on *.metal ARM instances), so KVM workloads -- fcvm,
+# firecracker, anything that IS a hypervisor -- get a metal-only pool list and accept
+# the slow boot as the price of admission. Same ordering rules, same >=96-core floor
+# (metal-24xl = 96 cores); all verified offered in us-west-2d.
 TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xlarge c9g.48xlarge c9gd.48xlarge m8g.48xlarge m8gd.48xlarge m9g.48xlarge m9gd.48xlarge i8g.48xlarge i8ge.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gb.24xlarge c8gd.24xlarge c8gn.24xlarge c9g.24xlarge c9gd.24xlarge m8g.24xlarge m8gd.24xlarge m9g.24xlarge m9gd.24xlarge i8g.24xlarge i8ge.24xlarge r8g.24xlarge r8gd.24xlarge}"
+KVM_TYPES="${PARALLEL_BOX_TYPES:-c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl}"
 
 # The dev servers hold a restricted IAM role with no ec2:RunInstances, and terraform
 # state lives on the jumpbox, so delegate the terraform half rather than widening
@@ -73,9 +81,19 @@ say() { printf '%s\n' "$*" >&2; }
 # ---------------------------------------------------------------------------------
 CMD="${1:-status}"
 BOX="${2:-}"
+MODE="${3:-}"
 case "$BOX" in
   ""|1|2) ;;
   *) say "unknown box '$BOX' (use 1 or 2)"; exit 1 ;;
+esac
+case "$MODE" in
+  "") ;;
+  kvm)
+    # Metal-only pools: the ONLY way to get /dev/kvm on Graviton. Boots in many
+    # minutes (metal firmware init) -- the wait loop below stretches accordingly.
+    TYPES="$KVM_TYPES"
+    ;;
+  *) say "unknown mode '$MODE' (only 'kvm')"; exit 1 ;;
 esac
 
 set_box() {
@@ -100,7 +118,7 @@ box_ip() {
 if ! on_jumpbox; then
   case "$CMD" in
     up)
-      delegate "up $BOX" || exit 1
+      delegate "up $BOX${MODE:+ $MODE}" || exit 1
       IP="$(delegate "ip $BOX")"
       [ -n "$IP" ] || { say "could not determine box IP"; exit 1; }
       say "Connecting to $IP ..."
@@ -185,19 +203,35 @@ case "$CMD" in
 
     say ""
     say "Launched $CHOSEN. Waiting for SSH and the work disk to mount..."
-    for i in $(seq 1 60); do
+    # Metal firmware init takes many minutes on top of the normal boot -- give kvm
+    # mode 25 min before declaring failure (virtualized boxes keep the 10 min bound).
+    WAIT_TRIES=60
+    [ "$MODE" = "kvm" ] && WAIT_TRIES=150
+    for i in $(seq 1 "$WAIT_TRIES"); do
       IP="$(box_ip)"
       if [ -n "$IP" ] && ssh -i "$KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
            -o BatchMode=yes "ubuntu@$IP" true 2>/dev/null; then
         say "Ready at $IP"
         ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
           'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"' 2>/dev/null || true
+        if [ "$MODE" = "kvm" ]; then
+          # The entire point of metal: prove /dev/kvm exists and make it usable by
+          # ubuntu (group change applies from the next SSH session on).
+          if ssh -i "$KEY" -o StrictHostKeyChecking=no -o BatchMode=yes "ubuntu@$IP" \
+               'test -c /dev/kvm && sudo usermod -aG kvm ubuntu' 2>/dev/null; then
+            say "  kvm:   /dev/kvm present; ubuntu in kvm group (applies on next login)"
+          else
+            say "FAILED: $CHOSEN came up WITHOUT a usable /dev/kvm."
+            say "That should be impossible on a *.metal type -- investigate before using."
+            exit 1
+          fi
+        fi
         exit 0
       fi
       [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
       sleep 10
     done
-    say "Launched but SSH did not come up in 10 min; check: $0 status"
+    say "Launched but SSH did not come up in $((WAIT_TRIES / 6)) min; check: $0 status"
     exit 1
     ;;
 
