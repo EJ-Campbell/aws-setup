@@ -16,10 +16,31 @@ data "archive_file" "runner_webhook" {
       import os
       import hmac
       import hashlib
+      import urllib.request
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
+
+      REPO = 'ejc3/fcvm'
+
+      # An instance younger than this counts toward the cap even though GitHub has
+      # no registration for it yet. A *.metal instance spends several minutes in
+      # hardware POST before user_data starts, and it only registers after that
+      # script installs and configures the runner. The cleanup Lambda already
+      # treats "younger than 10 minutes" as still-setting-up; 15 is that window
+      # plus one 5-minute poll interval, so the two Lambdas can never disagree
+      # about the same instance. Without the window a booting instance would be
+      # invisible and every poll would launch another one on top of it.
+      BOOT_GRACE_MINUTES = 15
+
+      # Ceiling on non-terminated instances per architecture, regardless of health.
+      # Health filtering is what lets scale-up step over a wedged runner, but if the
+      # health signal is ever wrong in the "nothing is healthy" direction it would
+      # launch metal spot instances without limit. Two spare slots absorb a poll's
+      # worth of reaping lag and cap the blast radius of a bad signal at two extra
+      # instances per architecture.
+      LAUNCH_HEADROOM = 2
 
       def get_user_data():
           """Fetch user_data from SSM Parameter Store"""
@@ -51,8 +72,53 @@ data "archive_file" "runner_webhook" {
           ).hexdigest()
           return hmac.compare_digest(expected, signature)
 
-      def get_running_runners(arch=None):
-          """Count runner instances in any non-terminated state"""
+      def github_get(pat, url):
+          """GET a GitHub API endpoint and return parsed JSON. Raises on failure."""
+          req = urllib.request.Request(url, headers={
+              'Authorization': f'token {pat}',
+              'Accept': 'application/vnd.github.v3+json'
+          })
+          with urllib.request.urlopen(req, timeout=5) as resp:
+              return json.loads(resp.read())
+
+      def get_github_pat():
+          """Read the runner PAT from SSM; None when unset or still the placeholder"""
+          try:
+              resp = ssm.get_parameter(Name='/github-runner/pat', WithDecryption=True)
+              pat = resp['Parameter']['Value']
+              if pat and pat != 'placeholder':
+                  return pat
+          except Exception as e:
+              print(f'SSM get_parameter failed: {e}')
+          return None
+
+      def get_online_runner_names():
+          """Names of runners GitHub can currently reach, or None if that is unknown.
+
+          None is deliberately distinct from the empty set: it means GitHub could
+          not be asked, and callers must fall back to counting instances instead of
+          concluding that every instance is dead.
+          """
+          pat = get_github_pat()
+          if not pat:
+              print('No usable PAT in SSM; runner health is unknown')
+              return None
+          try:
+              data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runners?per_page=100')
+          except Exception as e:
+              print(f'Failed to list GitHub runners: {e}')
+              return None
+          return {r['name'] for r in data.get('runners', []) if r.get('status') == 'online'}
+
+      def get_capacity(arch):
+          """Count runner instances for arch that can actually take work.
+
+          The cap has to be held by runners GitHub can hand a job to, not by EC2
+          instances that merely exist. On 2026-08-07 two wedged ARM instances stayed
+          'running' to EC2 and held 2 of the 4 ARM slots for 3.5 hours while CI
+          queued. An instance counts when GitHub has it registered and online, or
+          when it is still inside BOOT_GRACE_MINUTES and no registration is due yet.
+          """
           filters = [
               {'Name': 'tag:Role', 'Values': ['github-runner']},
               {'Name': 'instance-state-name', 'Values': ['pending', 'running']}
@@ -61,8 +127,70 @@ data "archive_file" "runner_webhook" {
               name_value = f'github-runner-{arch}'
               filters.append({'Name': 'tag:Name', 'Values': [name_value]})
           response = ec2.describe_instances(Filters=filters)
-          count = sum(len(r['Instances']) for r in response['Reservations'])
-          return count
+          instances = [i for r in response['Reservations'] for i in r['Instances']]
+          if not instances:
+              # Nothing to classify, so don't spend a GitHub call on it. This is the
+              # cold-start case, which is also the one that must answer fastest.
+              return {'counted': 0, 'instances': 0, 'online': 0, 'booting': 0, 'degraded': False}
+
+          online_names = get_online_runner_names()
+          if online_names is None:
+              # Health is unknown, so degrade to the pre-2026-08-07 instance count.
+              # Over-counting only delays CI and self-heals on the next poll;
+              # under-counting launches metal spot instances on data we could not
+              # verify. Fail toward the cheaper mistake.
+              return {'counted': len(instances), 'instances': len(instances),
+                      'online': 0, 'booting': 0, 'degraded': True}
+
+          now = datetime.now(timezone.utc)
+          online = 0
+          booting = 0
+          for inst in instances:
+              if f'runner-{inst["InstanceId"]}' in online_names:
+                  online += 1
+              elif now - inst['LaunchTime'] < timedelta(minutes=BOOT_GRACE_MINUTES):
+                  booting += 1
+          return {'counted': online + booting, 'instances': len(instances),
+                  'online': online, 'booting': booting, 'degraded': False}
+
+      def emit_decision(arch, queued_jobs, capacity, max_runners, decision, detail):
+          """One CloudWatch Embedded Metric Format line per scale-up decision.
+
+          The only evidence that scale-up was gated for 3.5 hours on 2026-08-07 was
+          an unstructured log line nobody was watching. EMF makes this line both
+          greppable in Logs Insights and a real metric, with no PutMetricData call
+          and no extra IAM. ScaleUpStarved is the pathological case - refusing to
+          launch while fewer than max_runners runners can take work - which cannot
+          happen in normal operation and is what cost-alerts.tf alarms on.
+          """
+          starved = 1 if decision == 'blocked' and capacity['counted'] < max_runners else 0
+          print(json.dumps({
+              '_aws': {
+                  'Timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
+                  'CloudWatchMetrics': [{
+                      'Namespace': 'GitHubRunners',
+                      'Dimensions': [['Architecture']],
+                      'Metrics': [
+                          {'Name': 'QueuedJobs', 'Unit': 'Count'},
+                          {'Name': 'HealthyRunners', 'Unit': 'Count'},
+                          {'Name': 'InstancesCounted', 'Unit': 'Count'},
+                          {'Name': 'ScaleUpStarved', 'Unit': 'Count'}
+                      ]
+                  }]
+              },
+              'event': 'runner_scale_decision',
+              'Architecture': arch,
+              'QueuedJobs': queued_jobs,
+              'HealthyRunners': capacity['counted'],
+              'InstancesCounted': capacity['instances'],
+              'ScaleUpStarved': starved,
+              'online_runners': capacity['online'],
+              'booting_runners': capacity['booting'],
+              'max_runners': max_runners,
+              'health_source': 'instances-only' if capacity['degraded'] else 'github',
+              'decision': decision,
+              'detail': detail
+          }))
 
       def detect_architecture(labels):
           """Detect architecture from job labels, default to arm64"""
@@ -171,19 +299,37 @@ data "archive_file" "runner_webhook" {
           labels = workflow_job.get('labels', [])
           arch = detect_architecture(labels)
 
-          # Check per-architecture runner count
+          # Check per-architecture capacity. queued_jobs is supplied by the cleanup
+          # Lambda's poll (it counts them); a real GitHub delivery is one job.
           max_runners = int(os.environ.get('MAX_RUNNERS', '3'))
-          running = get_running_runners(arch)
+          try:
+              # Coerce: a non-numeric value would make the EMF line invalid and
+              # silently drop every metric on it, including ScaleUpStarved.
+              queued_jobs = int(payload.get('queued_jobs', 1))
+          except (TypeError, ValueError):
+              queued_jobs = 1
+          capacity = get_capacity(arch)
 
-          if running >= max_runners:
-              return {'statusCode': 200, 'body': f'Max {arch} runners ({max_runners}) reached'}
+          if capacity['counted'] >= max_runners:
+              detail = f'Max {arch} runners ({max_runners}) reached'
+              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              return {'statusCode': 200, 'body': detail}
+
+          if capacity['instances'] >= max_runners + LAUNCH_HEADROOM:
+              detail = (f'{arch} instance ceiling ({max_runners + LAUNCH_HEADROOM}) reached '
+                        f'with only {capacity["counted"]} able to take work')
+              emit_decision(arch, queued_jobs, capacity, max_runners, 'blocked', detail)
+              return {'statusCode': 200, 'body': detail}
 
           # Launch new runner for detected architecture
-          spot_id, instance_type = launch_runner(arch)
-          return {
-              'statusCode': 200,
-              'body': f'Launched {arch} runner ({instance_type}): {spot_id}'
-          }
+          try:
+              spot_id, instance_type = launch_runner(arch)
+          except Exception as e:
+              emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
+              raise
+          detail = f'Launched {arch} runner ({instance_type}): {spot_id}'
+          emit_decision(arch, queued_jobs, capacity, max_runners, 'launched', detail)
+          return {'statusCode': 200, 'body': detail}
     EOF
     filename = "lambda_function.py"
   }
@@ -523,6 +669,89 @@ data "archive_file" "runner_cleanup" {
       # job is ever added to fcvm CI, raise this.
       MAX_INSTANCE_AGE_HOURS = 12
 
+      # A runner whose current job has been executing this long is stuck by
+      # definition. Across five recent green CI runs the longest legitimate
+      # self-hosted job was 43.5 minutes (Host-Root-arm64-SnapshotEnabled), so 180
+      # leaves better than 4x headroom and cannot reap healthy work. Nothing else
+      # bounds it: GitHub enforces no server-side job-execution limit for
+      # self-hosted runners, and the runner-side timeout-minutes default (360) is
+      # enforced by the runner process on the box - exactly what a wedged host
+      # cannot do. On 2026-08-07 a job sat in_progress for 5h18m on a box with load
+      # 523 while GitHub still reported that runner online and busy, so neither the
+      # lease nor a liveness check can see it. The job's own age is the one
+      # server-side signal that separates "holds a job" from "makes progress".
+      MAX_JOB_RUNTIME_MINUTES = 180
+
+      # Cap on per-run job lookups in a single poll, so a backlog of stale
+      # in-progress runs cannot walk this Lambda into its timeout.
+      MAX_STUCK_SCAN_RUNS = 10
+
+      def github_get(pat, url):
+          """GET a GitHub API endpoint and return parsed JSON. Raises on failure."""
+          req = urllib.request.Request(url, headers={
+              'Authorization': f'token {pat}',
+              'Accept': 'application/vnd.github.v3+json'
+          })
+          with urllib.request.urlopen(req, timeout=5) as resp:
+              return json.loads(resp.read())
+
+      def parse_ts(value):
+          """Parse a GitHub ISO-8601 timestamp; None when absent or malformed"""
+          if not value:
+              return None
+          try:
+              return datetime.fromisoformat(value.replace('Z', '+00:00'))
+          except Exception:
+              return None
+
+      def get_stuck_runners(pat, now):
+          """Runners whose in-progress job started over MAX_JOB_RUNTIME_MINUTES ago.
+
+          Returns {runner_name: (job_name, minutes_running)}.
+
+          Fail-safe: every GitHub error yields no candidates, so an outage or rate
+          limit reaps nothing, and a runner is only named when GitHub itself says
+          that runner is still executing that job.
+
+          Cheap: a job cannot have started before its run did, so a run that started
+          inside the ceiling is skipped without a jobs call. In steady state that is
+          one list call per poll and no per-run calls at all.
+          """
+          cutoff = now - timedelta(minutes=MAX_JOB_RUNTIME_MINUTES)
+          stuck = {}
+          try:
+              runs = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs?status=in_progress&per_page=50')
+          except Exception as e:
+              print(f'Stuck-job scan: cannot list in-progress runs: {e}')
+              return stuck
+
+          candidates = []
+          for run in runs.get('workflow_runs', []):
+              started = parse_ts(run.get('run_started_at') or run.get('created_at'))
+              # Unparseable start time: keep it as a candidate. Checking costs one
+              # call and reaping still needs per-job evidence below.
+              if started is not None and started > cutoff:
+                  continue
+              candidates.append((started or cutoff, run))
+          candidates.sort(key=lambda c: c[0])
+
+          for _, run in candidates[:MAX_STUCK_SCAN_RUNS]:
+              try:
+                  jobs = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/jobs?per_page=50')
+              except Exception as e:
+                  print(f'Stuck-job scan: cannot list jobs for run {run.get("id")}: {e}')
+                  continue
+              for job in jobs.get('jobs', []):
+                  if job.get('status') != 'in_progress':
+                      continue
+                  started = parse_ts(job.get('started_at'))
+                  if started is None or started > cutoff:
+                      continue
+                  name = job.get('runner_name') or ''
+                  if name.startswith('runner-i-'):
+                      stuck[name] = (job.get('name'), (now - started).total_seconds() / 60)
+          return stuck
+
       def get_github_pat():
           """Get GitHub PAT from SSM"""
           try:
@@ -604,6 +833,12 @@ data "archive_file" "runner_cleanup" {
           runners = get_runners(pat) if pat else {}
           print(f'Found {len(runners)} runners from GitHub')
           now = datetime.now(timezone.utc)
+
+          # Runners holding a job that has run past MAX_JOB_RUNTIME_MINUTES. Read
+          # once here, acted on in Phase 2b below.
+          stuck_runners = get_stuck_runners(pat, now) if pat else {}
+          if stuck_runners:
+              print(f'Stuck jobs detected on: {sorted(stuck_runners)}')
 
           # Phase 1: Clean up orphaned GitHub runners (instances gone)
           orphans_cleaned = []
@@ -703,6 +938,26 @@ data "archive_file" "runner_cleanup" {
                   else:
                       print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
 
+          # Phase 2b: Reap runners whose current job has exceeded the ceiling.
+          # Phase 2 cannot see this case: GitHub reports the runner online and busy
+          # the whole time, so the lease is renewed on every poll forever. The job's
+          # own age is per-job, so back-to-back healthy jobs never accumulate
+          # toward it and a healthy busy runner is never reaped.
+          stuck_terminated = []
+          running_ids = {i['InstanceId'] for r in response['Reservations'] for i in r['Instances']}
+          for runner_name, (job_name, minutes) in sorted(stuck_runners.items()):
+              instance_id = runner_name.replace('runner-', '')
+              if instance_id not in running_ids or instance_id in terminated:
+                  continue
+              print(f'Terminating stuck: {instance_id} (job {job_name!r} in_progress '
+                    f'{minutes:.0f}m > {MAX_JOB_RUNTIME_MINUTES}m)')
+              runner_info = runners.get(runner_name, {})
+              if runner_info.get('id'):
+                  deregister_runner(runner_info['id'], pat)
+              ec2.terminate_instances(InstanceIds=[instance_id])
+              terminated.append(instance_id)
+              stuck_terminated.append(instance_id)
+
           # Phase 3: Clean up stale AMI builder instances (> 2 hours old)
           ami_builder_terminated = []
           ami_response = ec2.describe_instances(
@@ -727,46 +982,41 @@ data "archive_file" "runner_cleanup" {
           launched = []
           if pat:
               try:
-                  url = f'https://api.github.com/repos/{REPO}/actions/runs?status=queued&per_page=10'
-                  req = urllib.request.Request(url, headers={
-                      'Authorization': f'token {pat}',
-                      'Accept': 'application/vnd.github.v3+json'
-                  })
-                  with urllib.request.urlopen(req, timeout=10) as resp:
-                      data = json.loads(resp.read())
-                      queued_runs = data.get('workflow_runs', [])
+                  data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs?status=queued&per_page=10')
+                  queued_runs = data.get('workflow_runs', [])
 
                   if queued_runs:
-                      # Find which architectures have queued self-hosted jobs
-                      archs_needed = set()
+                      # Count queued self-hosted jobs per architecture. The count
+                      # rides along to the webhook Lambda so its decision record
+                      # carries the demand side of the decision, not just supply.
+                      queued_by_arch = {}
                       for run in queued_runs[:5]:  # Limit API calls
-                          jobs_url = f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/jobs'
-                          jobs_req = urllib.request.Request(jobs_url, headers={
-                              'Authorization': f'token {pat}',
-                              'Accept': 'application/vnd.github.v3+json'
-                          })
-                          with urllib.request.urlopen(jobs_req, timeout=10) as jobs_resp:
-                              jobs_data = json.loads(jobs_resp.read())
-                              for job in jobs_data.get('jobs', []):
-                                  if job['status'] == 'queued':
-                                      labels = [l.lower() for l in job.get('labels', [])]
-                                      if 'self-hosted' in labels:
-                                          if 'x64' in labels or 'x86_64' in labels or 'amd64' in labels:
-                                              archs_needed.add('x86_64')
-                                          else:
-                                              archs_needed.add('arm64')
+                          jobs_data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/jobs')
+                          for job in jobs_data.get('jobs', []):
+                              if job['status'] == 'queued':
+                                  labels = [l.lower() for l in job.get('labels', [])]
+                                  if 'self-hosted' in labels:
+                                      if 'x64' in labels or 'x86_64' in labels or 'amd64' in labels:
+                                          arch = 'x86_64'
+                                      else:
+                                          arch = 'arm64'
+                                      queued_by_arch[arch] = queued_by_arch.get(arch, 0) + 1
 
                       # Invoke webhook Lambda for each architecture needed
                       webhook_fn = os.environ.get('WEBHOOK_FUNCTION', '')
-                      for arch in archs_needed:
+                      for arch, queued_jobs in sorted(queued_by_arch.items()):
                           labels = ['self-hosted', 'Linux', 'X64'] if arch == 'x86_64' else ['self-hosted', 'Linux', 'ARM64']
                           # Direct invoke: no requestContext, so the handler trusts it
                           # without a header. Skips HMAC, which API Gateway callers cannot.
                           payload = {
-                              'body': json.dumps({'action': 'queued', 'workflow_job': {'labels': labels}}),
+                              'body': json.dumps({
+                                  'action': 'queued',
+                                  'workflow_job': {'labels': labels},
+                                  'queued_jobs': queued_jobs
+                              }),
                               'headers': {}
                           }
-                          print(f'Retrying runner launch for {arch} (queued jobs found)')
+                          print(f'Retrying runner launch for {arch} ({queued_jobs} queued jobs)')
                           try:
                               lambda_client.invoke(
                                   FunctionName=webhook_fn,
@@ -779,7 +1029,7 @@ data "archive_file" "runner_cleanup" {
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'stuck_terminated': stuck_terminated, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
     EOF
     filename = "lambda_function.py"
   }
@@ -793,7 +1043,9 @@ resource "aws_lambda_function" "runner_cleanup" {
   role             = aws_iam_role.runner_lambda[0].arn
   handler          = "lambda_function.handler"
   runtime          = "python3.12"
-  timeout          = 60
+  # The stuck-job scan adds up to MAX_STUCK_SCAN_RUNS job lookups at a 5s socket
+  # timeout on top of the existing GitHub calls, which does not fit in 60s.
+  timeout = 120
 
   environment {
     variables = {

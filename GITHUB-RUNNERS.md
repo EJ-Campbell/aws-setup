@@ -63,6 +63,27 @@ per architecture**. ARM tries `c7gd.metal`→`c7g.metal`; x86 tries
 `c5d`/`c5`/`c6i`/`m5d.metal` in order for spot availability. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.
 
+**What holds a slot.** The cap counts runners that can *take work*, not EC2 instances that
+exist. The Lambda reads the same PAT from SSM, lists `GET /repos/ejc3/fcvm/actions/runners`,
+and counts an instance only if GitHub has `runner-<instance-id>` **online**, or the instance
+is younger than **`BOOT_GRACE_MINUTES` (15)** and no registration is due yet — a `*.metal`
+box spends minutes in POST before user_data starts, and without that window every poll would
+launch another instance on top of a booting one. Because booting instances still count, the
+cap still binds during a cold start and the herd can never exceed `MAX_RUNNERS` in flight.
+A second ceiling, `MAX_RUNNERS + LAUNCH_HEADROOM (2)` **instances** per architecture
+regardless of health, caps the blast radius if the health signal is ever wrong in the
+"nothing is healthy" direction. If GitHub cannot be reached the Lambda **degrades to the
+plain instance count**: over-counting only delays CI and self-heals next poll, while
+under-counting launches metal spot instances on data it could not verify.
+
+**Scale-up is observable.** Every decision prints one CloudWatch Embedded Metric Format
+line (`event: runner_scale_decision`) carrying `QueuedJobs`, `HealthyRunners`,
+`InstancesCounted`, `ScaleUpStarved`, the `Architecture` dimension, and the reason — a
+structured log and a real metric in `GitHubRunners` with no `PutMetricData` call and no
+extra IAM. `ScaleUpStarved` is 1 only when the instance ceiling blocks a launch that
+healthy-runner accounting would have allowed; `cost-alerts.tf` alarms on it
+(`runner-scale-up-starved`).
+
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
 Advanced tier, base64 — too big for Lambda's 4 KB env limit). On boot it sets up the box
 (btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads the PAT from SSM
@@ -74,13 +95,30 @@ a service. The PAT itself never leaves AWS; what touches `config.sh` is the ephe
 registration token derived from it.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
-(`rate(5 minutes)`) and does four things, three of them using the PAT: deregisters GitHub
+(`rate(5 minutes)`) and does five things, four of them using the PAT: deregisters GitHub
 runners whose instance is gone; renews the lease on busy runners (+60m) and lets idle ones
 expire, then terminates and deregisters anything past its lease (instances younger than 10
-minutes are skipped so setup isn't interrupted); terminates stray `ami-builder-temp`
-instances older than 2 hours (pure EC2, no PAT); and re-checks GitHub for `queued` runs to
-retry launches that failed (spot
-quota, capacity) — GitHub doesn't redeliver webhooks, so this poll is the retry.
+minutes are skipped so setup isn't interrupted); **terminates any runner whose current job
+has been `in_progress` longer than `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray
+`ami-builder-temp` instances older than 2 hours (pure EC2, no PAT); and re-checks GitHub for
+`queued` runs to retry launches that failed (spot quota, capacity) — GitHub doesn't
+redeliver webhooks, so this poll is the retry, and it now passes the per-architecture queued
+count along so the decision record has the demand side too.
+
+**Why job duration is the health signal.** A wedged host keeps its assigned job, so
+`busy` stays true and the lease renews forever; the host is still online, so a liveness check
+sees nothing either. GitHub enforces no server-side job-execution limit for self-hosted
+runners, and the runner-side `timeout-minutes` default (360) runs *on the box* — exactly what
+a wedged box cannot do. The job's own age is the one server-side signal that separates
+"holds a job" from "makes progress", and it is per-job, so back-to-back healthy jobs never
+accumulate toward it. 180 minutes is over 4x the longest legitimate self-hosted job observed
+(43.5m, `Host-Root-arm64-SnapshotEnabled`). The scan is cheap because a job cannot start
+before its run: only `in_progress` runs already older than the ceiling get a jobs lookup
+(capped at 10 per poll), so steady state is one list call. Every GitHub error yields no
+candidates, so an outage or rate limit reaps nothing. This is a control-plane check on
+purpose — the runner AMI publishes no CloudWatch metrics, and an on-box guard (the pattern
+`ejc3/fcvm` uses for disk in `runner-disk-guard.timer`) cannot be trusted to run on a host
+whose scheduler is the thing that failed.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
 only while GitHub explicitly reports it `online` (a missing `status` fails closed to
