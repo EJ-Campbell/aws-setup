@@ -735,7 +735,20 @@ data "archive_file" "runner_cleanup" {
               candidates.append((started or cutoff, run))
           candidates.sort(key=lambda c: c[0])
 
-          for _, run in candidates[:MAX_STUCK_SCAN_RUNS]:
+          # Rotate the scan window across polls instead of pinning the same
+          # oldest-first prefix: with more than MAX_STUCK_SCAN_RUNS over-age runs,
+          # a fixed prefix of stale hosted-only runs would starve a wedged
+          # self-hosted runner in position N+1 forever. The offset is derived from
+          # wall clock (stateless -- Lambda invocations share nothing), advances
+          # every 5-minute poll, and walks the whole candidate list within
+          # ceil(N / MAX_STUCK_SCAN_RUNS) polls.
+          if len(candidates) > MAX_STUCK_SCAN_RUNS:
+              start = int(now.timestamp() // 300) % len(candidates)
+              window = (candidates + candidates)[start:start + MAX_STUCK_SCAN_RUNS]
+          else:
+              window = candidates
+
+          for _, run in window:
               try:
                   jobs = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs/{run["id"]}/jobs?per_page=50')
               except Exception as e:
@@ -751,7 +764,6 @@ data "archive_file" "runner_cleanup" {
                   if name.startswith('runner-i-'):
                       stuck[name] = (job.get('name'), (now - started).total_seconds() / 60)
           return stuck
->>>>>>> fe77875 (Count healthy runners, reap stuck ones, and make the decision observable)
 
       def get_github_pat():
           """Get GitHub PAT from SSM"""
