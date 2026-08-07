@@ -166,11 +166,24 @@ data "archive_file" "runner_webhook" {
           The only evidence that scale-up was gated for 3.5 hours on 2026-08-07 was
           an unstructured log line nobody was watching. EMF makes this line both
           greppable in Logs Insights and a real metric, with no PutMetricData call
-          and no extra IAM. ScaleUpStarved is the pathological case - refusing to
-          launch while fewer than max_runners runners can take work - which cannot
-          happen in normal operation and is what cost-alerts.tf alarms on.
+          and no extra IAM.
           """
-          starved = 1 if decision == 'blocked' and capacity['counted'] < max_runners else 0
+          # Work is queued and this decision refused to add capacity for it.
+          # Deliberately NOT gated on counted < max_runners: on 2026-08-07 both
+          # wedged ARM runners were GitHub-online, so counted was 4 of 4 for the
+          # whole 3.5-hour window and that gate pinned this metric to 0 for exactly
+          # the incident it was written for. Ordinary saturation raises it too, so
+          # the discrimination lives in the alarm, not here: runner-scale-up-starved
+          # needs 12 consecutive polls (60 min), which is longer than the longest
+          # measured self-hosted job (43.5 min), so one over-capacity push drains
+          # before it fires while a pool that cannot recover does not.
+          starved = 1 if decision == 'blocked' and queued_jobs > 0 else 0
+          # Jobs are waiting and GitHub has nothing it can hand them to. Booting
+          # instances count toward the cap (that is what stops a launch herd) but
+          # they cannot serve a job, so this keys on `online` alone. Suppressed
+          # while degraded: with GitHub unreachable `online` is 0 by construction
+          # and would be pure noise - runner-pat-unusable covers that blind spot.
+          no_online = 1 if queued_jobs > 0 and not capacity['degraded'] and capacity['online'] == 0 else 0
           print(json.dumps({
               '_aws': {
                   'Timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -180,8 +193,10 @@ data "archive_file" "runner_webhook" {
                       'Metrics': [
                           {'Name': 'QueuedJobs', 'Unit': 'Count'},
                           {'Name': 'HealthyRunners', 'Unit': 'Count'},
+                          {'Name': 'OnlineRunners', 'Unit': 'Count'},
                           {'Name': 'InstancesCounted', 'Unit': 'Count'},
-                          {'Name': 'ScaleUpStarved', 'Unit': 'Count'}
+                          {'Name': 'ScaleUpStarved', 'Unit': 'Count'},
+                          {'Name': 'ZeroOnlineRunners', 'Unit': 'Count'}
                       ]
                   }]
               },
@@ -189,9 +204,10 @@ data "archive_file" "runner_webhook" {
               'Architecture': arch,
               'QueuedJobs': queued_jobs,
               'HealthyRunners': capacity['counted'],
+              'OnlineRunners': capacity['online'],
               'InstancesCounted': capacity['instances'],
               'ScaleUpStarved': starved,
-              'online_runners': capacity['online'],
+              'ZeroOnlineRunners': no_online,
               'booting_runners': capacity['booting'],
               'max_runners': max_runners,
               'health_source': 'instances-only' if capacity['degraded'] else 'github',
@@ -217,11 +233,10 @@ data "archive_file" "runner_webhook" {
       # EC2 state-reason codes meaning a launch never got the capacity it asked for.
       # Deliberately excludes Server.SpotInstanceTermination, which is ambiguous: it
       # covers the ordinary reclaim of a runner that worked fine for an hour, and
-      # rotating on that would send ARM to c7g.metal - a type with no instance-store
-      # NVMe, so user_data never builds /mnt/fcvm-btrfs - after every routine
-      # interruption. Rotate on launches that failed, not on runners that were taken
-      # back. A reclaim that does mean no capacity still gets caught, one poll later,
-      # by the stall check below.
+      # rotating on that would walk the pool off its cheapest type after every
+      # routine interruption. Rotate on launches that failed, not on runners that
+      # were taken back. A reclaim that does mean no capacity still gets caught, one
+      # poll later, by the stall check below.
       CAPACITY_STATE_REASONS = (
           'Server.InsufficientInstanceCapacity',
           'Server.CapacityOversubscribed',
@@ -272,6 +287,23 @@ data "archive_file" "runner_webhook" {
                   failed.add(instance_type)
           return failed
 
+      # Every type here has instance-store NVMe, which is an eligibility rule, not a
+      # preference. user_data builds /mnt/fcvm-btrfs across the instance-store disks
+      # and fcvm's tests write VM images, snapshots and cargo output there; on an
+      # EBS-only box that directory does not exist. The old lists rotated onto
+      # c7g.metal and c5.metal/c6i.metal, which have no instance store at all, so a
+      # capacity failure could promote the pool onto a type that boots, registers,
+      # takes a job and fails it. Verified against
+      # `describe-instance-types --filters bare-metal=true,instance-storage-supported=true`
+      # and `describe-instance-type-offerings --location us-west-1a`, which is the
+      # only AZ the runner subnet lives in. ARM stays on Graviton3 (same ISA level as
+      # the c7gd.metal dev box, so nested-virtualisation behaviour matches); x86
+      # stays on Nitro types with local NVMe.
+      RUNNER_INSTANCE_TYPES = {
+          'x86_64': ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal'],
+          'arm64': ['c7gd.metal', 'm7gd.metal', 'r7gd.metal'],
+      }
+
       def get_instance_types(arch, deprioritized=()):
           """Instance types to try for architecture, recent capacity failures last.
 
@@ -283,11 +315,7 @@ data "archive_file" "runner_webhook" {
           raised to advance it. The previous attempt's outcome is what advances the
           list, which is why this takes the failures as an argument.
           """
-          if arch == 'x86_64':
-              # Try multiple x86 metal types for better spot availability
-              types = ['c5d.metal', 'c5.metal', 'c6i.metal', 'm5d.metal']
-          else:
-              types = ['c7gd.metal', 'c7g.metal']
+          types = RUNNER_INSTANCE_TYPES['x86_64' if arch == 'x86_64' else 'arm64']
           return ([t for t in types if t not in deprioritized]
                   + [t for t in types if t in deprioritized])
 
@@ -694,41 +722,77 @@ RSYSLOG
 systemctl restart rsyslog || true
 sysctl -w kernel.printk="7 4 1 7" || true
 
-# Mount NVMe as btrfs RAID0 at /mnt/fcvm-btrfs
+# Instance identity, read once and reused. The NVMe check below has to be able to
+# report a failure, so this comes before anything that can fail.
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+imds() { curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+INSTANCE_ID=$(imds instance-id)
+REGION=$(imds placement/region)
+INSTANCE_TYPE=$(imds instance-type)
+
+# Instance-store NVMe is a hard requirement of this runner, not an optimisation.
+# fcvm's CI writes VM images, snapshots, container storage and cargo output to
+# /mnt/fcvm-btrfs; on a box with no instance store that path does not exist and every
+# job placed there fails. This script used to guard only the btrfs setup on the disk
+# count and then register the runner unconditionally, so an EBS-only instance type -
+# which the spot fallback list could rotate onto - produced a runner that was online,
+# counted as healthy capacity, and silently broken.
+#
+# Fail before registering. An unregistered instance is never handed a job, never
+# counts as an online runner, and is terminated by the cleanup Lambda when its lease
+# expires. The metric is the loud part: nothing else on this box reports to
+# CloudWatch, and a runner that quietly never appears is exactly the failure mode
+# this whole change set exists to eliminate.
+bootstrap_failed() {
+  MSG="github-runner bootstrap FAILED on $INSTANCE_ID ($INSTANCE_TYPE): $2"
+  logger -p user.crit "$MSG" || true
+  echo "$MSG" > /dev/ttyS0 || true
+  aws cloudwatch put-metric-data --region "$REGION" \
+    --namespace GitHubRunners --metric-name RunnerBootstrapFailed \
+    --unit Count --value 1 --dimensions "Reason=$1" || true
+  exit 1
+}
+
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
 NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$")
 NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
-if [ "$NVME_COUNT" -gt 0 ]; then
-  CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
-  BTRFS_DEVS=$(btrfs filesystem show /mnt/fcvm-btrfs 2>/dev/null | grep -c 'devid' || echo 0)
-  if [[ "$CURRENT_MOUNT" == /dev/nvme* ]] && [ "$BTRFS_DEVS" -ge "$NVME_COUNT" ]; then
-    echo "RAID0 already mounted ($BTRFS_DEVS devices), skipping"
-  else
-    # Unmount existing (loop from AMI or single-NVMe from old service)
-    mountpoint -q /mnt/fcvm-btrfs && umount /mnt/fcvm-btrfs || true
-    which mkfs.btrfs || apt-get install -y btrfs-progs
-    mkdir -p /mnt/fcvm-btrfs
-    if [ "$NVME_COUNT" -ge 2 ]; then
-      NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
-      echo "RAID0 across $NVME_COUNT NVMe: $NVME_PATHS"
-      mkfs.btrfs -f -d raid0 -m raid0 $NVME_PATHS
-      mount $(echo "$NVME_PATHS" | awk '{print $1}') /mnt/fcvm-btrfs
-    else
-      NVME_DEV=$(echo "$NVME_DEVS" | head -1)
-      echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
-      mkfs.btrfs -f /dev/$NVME_DEV
-      mount /dev/$NVME_DEV /mnt/fcvm-btrfs
-    fi
-    chmod 1777 /mnt/fcvm-btrfs
-  fi
-
-  mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache,containers,cargo-target}
-  chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
-  mkdir -p /home/ubuntu/.local/share
-  ln -sf /mnt/fcvm-btrfs/containers /home/ubuntu/.local/share/containers
-  chown -R ubuntu:ubuntu /home/ubuntu/.local
-  echo 'export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target' >> /home/ubuntu/.bashrc
+if [ "$NVME_COUNT" -eq 0 ]; then
+  bootstrap_failed no-instance-store "no instance-store NVMe, refusing to register"
 fi
+
+# Mount NVMe as btrfs RAID0 at /mnt/fcvm-btrfs
+CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
+BTRFS_DEVS=$(btrfs filesystem show /mnt/fcvm-btrfs 2>/dev/null | grep -c 'devid' || echo 0)
+if [[ "$CURRENT_MOUNT" == /dev/nvme* ]] && [ "$BTRFS_DEVS" -ge "$NVME_COUNT" ]; then
+  echo "RAID0 already mounted ($BTRFS_DEVS devices), skipping"
+else
+  # Unmount existing (loop from AMI or single-NVMe from old service)
+  mountpoint -q /mnt/fcvm-btrfs && umount /mnt/fcvm-btrfs || true
+  which mkfs.btrfs || apt-get install -y btrfs-progs
+  mkdir -p /mnt/fcvm-btrfs
+  if [ "$NVME_COUNT" -ge 2 ]; then
+    NVME_PATHS=$(echo "$NVME_DEVS" | sed 's|^|/dev/|' | tr '\n' ' ')
+    echo "RAID0 across $NVME_COUNT NVMe: $NVME_PATHS"
+    mkfs.btrfs -f -d raid0 -m raid0 $NVME_PATHS
+    mount $(echo "$NVME_PATHS" | awk '{print $1}') /mnt/fcvm-btrfs
+  else
+    NVME_DEV=$(echo "$NVME_DEVS" | head -1)
+    echo "Setting up NVMe as btrfs: /dev/$NVME_DEV"
+    mkfs.btrfs -f /dev/$NVME_DEV
+    mount /dev/$NVME_DEV /mnt/fcvm-btrfs
+  fi
+  chmod 1777 /mnt/fcvm-btrfs
+fi
+
+mkdir -p /mnt/fcvm-btrfs/{kernels,rootfs,initrd,state,snapshots,vm-disks,cache,image-cache,containers,cargo-target}
+chown -R ubuntu:ubuntu /mnt/fcvm-btrfs
+mkdir -p /home/ubuntu/.local/share
+ln -sf /mnt/fcvm-btrfs/containers /home/ubuntu/.local/share/containers
+chown -R ubuntu:ubuntu /home/ubuntu/.local
+echo 'export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target' >> /home/ubuntu/.bashrc
+
+# The mount is the point of the check above: prove it before going any further.
+mountpoint -q /mnt/fcvm-btrfs || bootstrap_failed btrfs-not-mounted "/mnt/fcvm-btrfs not mounted, refusing to register"
 
 # Runtime permissions
 chmod 666 /dev/kvm
@@ -741,10 +805,8 @@ iptables -P FORWARD ACCEPT || true
 # Assign a global IPv6 address to the ENI
 # AWS run_instances can't set both Ipv6AddressCount and Ipv6PrefixCount in the same
 # NetworkInterfaces entry, so we assign the IPv6 address post-launch.
-TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
-ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
-REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
+MAC=$(imds mac)
+ENI_ID=$(imds "network/interfaces/macs/$MAC/interface-id")
 aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION" && echo "IPv6 address assigned to $ENI_ID"
 
 # Raise dirty_ratio to prevent writeback throttling during snapshot creation
@@ -763,8 +825,6 @@ chmod 700 /home/ubuntu/.ssh
 chmod 600 /home/ubuntu/.ssh/authorized_keys
 
 snap start amazon-ssm-agent || true
-TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 ARCH=$(uname -m)
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -782,15 +842,25 @@ cd /opt/actions-runner
 curl -sL "$RUNNER_URL" | tar xz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
+# Registration is the last thing that can fail quietly, and the PAT is the single
+# point of failure behind all of it: when /github-runner/pat expires this request is
+# refused, the box comes up healthy in every other respect, and nothing joins the
+# pool. Both failures are reported the same way as a missing disk.
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
-if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
-  REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-    https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
-  sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "runner-$INSTANCE_ID" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
-  ./svc.sh install ubuntu
-  ./svc.sh start
+if [ -z "$PAT" ] || [ "$PAT" = "placeholder" ]; then
+  bootstrap_failed no-pat "no usable PAT in /github-runner/pat, refusing to register"
 fi
+
+REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
+  https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token // empty')
+if [ -z "$REG_TOKEN" ]; then
+  bootstrap_failed registration-token "GitHub refused a registration token (PAT expired or lacks Administration: write)"
+fi
+
+sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
+  --name "runner-$INSTANCE_ID" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+./svc.sh install ubuntu
+./svc.sh start
 EOF
 }
 
@@ -818,6 +888,7 @@ data "archive_file" "runner_cleanup" {
     content  = <<-EOF
       import boto3
       import urllib.request
+      import urllib.error
       import json
       import os
       from datetime import datetime, timezone, timedelta
@@ -848,22 +919,63 @@ data "archive_file" "runner_cleanup" {
       # job is ever added to fcvm CI, raise this.
       MAX_INSTANCE_AGE_HOURS = 12
 
-      # A runner whose current job has been executing this long is stuck by
-      # definition. Across five recent green CI runs the longest legitimate
-      # self-hosted job was 43.5 minutes (Host-Root-arm64-SnapshotEnabled), so 180
-      # leaves better than 4x headroom and cannot reap healthy work. Nothing else
-      # bounds it: GitHub enforces no server-side job-execution limit for
-      # self-hosted runners, and the runner-side timeout-minutes default (360) is
-      # enforced by the runner process on the box - exactly what a wedged host
-      # cannot do. On 2026-08-07 a job sat in_progress for 5h18m on a box with load
-      # 523 while GitHub still reported that runner online and busy, so neither the
-      # lease nor a liveness check can see it. The job's own age is the one
-      # server-side signal that separates "holds a job" from "makes progress".
+      # Backstop ceiling on one job's total execution. Nothing else bounds it:
+      # GitHub enforces no server-side job-execution limit for self-hosted runners,
+      # and the runner-side timeout-minutes default (360) is enforced by the runner
+      # process on the box - exactly what a wedged host cannot do. On 2026-08-07 a
+      # job sat in_progress for 5h18m on a box with load 523 while GitHub still
+      # reported that runner online and busy, so neither the lease nor a liveness
+      # check can see it. Measured over 8 successful ci.yml runs (48 self-hosted
+      # jobs) the longest legitimate job was 43.5 minutes
+      # (Host-Root-arm64-SnapshotEnabled), so this keeps better than 4x headroom.
       MAX_JOB_RUNTIME_MINUTES = 180
+
+      # The fast signal, and the reason 180 minutes is no longer the time to
+      # remediation. GitHub records step transitions server-side as the runner
+      # reports them, so a step that has been `in_progress` for this long is a host
+      # that has stopped making progress - the runner is still there, still holding
+      # the job, and no longer advancing it. That is exactly the 2026-08-07 failure,
+      # and it is visible in the same jobs response the scan already reads, at no
+      # extra API cost.
+      #
+      # 60 minutes is measured, not guessed: across the same 8 successful ci.yml
+      # runs the longest legitimate *step* was 35.1 minutes (`test-root` in
+      # Host-Root-arm64-SnapshotEnabled) and the second longest 27.4 minutes. 60 is
+      # 1.7x the longest step and still longer than the longest whole job, so no
+      # healthy step can reach it, and a wedged runner is reaped in about an hour
+      # instead of three. The cost of being wrong is symmetric with the 12h age cap:
+      # one killed job that a re-run fixes, against a slot that starves the pool.
+      MAX_STEP_RUNTIME_MINUTES = 60
 
       # Cap on per-run job lookups in a single poll, so a backlog of stale
       # in-progress runs cannot walk this Lambda into its timeout.
       MAX_STUCK_SCAN_RUNS = 10
+
+      # PAT health, filled in by github_get and reported once per poll. Every
+      # capability in this file rides on /github-runner/pat: when it expires
+      # capacity accounting degrades to counting instances, nothing is reaped, the
+      # queue poll stops launching, and new instances boot without registering. All
+      # of that is silent, so the token's own health is a metric.
+      PAT_STATUS = {'valid': None, 'days_to_expiry': None}
+
+      def note_token_expiry(headers):
+          """Record days remaining from GitHub's token-expiration header, if sent.
+
+          Fine-grained PATs carry `github-authentication-token-expiration`; classic
+          tokens without an expiry send nothing, in which case there is no expiry to
+          alarm on and the metric is simply not emitted.
+          """
+          raw = headers.get('github-authentication-token-expiration') if headers else None
+          if not raw:
+              return
+          for fmt in ('%Y-%m-%d %H:%M:%S %Z', '%Y-%m-%d %H:%M:%S UTC', '%Y-%m-%dT%H:%M:%SZ'):
+              try:
+                  expires = datetime.strptime(raw.strip(), fmt).replace(tzinfo=timezone.utc)
+              except ValueError:
+                  continue
+              PAT_STATUS['days_to_expiry'] = (expires - datetime.now(timezone.utc)).total_seconds() / 86400
+              return
+          print(f'Unparseable token expiry header: {raw!r}')
 
       def github_get(pat, url):
           """GET a GitHub API endpoint and return parsed JSON. Raises on failure."""
@@ -871,8 +983,21 @@ data "archive_file" "runner_cleanup" {
               'Authorization': f'token {pat}',
               'Accept': 'application/vnd.github.v3+json'
           })
-          with urllib.request.urlopen(req, timeout=5) as resp:
-              return json.loads(resp.read())
+          try:
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read())
+                  PAT_STATUS['valid'] = 1
+                  note_token_expiry(resp.headers)
+                  return data
+          except urllib.error.HTTPError as e:
+              # 401 is an expired or revoked token. A 403 is only a token problem
+              # when it is not rate limiting - GitHub uses 403 for both, and a rate
+              # limit says nothing about the credential.
+              rate_limited = e.headers is not None and e.headers.get('x-ratelimit-remaining') == '0'
+              if e.code == 401 or (e.code == 403 and not rate_limited):
+                  PAT_STATUS['valid'] = 0
+                  print(f'GitHub rejected the runner PAT ({e.code}) on {url}')
+              raise
 
       def parse_ts(value):
           """Parse a GitHub ISO-8601 timestamp; None when absent or malformed"""
@@ -883,20 +1008,45 @@ data "archive_file" "runner_cleanup" {
           except Exception:
               return None
 
-      def get_stuck_runners(pat, now):
-          """Runners whose in-progress job started over MAX_JOB_RUNTIME_MINUTES ago.
+      def stuck_reason(job, now):
+          """Why this in-progress job counts as wedged, or None if it is healthy.
 
-          Returns {runner_name: (job_name, minutes_running)}.
+          Two independent server-side signals, both per-job so back-to-back healthy
+          jobs never accumulate toward either: the step the runner is currently
+          executing has stopped advancing, or the job as a whole has run past the
+          backstop. The step check is what makes this fast; the job check still
+          catches a job whose steps GitHub does not report.
+          """
+          for step in job.get('steps') or []:
+              if step.get('status') != 'in_progress':
+                  continue
+              started = parse_ts(step.get('started_at'))
+              if started is None:
+                  continue
+              minutes = (now - started).total_seconds() / 60
+              if minutes > MAX_STEP_RUNTIME_MINUTES:
+                  return f'step {step.get("name")!r} in_progress {minutes:.0f}m > {MAX_STEP_RUNTIME_MINUTES}m'
+          started = parse_ts(job.get('started_at'))
+          if started is not None:
+              minutes = (now - started).total_seconds() / 60
+              if minutes > MAX_JOB_RUNTIME_MINUTES:
+                  return f'job in_progress {minutes:.0f}m > {MAX_JOB_RUNTIME_MINUTES}m'
+          return None
+
+      def get_stuck_runners(pat, now):
+          """Runners whose current job has stopped making progress.
+
+          Returns {runner_name: (job_name, reason)}.
 
           Fail-safe: every GitHub error yields no candidates, so an outage or rate
           limit reaps nothing, and a runner is only named when GitHub itself says
           that runner is still executing that job.
 
-          Cheap: a job cannot have started before its run did, so a run that started
-          inside the ceiling is skipped without a jobs call. In steady state that is
-          one list call per poll and no per-run calls at all.
+          Cheap: neither a job nor a step can have started before its run did, so a
+          run that started inside the smaller of the two ceilings is skipped without
+          a jobs call. In steady state that is one list call per poll.
           """
-          cutoff = now - timedelta(minutes=MAX_JOB_RUNTIME_MINUTES)
+          cutoff = now - timedelta(minutes=min(MAX_JOB_RUNTIME_MINUTES, MAX_STEP_RUNTIME_MINUTES))
           stuck = {}
           try:
               runs = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs?status=in_progress&per_page=50')
@@ -923,12 +1073,12 @@ data "archive_file" "runner_cleanup" {
               for job in jobs.get('jobs', []):
                   if job.get('status') != 'in_progress':
                       continue
-                  started = parse_ts(job.get('started_at'))
-                  if started is None or started > cutoff:
-                      continue
                   name = job.get('runner_name') or ''
-                  if name.startswith('runner-i-'):
-                      stuck[name] = (job.get('name'), (now - started).total_seconds() / 60)
+                  if not name.startswith('runner-i-'):
+                      continue
+                  reason = stuck_reason(job, now)
+                  if reason:
+                      stuck[name] = (job.get('name'), reason)
           return stuck
 
       def get_github_pat():
@@ -947,18 +1097,12 @@ data "archive_file" "runner_cleanup" {
           """Get all runners from GitHub, returns dict of name -> {id, busy, status}"""
           # per_page is 30 by default, and a truncated list reads as "this runner is
           # not registered" - which is how instances get reaped or double-counted.
-          url = f'https://api.github.com/repos/{REPO}/actions/runners?per_page=100'
-          req = urllib.request.Request(url, headers={
-              'Authorization': f'token {pat}',
-              'Accept': 'application/vnd.github.v3+json'
-          })
           try:
-              with urllib.request.urlopen(req, timeout=10) as resp:
-                  data = json.loads(resp.read())
-                  # status is preserved as-absent when GitHub omits it (fail CLOSED:
-                  # a missing status must never count as online, or a wedged busy
-                  # runner with a flaky API response is renewed forever again).
-                  return {r['name']: {'id': r['id'], 'busy': r['busy'], 'status': r.get('status')} for r in data.get('runners', [])}
+              data = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runners?per_page=100')
+              # status is preserved as-absent when GitHub omits it (fail CLOSED:
+              # a missing status must never count as online, or a wedged busy
+              # runner with a flaky API response is renewed forever again).
+              return {r['name']: {'id': r['id'], 'busy': r['busy'], 'status': r.get('status')} for r in data.get('runners', [])}
           except Exception as e:
               print(f'Failed to get runners: {e}')
           return {}
@@ -1109,6 +1253,45 @@ data "archive_file" "runner_cleanup" {
                       demand['arm64'] += 1
           return demand
 
+      def emit_health(stuck_count, degraded):
+          """One EMF line per poll: is this machinery able to do its job at all?
+
+          The webhook Lambda's decision record only exists when there is a decision
+          to make. This one is unconditional, every five minutes, and carries the
+          two facts that make every other signal in this file trustworthy: whether
+          the PAT still works, and whether anything is wedged. `Repo` is a constant
+          dimension - EMF needs a dimension set, and the repository is the honest
+          scope for a token and a runner pool that serve exactly one repository.
+          """
+          metrics = [
+              {'Name': 'StuckRunners', 'Unit': 'Count'},
+              {'Name': 'PatValid', 'Unit': 'Count'},
+          ]
+          fields = {
+              'event': 'runner_pool_health',
+              'Repo': REPO,
+              'StuckRunners': stuck_count,
+              # Absent PAT is an unusable PAT. Unknown (no GitHub call succeeded and
+              # none was rejected) is left unemitted so a GitHub outage cannot be
+              # mistaken for a dead token - the alarm keeps its previous state.
+              'PatValid': 0 if degraded else PAT_STATUS['valid'],
+          }
+          if fields['PatValid'] is None:
+              metrics = metrics[:1]
+              del fields['PatValid']
+          if PAT_STATUS['days_to_expiry'] is not None:
+              metrics.append({'Name': 'PatDaysToExpiry', 'Unit': 'Count'})
+              fields['PatDaysToExpiry'] = round(PAT_STATUS['days_to_expiry'], 2)
+          fields['_aws'] = {
+              'Timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
+              'CloudWatchMetrics': [{
+                  'Namespace': 'GitHubRunners',
+                  'Dimensions': [['Repo']],
+                  'Metrics': metrics
+              }]
+          }
+          print(json.dumps(fields))
+
       def handler(event, context):
           pat = get_github_pat()
           print(f'PAT available: {bool(pat)}')
@@ -1116,8 +1299,8 @@ data "archive_file" "runner_cleanup" {
           print(f'Found {len(runners)} runners from GitHub')
           now = datetime.now(timezone.utc)
 
-          # Runners holding a job that has run past MAX_JOB_RUNTIME_MINUTES. Read
-          # once here, acted on in Phase 2b below.
+          # Runners whose current job has stopped making progress. Read once here,
+          # acted on in Phase 2b below.
           stuck_runners = get_stuck_runners(pat, now) if pat else {}
           if stuck_runners:
               print(f'Stuck jobs detected on: {sorted(stuck_runners)}')
@@ -1220,19 +1403,18 @@ data "archive_file" "runner_cleanup" {
                   else:
                       print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
 
-          # Phase 2b: Reap runners whose current job has exceeded the ceiling.
+          # Phase 2b: Reap runners whose current job has stopped making progress.
           # Phase 2 cannot see this case: GitHub reports the runner online and busy
-          # the whole time, so the lease is renewed on every poll forever. The job's
-          # own age is per-job, so back-to-back healthy jobs never accumulate
-          # toward it and a healthy busy runner is never reaped.
+          # the whole time, so the lease is renewed on every poll forever. Both
+          # signals behind stuck_reason are per-job, so back-to-back healthy jobs
+          # never accumulate toward either and a healthy busy runner is never reaped.
           stuck_terminated = []
           running_ids = {i['InstanceId'] for r in response['Reservations'] for i in r['Instances']}
-          for runner_name, (job_name, minutes) in sorted(stuck_runners.items()):
+          for runner_name, (job_name, reason) in sorted(stuck_runners.items()):
               instance_id = runner_name.replace('runner-', '')
               if instance_id not in running_ids or instance_id in terminated:
                   continue
-              print(f'Terminating stuck: {instance_id} (job {job_name!r} in_progress '
-                    f'{minutes:.0f}m > {MAX_JOB_RUNTIME_MINUTES}m)')
+              print(f'Terminating stuck: {instance_id} (job {job_name!r}: {reason})')
               runner_info = runners.get(runner_name, {})
               if runner_info.get('id'):
                   deregister_runner(runner_info['id'], pat)
@@ -1330,6 +1512,7 @@ data "archive_file" "runner_cleanup" {
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
+          emit_health(len(stuck_runners), degraded=not pat)
           return {'terminated': terminated, 'renewed': renewed, 'expired': expired,
                   'over_age': over_age, 'stuck_terminated': stuck_terminated,
                   'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned,

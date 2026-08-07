@@ -140,6 +140,23 @@ resource "aws_iam_role_policy" "runner" {
           "ec2:DescribeNetworkInterfaces"
         ]
         Resource = "*"
+      },
+      {
+        # The only way this box can report that it refused to register itself.
+        # user_data hard-fails before registration when the instance has no
+        # instance-store NVMe, when /mnt/fcvm-btrfs did not mount, or when GitHub
+        # refuses a registration token, and publishes GitHubRunners/
+        # RunnerBootstrapFailed so the failure is an alarm instead of a runner that
+        # silently never appears. PutMetricData takes no resource ARN, so the
+        # namespace condition is the scope: this role can write that one namespace
+        # and cannot touch AWS/EC2 or anyone else's metrics.
+        Sid      = "ReportBootstrapFailure"
+        Effect   = "Allow"
+        Action   = "cloudwatch:PutMetricData"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = "GitHubRunners" }
+        }
       }
     ]
   })
