@@ -49,7 +49,8 @@ the workflow.
 provide. So a job queued on `ejc3/fcvm` triggers AWS to launch a spot `*.metal` instance
 that registers itself back as a self-hosted runner, serves the job, and is reaped when idle.
 
-**Launch path.** GitHub fires a `workflow_job` webhook → API Gateway HTTP API
+**Launch path.** GitHub fires a `workflow_job` webhook — the hook itself is Terraform-managed
+(`github_repository_webhook.runner`, adopted from hook id 589197362) → API Gateway HTTP API
 (`POST /webhook`, output `runner_webhook_url`) → Lambda `github-runner-webhook`
 (`reserved_concurrent_executions = 1`, so concurrent webhooks can't all read the same count
 and over-launch). The Lambda HMAC-verifies `x-hub-signature-256` against `WEBHOOK_SECRET` on
@@ -145,14 +146,23 @@ legitimately long job is ever added.
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
 |--|--|--|--|--|
 | **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` | manual `put-parameter`; TF stores `placeholder` with `ignore_changes = [value]` |
-| **Webhook HMAC** | `github_webhook_secret` tfvar (sensitive) → Lambda env `WEBHOOK_SECRET` | shared, both sides | the webhook Lambda; mirror in GitHub webhook config | `terraform.tfvars`; must match GitHub |
+| **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
 | **Registration token** | minted at boot, never persisted | GitHub-issued, ephemeral | the booting runner only | GitHub API, single use, ~1h TTL |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | trust policy on `github-actions-terraform` |
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
+| **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
 
 The one credential GitHub itself holds for Pattern B is the webhook HMAC. Everything else is
 either federated (Pattern A) or stored AWS-side and read through IAM.
+
+**Three GitHub PATs, one job each, deliberately not interchangeable.** `github-pat-ejc3`
+clones private repos from dev boxes, `/github-runner/pat` registers and reaps runners, and
+`github-webhook-admin-pat` owns the webhook. The first two are read by machines that run
+other people's code — `dev-server-role` on the metal boxes and the runner instance role on
+CI hosts — so neither may hold webhook-write: that would let a dev box or a CI job repoint
+the launch endpoint. Measured 2026-08-07, both return 403 "Resource not accessible by
+personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct answer.
 
 ## IAM boundaries — who can read what
 
@@ -196,6 +206,14 @@ Closed (were sharp edges, now hardened):
   anonymous POST to `/webhook` no longer launches instances and no header skips verification
   (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
   by being direct `lambda:Invoke`, which carry no `requestContext`).
+- **Both halves of that secret come from one Terraform value.** It used to be two hand-copied
+  strings, a tfvar and a form field, with nothing checking they still matched. They stopped
+  matching, and because verification fails closed the failure was silent and total: all 5,026
+  deliveries GitHub retains for hook 589197362 between 2026-08-05T21:11Z and
+  2026-08-07T22:49Z returned 401 or 503, zero returned 200. Event-driven scale-up was dead
+  for two days behind a pool that still looked alive on the five-minute poll.
+  `random_password.github_webhook` now feeds the Lambda env and the hook's
+  `configuration.secret`, so there is no second copy to drift.
 - **SSH is restricted to known hosts.** Port 22 is reachable from `10.1.0.0/16` (intra-VPC)
   and the operator's three static EIPs (jumpbox + the two dev servers) — not the public
   internet; shell access from anywhere else is via SSM Session Manager. The runners still run
@@ -219,6 +237,17 @@ Still open (accepted for now):
   self-hosted side down in one apply.
 - Set the PAT out of band (it's never in Terraform state):
   `aws ssm put-parameter --name /github-runner/pat --value ghp_xxx --type SecureString --overwrite`.
-- The GitHub webhook points at the `runner_webhook_url` output, event `workflow_job`.
+- The webhook is Terraform's, both halves. It is `github_repository_webhook.runner`, pointed
+  at `runner_webhook_url`, event `workflow_job`, secret generated by
+  `random_password.github_webhook`. **Import the live hook once before the first apply on any
+  state that doesn't already have it** — without this the apply adds a *second* hook to
+  `ejc3/fcvm` delivering to the same URL, doubling every event:
+
+  ```bash
+  terraform import 'github_repository_webhook.runner[0]' fcvm/589197362
+  ```
+
+  Rotate the HMAC with `terraform apply -replace='random_password.github_webhook[0]'`; the
+  same apply writes both sides.
 - Pattern A needs nothing in GitHub but the workflow's `permissions: id-token: write` and the
   role ARN — no repo secret to manage.

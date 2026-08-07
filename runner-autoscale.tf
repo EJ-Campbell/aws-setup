@@ -356,7 +356,7 @@ resource "aws_lambda_function" "runner_webhook" {
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
       USER_DATA_PARAM   = aws_ssm_parameter.runner_user_data[0].name
       MAX_RUNNERS       = "4" # Per architecture (4 ARM + 4 x86 = 8 total max)
-      WEBHOOK_SECRET    = var.github_webhook_secret
+      WEBHOOK_SECRET    = random_password.github_webhook[0].result
     }
   }
 
@@ -475,11 +475,99 @@ variable "enable_github_runner" {
   default     = true
 }
 
-variable "github_webhook_secret" {
-  description = "GitHub webhook secret for signature verification"
-  type        = string
-  default     = ""
-  sensitive   = true
+# ============================================
+# Webhook HMAC secret -- generated once, written to both sides
+# ============================================
+#
+# The secret GitHub signs `workflow_job` deliveries with, and the secret the Lambda
+# verifies them against, are now the same Terraform-generated value. They used to be two
+# hand-carried copies: an operator pasted one string into GitHub's webhook form and a
+# matching one into the gitignored `terraform.tfvars` as `github_webhook_secret`. Nothing
+# checked that the copies still agreed, and at some point they stopped agreeing.
+#
+# `verify_signature` fails closed, so the mismatch was total: every one of the 5,026
+# deliveries GitHub still retains for hook 589197362 (2026-08-05T21:11Z through
+# 2026-08-07T22:49Z) returned 401 or 503 and not one returned 200. Event-driven scale-up
+# was dead for two days -- the pool survived only on the five-minute cleanup poll, which
+# contributed to a multi-hour runner-pool collapse on 2026-08-07.
+#
+# No human chooses, transcribes, or stores this value now, so the two halves cannot drift.
+
+resource "random_password" "github_webhook" {
+  count = var.enable_github_runner ? 1 : 0
+
+  # Alphanumeric on purpose. An HMAC-SHA256 key gains nothing from punctuation, and the
+  # value passes through a Lambda environment variable, a JSON API body and whatever
+  # someone eventually pastes into a shell to debug it. 64 chars is ~380 bits.
+  length  = 64
+  special = false
+}
+
+# ============================================
+# GitHub side of the webhook
+# ============================================
+#
+# CREDENTIALS: a dedicated fine-grained PAT in Secrets Manager, the same shape as the
+# Cloudflare token in `cloudflare.tf` -- minted by hand, never in the repo, and readable
+# only by the administrator roles that run Terraform. It needs exactly one repository
+# permission on `ejc3/fcvm`: **Webhooks: Read and write** (the classic-PAT equivalent is
+# `admin:repo_hook`). Nothing else.
+#
+# Why a third token rather than reusing one of the two that already exist: measured on
+# 2026-08-07, neither can do this. `github-pat-ejc3` (Secrets Manager, readable by
+# `dev-server-role` on both metal boxes) and `/github-runner/pat` (SSM, readable by the
+# runner instance role, i.e. by CI jobs) are both fine-grained PATs without the Webhooks
+# permission -- each returns 403 "Resource not accessible by personal access token" on
+# `GET /repos/ejc3/fcvm/hooks`. Adding the permission to either would let any dev box, or
+# any job running on a self-hosted runner, repoint or disable the CI webhook. This account
+# already keeps GitHub PATs scoped one per purpose; this is the third.
+
+data "aws_secretsmanager_secret_version" "github_webhook_admin_pat" {
+  secret_id = "github-webhook-admin-pat"
+}
+
+provider "github" {
+  owner = "ejc3"
+  token = data.aws_secretsmanager_secret_version.github_webhook_admin_pat.secret_string
+}
+
+# The pre-existing hook is 589197362 and MUST be imported before the first apply, or this
+# creates a second hook delivering to the same URL:
+#
+#   terraform import 'github_repository_webhook.runner[0]' fcvm/589197362
+#
+# Not a declarative `import` block: this resource is count-gated, and an import block whose
+# `to` is `...runner[0]` fails to resolve the moment `enable_github_runner` goes false,
+# which would break the documented one-flip teardown. Cloudflare's resources were adopted
+# with the same CLI import, so this matches how the rest of the repo was reconciled.
+#
+# Its live configuration already matches every attribute below, so the import is clean and
+# in-place: only `repository` is ForceNew, and GitHub never returns the secret, so the
+# first plan after import shows exactly one change -- `configuration.secret` moving from
+# the API's "********" placeholder to the value generated above. The hook keeps its id.
+resource "github_repository_webhook" "runner" {
+  count      = var.enable_github_runner ? 1 : 0
+  repository = "fcvm"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  # Only the API Gateway is referenced above, so without this the hook could be created
+  # before the Lambda behind that route exists. Ordering it after the function means
+  # GitHub is never pointed at a live URL with nothing to answer it, and it fixes the
+  # direction of a rotation window: Lambda takes the new secret first, GitHub second.
+  #
+  # Rotation (`terraform apply -replace='random_password.github_webhook[0]'`) changes both
+  # halves in one apply, but not atomically -- for the seconds between the two API calls
+  # GitHub still signs with the old value and deliveries 401. That is the fail-closed
+  # direction and the five-minute cleanup poll picks up anything missed, so it is fine.
+  depends_on = [aws_lambda_function.runner_webhook]
 }
 
 # ============================================
