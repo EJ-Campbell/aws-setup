@@ -251,8 +251,10 @@ Closed (were sharp edges, now hardened):
   deliveries GitHub retains for hook 589197362 between 2026-08-05T21:11Z and
   2026-08-07T22:49Z returned 401 or 503, zero returned 200. Event-driven scale-up was dead
   for two days behind a pool that still looked alive on the five-minute poll.
-  `random_password.github_webhook` now feeds the Lambda env and the hook's
-  `configuration.secret`, so there is no second copy to drift.
+  `random_password.github_webhook` feeds the Lambda env and the hook's
+  `configuration.secret`, so there is no second copy to drift. This ownership begins at
+  the one-time import + apply documented below — until that apply lands on a given state,
+  the live hook still carries whatever secret it had before, and deliveries keep failing.
 - **SSH is restricted to known hosts.** Port 22 is reachable from `10.1.0.0/16` (intra-VPC)
   and the operator's three static EIPs (jumpbox + the two dev servers) — not the public
   internet; shell access from anywhere else is via SSM Session Manager. The runners still run

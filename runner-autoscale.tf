@@ -666,9 +666,11 @@ provider "github" {
 # with the same CLI import, so this matches how the rest of the repo was reconciled.
 #
 # Its live configuration already matches every attribute below, so the import is clean and
-# in-place: only `repository` is ForceNew, and GitHub never returns the secret, so the
-# first plan after import shows exactly one change -- `configuration.secret` moving from
-# the API's "********" placeholder to the value generated above. The hook keeps its id.
+# in-place: only `repository` is ForceNew, and GitHub never returns the secret. The first
+# plan after import therefore shows no replacement of the hook -- just the in-place
+# `configuration.secret` change from the API's "********" placeholder to the generated
+# value, alongside the creation of `random_password.github_webhook[0]` itself and the
+# webhook Lambda's WEBHOOK_SECRET env update that consumes it. The hook keeps its id.
 resource "github_repository_webhook" "runner" {
   count      = var.enable_github_runner ? 1 : 0
   repository = "fcvm"
