@@ -83,15 +83,24 @@ retry launches that failed (spot
 quota, capacity) — GitHub doesn't redeliver webhooks, so this poll is the retry.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
-only while GitHub still reports it `online`, and no instance outlives
-`MAX_INSTANCE_AGE_HOURS` (12h) regardless of busy state. Both exist because `busy` means
-"holds a job", not "makes progress": on 2026-08-07 two ARM runners wedged with ~490 leaked
-`firecracker` processes and load averages of 389 and 523 (disk was fine at 46%/67%). They
-kept their assigned jobs, so GitHub kept reporting `busy=true`, so the lease was renewed
-every 5 minutes for 21 hours. They occupied 2 of the 4 ARM slots while doing no work, and
-`get_running_runners` — which counts EC2 instances, not healthy runners — reported the pool
-at max, so no replacement ever launched and CI sat queued. GitHub caps a single job at 6h,
-so a 12h-old instance is definitionally stuck.
+only while GitHub explicitly reports it `online` (a missing `status` fails closed to
+not-busy), and no instance outlives `MAX_INSTANCE_AGE_HOURS` (12h) regardless of busy
+state. Both exist because `busy` means "holds a job", not "makes progress": on 2026-08-07
+two ARM runners wedged with ~490 leaked `firecracker` processes and load averages of 389
+and 523 (disk was fine at 46%/67%). They kept their assigned jobs, so GitHub kept
+reporting `busy=true`, so the lease was renewed every 5 minutes for 21 hours. They
+occupied 2 of the 4 ARM slots while doing no work, and `get_running_runners` — which
+counts EC2 instances, not healthy runners — reported the pool at max, so no replacement
+ever launched and CI sat queued.
+
+The 12h ceiling is a deliberate **local policy**, not a platform limit: GitHub allows a
+self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
+only), and these runners are not ephemeral, so one instance can legitimately chain many
+short jobs past 12h of age. The trade, made explicitly: every fcvm CI job finishes in
+well under 2 hours, so a 12h-old runner is overwhelmingly likely wedged. Worst case the
+cap kills one healthy in-flight job, which a re-run fixes; a wedged slot silently starves
+the whole pool indefinitely, which no re-run fixes. Raise `MAX_INSTANCE_AGE_HOURS` if a
+legitimately long job is ever added.
 
 ## What crosses the boundary (secrets inventory)
 
