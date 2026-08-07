@@ -42,7 +42,10 @@ JUMPBOX="10.0.1.72"
 # the slow boot as the price of admission. Same ordering rules, same >=96-core floor
 # (metal-24xl = 96 cores); all verified offered in us-west-2d.
 TYPES="${PARALLEL_BOX_TYPES:-c8g.48xlarge c8gb.48xlarge c8gd.48xlarge c8gn.48xlarge c9g.48xlarge c9gd.48xlarge m8g.48xlarge m8gd.48xlarge m9g.48xlarge m9gd.48xlarge i8g.48xlarge i8ge.48xlarge r8g.48xlarge r8gd.48xlarge c8g.24xlarge c8gb.24xlarge c8gd.24xlarge c8gn.24xlarge c9g.24xlarge c9gd.24xlarge m8g.24xlarge m8gd.24xlarge m9g.24xlarge m9gd.24xlarge i8g.24xlarge i8ge.24xlarge r8g.24xlarge r8gd.24xlarge}"
-KVM_TYPES="${PARALLEL_BOX_TYPES:-c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl}"
+# Deliberately a SEPARATE override var: reusing PARALLEL_BOX_TYPES here would let a
+# virtualized-list override silently poison kvm mode with non-metal types, which
+# would burn the full 25-min wait and then fail the /dev/kvm check.
+KVM_TYPES="${PARALLEL_BOX_KVM_TYPES:-c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl}"
 
 # The dev servers hold a restricted IAM role with no ec2:RunInstances, and terraform
 # state lives on the jumpbox, so delegate the terraform half rather than widening
