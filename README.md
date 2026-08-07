@@ -83,8 +83,10 @@ needs:
 - the Cloudflare `cc-games.dev` zone and Secrets Manager values
   `cloudflare-tunnel-token`, `cloudflare-tunnel-credentials`, and
   `cloudflare-google-idp`;
-- the `github-pat-ejc3` Secrets Manager value, the runner-only
-  GitHub PAT, and `github_webhook_secret` in the ignored `terraform.tfvars`;
+- the `github-pat-ejc3` Secrets Manager value, the runner-only GitHub PAT, and
+  `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
+  repository permission is `Webhooks: Read and write` on `ejc3/fcvm`, used by the
+  `integrations/github` provider to own the runner webhook;
 - current ARM64 and x86 runner AMIs tagged `Purpose=github-runner`;
 - the Google OAuth callback
   `https://ejc3.cloudflareaccess.com/cdn-cgi/access/callback` when Google login is enabled.
@@ -128,12 +130,19 @@ terraform plan
 terraform apply
 ```
 
-Configure the `ejc3/fcvm` `workflow_job` webhook with `runner_webhook_url` and the same HMAC
-value as `github_webhook_secret`, then confirm the SNS email subscription. Do not leave
-placeholder secret/parameter values in a live account. Optional Mac development needs
-available EC2 Dedicated Host quota and an explicit new `mac_teardown_at` at least 24 hours
-after allocation; its checked-in date is historical and must not be reused. Terraform
-creates its VNC password.
+Terraform owns the `ejc3/fcvm` `workflow_job` webhook and generates its HMAC secret, so
+there is nothing to mirror by hand. If the recovered state does not already contain it,
+adopt the live hook before the first apply -- otherwise the apply adds a *second* hook
+delivering to the same URL:
+
+```bash
+terraform import 'github_repository_webhook.runner[0]' fcvm/589197362
+```
+
+Then confirm the SNS email subscription. Do not leave placeholder secret/parameter values
+in a live account. Optional Mac development needs available EC2 Dedicated Host quota and an
+explicit new `mac_teardown_at` at least 24 hours after allocation; its checked-in date is
+historical and must not be reused. Terraform creates its VNC password.
 
 ## Fleet
 
@@ -429,6 +438,13 @@ job that long is wedged, and "busy" alone would renew its lease forever — and 
 GitHub's queued jobs — across in-progress runs too, and ignoring runs with no jobs — to
 launch what the queue actually needs.
 
+Terraform owns both halves of that webhook: it generates the HMAC secret, sets it on the
+`ejc3/fcvm` hook through the `integrations/github` provider, and passes the same value to
+the Lambda. There is no operator-held copy to fall out of sync -- which it did, silently
+and completely, until 2026-08-07. That ownership takes effect at the one-time hook import
+and the first apply after it (see Prerequisites); a state that has not run them yet still
+has the pre-Terraform secret live on the hook.
+
 The maximum is four runners per architecture, counted as runners GitHub can actually hand a
 job to rather than instances that merely exist, so a wedged box cannot hold a slot. Each
 scale-up decision emits a `GitHubRunners` metric and a structured log line, and the
@@ -445,8 +461,10 @@ The repository also manages:
 
 The drift workflow is not currently healthy: recent scheduled runs fail because its OIDC
 role cannot read the Secrets Manager, Organizations, and CodeArtifact data required by a
-full refresh, and the workflow does not supply `github_webhook_secret`. Treat drift
-detection as scheduled but non-functional until those IAM/input gaps are fixed.
+full refresh. Secrets Manager is now the harder blocker of the three -- the Cloudflare and
+GitHub provider tokens both come from there, so a plan cannot even configure its providers
+without that read. Treat drift detection as scheduled but non-functional until that IAM gap
+is fixed.
 
 ## Bootstrap, authentication, and convergence
 

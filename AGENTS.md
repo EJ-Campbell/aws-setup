@@ -156,9 +156,10 @@ working personal login with a bootstrap token.
 pre-exist Terraform. Keep the exact prerequisite list and login sequence in `README.md`.
 
 **Drift CI is not currently healthy**: the scheduled workflow lacks Secrets Manager,
-Organizations, and CodeArtifact read access, and it does not supply
-`github_webhook_secret`. Do not describe the schedule as working drift protection until a
-live run succeeds.
+Organizations, and CodeArtifact read access. Secrets Manager is the hardest of the three
+now that both the Cloudflare and GitHub providers take their tokens from there -- a plan
+cannot configure its providers without it. Do not describe the schedule as working drift
+protection until a live run succeeds.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing
@@ -313,6 +314,11 @@ GitHub authentication for private repos is stored in AWS Secrets Manager:
 - **Secret name**: `github-pat-ejc3`
 - **Region**: us-west-1
 - **Used by**: claude-code-sync to clone private history repo
+
+This is not the only GitHub PAT. Each is scoped to one job and they are not
+interchangeable: `/github-runner/pat` (SSM) registers runners, and
+`github-webhook-admin-pat` (Secrets Manager) is webhook-write only and exists solely for
+the `integrations/github` provider. See `GITHUB-RUNNERS.md` for the full inventory.
 
 Instances fetch the token during user_data bootstrap:
 ```bash
