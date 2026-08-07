@@ -117,6 +117,23 @@ class FakeLambdaClient:
         self.invokes.append(json.loads(json.loads(kw["Payload"])["body"]))
 
     def arch_invokes(self):
+        """Total runners REQUESTED per architecture.
+
+        The cleanup poll sends one invocation per architecture whose payload
+        carries the whole deficit as launch_count (a burst of single-launch
+        invocations could overshoot MAX_RUNNERS: DescribeInstances is eventually
+        consistent, so each invocation can miss the instance the previous one
+        just launched). Summing launch_count keeps these assertions about
+        demand, and invocations_per_arch() below asserts the one-invoke shape.
+        """
+        counts = {}
+        for payload in self.invokes:
+            labels = [x.lower() for x in payload["workflow_job"]["labels"]]
+            arch = "x86_64" if "x64" in labels else "arm64"
+            counts[arch] = counts.get(arch, 0) + payload.get("launch_count", 1)
+        return counts
+
+    def invocations_per_arch(self):
         counts = {}
         for payload in self.invokes:
             labels = [x.lower() for x in payload["workflow_job"]["labels"]]
@@ -332,7 +349,7 @@ def case_handler_launches_next_type_when_the_pool_is_all_husks():
         "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
     })}
     result = webhook(ec2)["handler"](event, None)
-    assert "Launched x86_64 runner (c5.metal)" in result["body"], result
+    assert "Launched 1 x86_64 runner(s) (c5.metal)" in result["body"], result
     assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
 
 
@@ -457,10 +474,61 @@ def case_runs_beyond_the_first_page_are_found():
 
 
 def case_queue_deeper_than_the_pool_launches_up_to_the_cap():
-    """Seven queued arm64 jobs must fill the pool in one poll, not one per poll."""
+    """Seven queued arm64 jobs must fill the pool in one poll, not one per poll.
+
+    And the whole deficit must travel in a SINGLE invocation per architecture:
+    a burst of single-launch invocations, even serialized by reserved
+    concurrency 1, can each miss the instance the previous one just launched
+    (DescribeInstances is eventually consistent) and overshoot MAX_RUNNERS.
+    """
     busy = run(7, "queued")
     github = FakeGitHub(runs=[busy], jobs={busy["id"]: [job("queued", "arm64") for _ in range(7)]})
-    assert poll(github) == {"arm64": 4}, poll(github)
+    invoker = FakeLambdaClient()
+    cleanup(FakeEC2(), github, invoker)["handler"]({}, None)
+    assert invoker.arch_invokes() == {"arm64": 4}, invoker.arch_invokes()
+    assert invoker.invocations_per_arch() == {"arm64": 1}, invoker.invocations_per_arch()
+
+
+def case_stale_describe_cannot_overshoot_the_cap():
+    """The launch budget is bounded in-process, immune to describe lag.
+
+    FakeEC2 never adds launched instances to its describe results -- the
+    worst-case eventual-consistency window, forever. A launch_count of 7
+    against an empty pool of max 4 must launch exactly 4, because the
+    handler's own loop is the counter, not a re-read of EC2 state.
+    """
+    ec2 = FakeEC2([])
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+        "launch_count": 7,
+    })}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched 4 arm64 runner(s)" in result["body"], result
+    assert len(launched_types(ec2)) == 4, launched_types(ec2)
+
+
+def case_public_webhook_cannot_amplify_launch_count():
+    """launch_count is honored only on IAM-authed direct invokes.
+
+    A real GitHub delivery arrives through API Gateway (requestContext
+    present). Even correctly signed, its launch_count must be ignored --
+    otherwise anyone with the webhook secret could 4x every launch.
+    """
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+    body = json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+        "launch_count": 4,
+    })
+    sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    event = {"body": body, "requestContext": {}, "headers": {"x-hub-signature-256": sig}}
+    ec2 = FakeEC2([])
+    result = webhook(ec2, env={"WEBHOOK_SECRET": secret})["handler"](event, None)
+    assert "Launched 1 arm64 runner(s)" in result["body"], result
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
 
 
 def case_phantom_only_queue_launches_nothing():
