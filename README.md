@@ -421,9 +421,11 @@ login.
 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
 Labels select the architecture; the launcher tries several metal families when capacity is
-scarce. A runner receives a 60-minute lease, renews while GitHub reports it busy, and is
-terminated when idle/expired. Cleanup runs every five minutes and also replaces missing
-runners for queued jobs.
+scarce, moving a family that just failed for capacity to the back of that order. A runner
+receives a 60-minute lease, renews while GitHub reports it busy, and is terminated when
+idle/expired. Cleanup runs every five minutes: it reaps launches that never came up, and
+counts GitHub's queued jobs — across in-progress runs too, and ignoring runs with no jobs —
+to launch what the queue actually needs.
 
 The maximum is four runners per architecture. Runner roots and instance-store data are
 disposable. See `GITHUB-RUNNERS.md` for the webhook, AMI, lease, and cleanup internals.

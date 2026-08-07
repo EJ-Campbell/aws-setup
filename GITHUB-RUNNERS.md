@@ -59,8 +59,9 @@ without a forgeable header); it acts only on `action == "queued"`, reads the job
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
-per architecture**. ARM tries `c7gd.metal`→`c7g.metal`; x86 tries
-`c5d`/`c5`/`c6i`/`m5d.metal` in order for spot availability. Each instance is tagged with a
+per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
+`c7gd.metal`→`c7g.metal`; x86 tries `c5d`/`c5`/`c6i`/`m5d.metal`, with any type that
+recently failed for capacity moved to the back of that order. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.
 
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
@@ -78,9 +79,39 @@ registration token derived from it.
 runners whose instance is gone; renews the lease on busy runners (+60m) and lets idle ones
 expire, then terminates and deregisters anything past its lease (instances younger than 10
 minutes are skipped so setup isn't interrupted); terminates stray `ami-builder-temp`
-instances older than 2 hours (pure EC2, no PAT); and re-checks GitHub for `queued` runs to
-retry launches that failed (spot
-quota, capacity) — GitHub doesn't redeliver webhooks, so this poll is the retry.
+instances older than 2 hours (pure EC2, no PAT); reaps launches still `pending` after 15
+minutes; and counts GitHub's queued jobs to launch what the queue actually needs — GitHub
+doesn't redeliver webhooks, so this poll is the retry.
+
+**A spot capacity failure has to move the launcher to the next instance type.** It cannot
+discover one by itself: `run_instances` returns an instance ID for a spot request AWS cannot
+fulfil and terminates the instance afterwards, so no exception is ever raised and the
+`except` branch that was supposed to advance the fallback list never fires. On 2026-08-07 the
+poll launched `c5d.metal` at 18:41, 18:46 and 18:51; all three were still `pending` when AWS
+marked them `instance-terminated-no-capacity` at 20:31, nearly two hours later, and
+`c5.metal`, `c6i.metal` and `m5d.metal` were never tried at all. Three things close that
+loop. A launch still `pending` after `STARTUP_TIMEOUT_MINUTES` (15) is a failed launch, not a
+runner, so it stops counting toward the cap. The cleanup Lambda stamps `CapacityFailedAt` on
+it and terminates it — the tag has to be written first, because terminating rewrites the
+state reason to `Client.UserInitiatedShutdown` and the evidence would be lost. And the
+launcher reads that record — AWS's own capacity state reasons, the tag, and anything
+stalling right now — to move failed types to the back of the list. Back, not out: if every
+type has failed the list is only reordered, so a launch is still attempted.
+
+**The queue poll counts jobs, not a sample of runs.** It asks for runs with `status=queued`
+*and* `status=in_progress`, pages both, pages each run's jobs, and counts the queued
+self-hosted jobs themselves; the only early exit is when both architectures already want more
+runners than the pool can hold. Sampling the newest five `queued` runs hid real work two
+ways. A run that is `in_progress` still holds queued jobs and the `queued` query does not
+return it: run 31202629167 went `in_progress` at 17:40 on 2026-08-07 and kept two arm64 jobs
+queued until 18:25, invisible for 45 minutes. And `ejc3/fcvm` carries six runs from
+2026-08-06 that are permanently `status=queued` with **zero jobs** and cannot be cancelled,
+force-cancelled or deleted through the API. Runs come back newest first, so those six sit
+ahead of any older real work — more than the five-run sample held. The scan now also launches
+one runner per queued job rather than one per architecture per poll, which used to fill the
+pool at one runner every five minutes however deep the queue was; the webhook Lambda stays
+the single authority on the cap, so surplus invocations are simply answered with "max
+reached".
 
 ## What crosses the boundary (secrets inventory)
 
