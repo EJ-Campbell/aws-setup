@@ -430,11 +430,12 @@ login.
 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
 Labels select the architecture; the launcher tries several metal families when capacity is
-scarce. A runner receives a 60-minute lease, renews while GitHub reports it busy, and is
-terminated when idle/expired. Cleanup runs every five minutes and also replaces missing
-runners for queued jobs, and terminates any runner whose current job has been running for
-more than three hours — a job that long is wedged, and "busy" alone would renew its lease
-forever.
+scarce, moving a family that just failed for capacity to the back of that order. A runner
+receives a 60-minute lease, renews while GitHub reports it online and busy, and is
+terminated when idle/expired. Cleanup runs every five minutes: it reaps launches that never
+came up, terminates any runner whose current job has stopped making progress, and counts
+GitHub's queued jobs — across in-progress runs too, and ignoring runs with no jobs — to
+launch what the queue actually needs.
 
 Terraform owns both halves of that webhook: it generates the HMAC secret, sets it on the
 `ejc3/fcvm` hook through the `integrations/github` provider, and passes the same value to

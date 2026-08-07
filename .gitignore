@@ -21,3 +21,6 @@ Thumbs.db
 # Logs
 *.log
 tfplan
+
+# Python
+__pycache__/
