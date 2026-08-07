@@ -193,6 +193,8 @@ cat > /usr/local/bin/pbox <<'PBOX'
 # jobs can run at once.
 #
 #   pbox up [2]     launch box 1 (or 2) and ssh over    ("I want it")
+#   pbox up [2] kvm launch on METAL pools: /dev/kvm for hypervisor workloads
+#                   (fcvm/firecracker). Metal boots in many minutes -- be patient.
 #   pbox down [2]   terminate it                        ("I don't")
 #   pbox ssh [2]    reconnect to a running box
 #   pbox status     both boxes: running? cost? disk?
@@ -217,11 +219,17 @@ JB() { ssh -i "$JUMPBOX_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "u
 
 C="$${1:-status}"
 N="$${2:-}"
+M="$${3:-}"
+# "pbox up kvm" is shorthand for box 1 in kvm mode. N must become an explicit
+# "1": an empty N would send "up  kvm", which the forced command word-splits so
+# parallel-box.sh sees kvm as the BOX argument and rejects it.
+if [ "$N" = "kvm" ]; then M="kvm"; N=1; fi
 case "$N" in ""|1|2) ;; *) echo "unknown box '$N' (use 1 or 2)" >&2; exit 1;; esac
+case "$M" in ""|kvm) ;; *) echo "unknown mode '$M' (only 'kvm')" >&2; exit 1;; esac
 
 case "$C" in
   up|want)
-    JB "up $N"
+    JB "up $N$${M:+ $M}"
     IP="$(JB "ip $N")"
     [ -n "$IP" ] || { echo "box did not come up; try: pbox status" >&2; exit 1; }
     echo "Connecting to $IP (work disk at /mnt/work)..."
