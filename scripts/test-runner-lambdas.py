@@ -314,6 +314,40 @@ def case_incident_replay_three_dead_c5d_launches():
     assert module["get_running_runners"]("x86_64") == 0
 
 
+def case_handler_launches_next_type_when_the_pool_is_all_husks():
+    """End to end through the webhook entry point, not just launch_runner.
+
+    Four x86 instances exist, so the old count reported the pool full and returned
+    "Max x86_64 runners (4) reached". All four are dead launches, so the pool is
+    really empty and the next instance type is the one to try.
+    """
+    ec2 = FakeEC2([
+        instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
+        instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
+        instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
+        instance("i-0fb9768c36e56129d", "c5d.metal", "pending", 60),
+    ])
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
+    })}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched x86_64 runner (c5.metal)" in result["body"], result
+    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+
+
+def case_handler_still_refuses_when_the_pool_is_genuinely_full():
+    """The cap must still hold for runners that can actually take a job."""
+    ec2 = FakeEC2([instance(f"i-live{n}", "c5d.metal", "running", 20) for n in range(4)])
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
+    })}
+    result = webhook(ec2)["handler"](event, None)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+    assert launched_types(ec2) == [], launched_types(ec2)
+
+
 def case_ordinary_spot_reclaim_does_not_rotate():
     """A reclaimed runner is not a failed launch.
 
