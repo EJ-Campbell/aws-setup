@@ -96,7 +96,7 @@ a service. The PAT itself never leaves AWS; what touches `config.sh` is the ephe
 registration token derived from it.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
-(`rate(5 minutes)`) and does five things, four of them using the PAT: deregisters GitHub
+(`rate(5 minutes)`) and does six things, four of them using the PAT: deregisters GitHub
 runners whose instance is gone; renews the lease on busy runners (+60m) and lets idle ones
 expire, then terminates and deregisters anything past its lease (instances younger than 10
 minutes are skipped so setup isn't interrupted); **terminates any runner whose current job
