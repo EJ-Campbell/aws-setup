@@ -652,13 +652,17 @@ resource "random_password" "github_webhook" {
 # any job running on a self-hosted runner, repoint or disable the CI webhook. This account
 # already keeps GitHub PATs scoped one per purpose; this is the third.
 
+# Gated so that disabling the runner stack (or losing the secret) can never break
+# unrelated plans: an ungated data source is read on EVERY plan, and a missing
+# secret would fail the documented one-flip teardown along with everything else.
 data "aws_secretsmanager_secret_version" "github_webhook_admin_pat" {
+  count     = var.enable_github_runner ? 1 : 0
   secret_id = "github-webhook-admin-pat"
 }
 
 provider "github" {
   owner = "ejc3"
-  token = data.aws_secretsmanager_secret_version.github_webhook_admin_pat.secret_string
+  token = var.enable_github_runner ? data.aws_secretsmanager_secret_version.github_webhook_admin_pat[0].secret_string : null
 }
 
 # The pre-existing hook is 589197362 and MUST be imported before the first apply, or this

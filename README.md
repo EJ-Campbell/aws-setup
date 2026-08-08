@@ -122,21 +122,21 @@ console or AWS CLI without printing their values. This is a one-time secret-payl
 bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
 
-After state, prerequisites, and secret payloads are reconciled, run and review the full
-plan:
+Terraform owns the `ejc3/fcvm` `workflow_job` webhook and generates its HMAC secret, so
+there is nothing to mirror by hand. **Before the first full apply**, if the recovered
+state does not already contain the hook, adopt it -- otherwise the apply adds a *second*
+hook delivering to the same URL and every event arrives twice:
+
+```bash
+terraform import 'github_repository_webhook.runner[0]' fcvm/589197362
+```
+
+Only then, with state, prerequisites, secret payloads, and the hook import reconciled,
+run and review the full plan:
 
 ```bash
 terraform plan
 terraform apply
-```
-
-Terraform owns the `ejc3/fcvm` `workflow_job` webhook and generates its HMAC secret, so
-there is nothing to mirror by hand. If the recovered state does not already contain it,
-adopt the live hook before the first apply -- otherwise the apply adds a *second* hook
-delivering to the same URL:
-
-```bash
-terraform import 'github_repository_webhook.runner[0]' fcvm/589197362
 ```
 
 Then confirm the SNS email subscription. Do not leave placeholder secret/parameter values
