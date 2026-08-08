@@ -982,7 +982,13 @@ data "archive_file" "runner_cleanup" {
                   Tags=[{'Key': 'CapacityFailedAt', 'Value': now.isoformat()}]
               )
           except Exception as e:
-              print(f'Failed to tag {instance_id} as a capacity failure: {e}')
+              # Do NOT terminate on a failed tag: terminating rewrites the state
+              # reason and the capacity evidence is gone forever, so the launcher
+              # would re-pick the same doomed type - the exact loop this function
+              # exists to break. The instance stays pending; the next poll retries
+              # both the tag and the terminate.
+              print(f'Failed to tag {instance_id} as a capacity failure: {e}; deferring the terminate')
+              return False
           try:
               ec2.terminate_instances(InstanceIds=[instance_id])
               return True
@@ -1013,7 +1019,18 @@ data "archive_file" "runner_cleanup" {
       # deleted through the API. The runs endpoint returns newest first, so those six
       # sit ahead of any older real work and a five-run sample can be nothing but
       # undrainable phantoms.
+      # Applied PER STATUS, never to the concatenated list: a combined cap would
+      # let permanently-queued phantom runs (which sort ahead of real work) evict
+      # every in_progress run from the scan. Worst-case runtime is governed by the
+      # time budget below, not by this count.
       QUEUE_SCAN_MAX_RUNS = 200
+
+      # Hard wall-clock budget for the queue scan. The worst case without it is
+      # one 5s-timeout GitHub call per scanned run - far beyond the Lambda
+      # timeout, which is not catchable, so a long scan would kill the whole poll
+      # and launch NOTHING. A truncated scan under-counts demand, which the next
+      # poll corrects; a dead poll corrects nothing.
+      QUEUE_SCAN_TIME_BUDGET_SECONDS = 120
 
       def github_get(pat, url):
           """GET a GitHub API endpoint and return parsed JSON. Raises on failure."""
@@ -1057,20 +1074,28 @@ data "archive_file" "runner_cleanup" {
       def queued_demand(pat, cap):
           """Count queued self-hosted jobs per architecture.
 
-          `cap` is the only thing that stops the scan early, and only once both
-          architectures already want more runners than the pool can hold - past that
-          point more scanning cannot change what gets launched. Nothing else
-          truncates: every queued and in-progress run is inspected, and a run with no
-          queued jobs contributes nothing rather than consuming a sample slot.
+          Three bounds, each reported when it fires: the saturation exit (both
+          architectures already want at least as many runners as the pool holds,
+          so more scanning cannot change what gets launched), QUEUE_SCAN_MAX_RUNS
+          per status (per status so phantom queued runs can never evict the
+          in_progress runs from the scan), and a wall-clock budget (a Lambda
+          timeout is not catchable and would kill the whole poll). Truncation
+          under-counts demand; the next poll corrects it. A run with no queued
+          jobs contributes nothing rather than consuming a sample slot.
           """
           demand = {'arm64': 0, 'x86_64': 0}
+          scan_start = datetime.now(timezone.utc)
           run_ids = list(dict.fromkeys(
               list_run_ids(pat, 'queued', QUEUE_SCAN_MAX_RUNS)
               + list_run_ids(pat, 'in_progress', QUEUE_SCAN_MAX_RUNS)
-          ))[:QUEUE_SCAN_MAX_RUNS]
+          ))
           for scanned, run_id in enumerate(run_ids):
               if all(count >= cap for count in demand.values()):
                   print(f'Queue scan satisfied after {scanned} of {len(run_ids)} runs')
+                  break
+              elapsed = (datetime.now(timezone.utc) - scan_start).total_seconds()
+              if elapsed > QUEUE_SCAN_TIME_BUDGET_SECONDS:
+                  print(f'Queue scan hit its {QUEUE_SCAN_TIME_BUDGET_SECONDS}s budget after {scanned} of {len(run_ids)} runs; demand is a lower bound')
                   break
               for job in queued_self_hosted_jobs(pat, run_id):
                   labels = [l.lower() for l in job.get('labels', [])]
@@ -1317,11 +1342,12 @@ resource "aws_lambda_function" "runner_cleanup" {
   role             = aws_iam_role.runner_lambda[0].arn
   handler          = "lambda_function.handler"
   runtime          = "python3.12"
-  # The stuck-job scan adds up to MAX_STUCK_SCAN_RUNS job lookups (5s socket
-  # timeout each) and the full-queue scan is one GitHub call per candidate run;
-  # neither must have to choose between finishing and seeing the whole queue.
-  # 240s covers both worst cases with headroom under the 5-minute schedule so
-  # invocations cannot overlap.
+  # Worst-case budget: stuck-job scan <= 10 lookups x 5s, queue scan hard-capped
+  # at QUEUE_SCAN_TIME_BUDGET_SECONDS (120s) plus run-listing pages, and the
+  # lease/reap phases' EC2 calls. 240s covers that with headroom under the
+  # 5-minute schedule so invocations cannot overlap; the queue scan's own budget
+  # is what guarantees the Lambda timeout (uncatchable) is never the thing that
+  # ends a poll.
   timeout = 240
 
   environment {
@@ -1334,6 +1360,17 @@ resource "aws_lambda_function" "runner_cleanup" {
   tags = {
     Name = "github-runner-cleanup"
   }
+}
+
+# Async invocations (the cleanup poll's direct invokes) must never be retried by
+# Lambda itself: a retry after a partial launch re-reads eventually-consistent
+# DescribeInstances, can miss the instances the failed attempt already launched,
+# and overshoots the cap. The 5-minute poll IS the retry path, and it re-derives
+# the deficit from fresh state.
+resource "aws_lambda_function_event_invoke_config" "runner_webhook" {
+  count                  = var.enable_github_runner ? 1 : 0
+  function_name          = aws_lambda_function.runner_webhook[0].function_name
+  maximum_retry_attempts = 0
 }
 
 resource "aws_cloudwatch_event_rule" "runner_cleanup" {

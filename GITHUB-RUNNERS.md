@@ -159,8 +159,12 @@ type has failed the list is only reordered, so a launch is still attempted.
 
 **The queue poll counts jobs, not a sample of runs.** It asks for runs with `status=queued`
 *and* `status=in_progress`, pages both, pages each run's jobs, and counts the queued
-self-hosted jobs themselves; the only early exit is when both architectures already want more
-runners than the pool can hold. Sampling the newest five `queued` runs hid real work two
+self-hosted jobs themselves. Three bounds, each logged when it fires: a saturation exit
+(both architectures already want at least as many runners as the pool holds, so more
+scanning cannot change the launch), `QUEUE_SCAN_MAX_RUNS` (200) applied per status — per
+status so phantom queued runs can never evict the in-progress runs from the scan — and a
+120-second wall-clock budget, because a Lambda timeout is uncatchable and would kill the
+whole poll; a truncated scan merely under-counts, and the next poll corrects it. Sampling the newest five `queued` runs hid real work two
 ways. A run that is `in_progress` still holds queued jobs and the `queued` query does not
 return it: run 31202629167 went `in_progress` at 17:40 on 2026-08-07 and kept two arm64 jobs
 queued until 18:25, invisible for 45 minutes. And `ejc3/fcvm` carries six runs from

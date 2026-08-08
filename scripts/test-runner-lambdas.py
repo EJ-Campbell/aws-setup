@@ -16,6 +16,7 @@ Run from the repo root:  python3 scripts/test-runner-lambdas.py
 Exit code 1 if any case fails.
 """
 import json
+import os
 import re
 import sys
 import textwrap
@@ -164,7 +165,12 @@ class FakeGitHub:
             jobs = self.jobs.get(int(jobs_match.group(1)), [])
             window = jobs[(page - 1) * per_page: page * per_page]
             return {"total_count": len(jobs), "jobs": window}
-        status = re.search(r"[?&]status=(\w+)", url).group(1)
+        status_match = re.search(r"[?&]status=(\w+)", url)
+        if not status_match:
+            # Fail LOUDLY: the Lambdas wrap GitHub calls in broad except blocks,
+            # so a silently unrouted URL would read as "no demand" and pass.
+            raise ValueError(f"FakeGitHub has no route for {url}")
+        status = status_match.group(1)
         matched = [r for r in self.runs if r["status"] == status]
         window = matched[(page - 1) * per_page: page * per_page]
         return {"total_count": len(matched), "workflow_runs": window}
@@ -193,8 +199,19 @@ class FakeGitHub:
         return module
 
 
+_BASE_ENV = dict(os.environ)
+
+
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW):
-    """exec the Lambda source with its AWS and GitHub edges replaced."""
+    """exec the Lambda source with its AWS and GitHub edges replaced.
+
+    os.environ is reset to the process baseline first: exec does not isolate
+    imports, so the env vars below land in the REAL environment and would
+    otherwise leak between cases (a WEBHOOK_SECRET set by one case must not
+    still be set for the next).
+    """
+    os.environ.clear()
+    os.environ.update(_BASE_ENV)
     clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client}
     fake_boto3 = types.ModuleType("boto3")
     fake_boto3.client = lambda service, **kw: clients[service]
