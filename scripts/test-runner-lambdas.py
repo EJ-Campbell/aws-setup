@@ -324,11 +324,15 @@ def case_incident_replay_three_dead_c5d_launches():
         instance("i-012093644a97c1b37", "c5d.metal", "pending", 74),
         instance("i-00ead8c13e0bfffff", "c5d.metal", "pending", 69),
     ])
-    module = webhook(ec2)
+    # GitHub is reachable and has no runner registered for any husk -- required:
+    # without a GitHub view, get_capacity deliberately degrades to the instance
+    # count and husks WOULD hold slots (fail toward over-counting).
+    module = webhook(ec2, github=FakeGitHub())
     module["launch_runner"]("x86_64")
     assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
-    # And the husks are not counted as runners, so the pool is not "full".
-    assert module["get_running_runners"]("x86_64") == 0
+    # And the husks are not counted as runners, so the pool is not "full":
+    # stalled pending instances are past BOOT_GRACE_MINUTES and not online.
+    assert module["get_capacity"]("x86_64")["counted"] == 0
 
 
 def case_handler_launches_next_type_when_the_pool_is_all_husks():
@@ -348,7 +352,8 @@ def case_handler_launches_next_type_when_the_pool_is_all_husks():
         "action": "queued",
         "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
     })}
-    result = webhook(ec2)["handler"](event, None)
+    # GitHub reachable, nothing registered: see the husk-counting note above.
+    result = webhook(ec2, github=FakeGitHub())["handler"](event, None)
     assert "Launched 1 x86_64 runner(s) (c5.metal)" in result["body"], result
     assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
 
