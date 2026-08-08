@@ -146,7 +146,7 @@ creates its VNC password.
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
-| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four per architecture maximum; idle/expired leases terminate. |
+| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
@@ -423,10 +423,16 @@ The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or
 Labels select the architecture; the launcher tries several metal families when capacity is
 scarce. A runner receives a 60-minute lease, renews while GitHub reports it busy, and is
 terminated when idle/expired. Cleanup runs every five minutes and also replaces missing
-runners for queued jobs.
+runners for queued jobs, and terminates any runner whose current job has been running for
+more than three hours — a job that long is wedged, and "busy" alone would renew its lease
+forever.
 
-The maximum is four runners per architecture. Runner roots and instance-store data are
-disposable. See `GITHUB-RUNNERS.md` for the webhook, AMI, lease, and cleanup internals.
+The maximum is four runners per architecture, counted as runners GitHub can actually hand a
+job to rather than instances that merely exist, so a wedged box cannot hold a slot. Each
+scale-up decision emits a `GitHubRunners` metric and a structured log line, and the
+`runner-scale-up-starved` alarm fires if launches are ever blocked while under that cap.
+Runner roots and instance-store data are disposable. See `GITHUB-RUNNERS.md` for the
+webhook, AMI, lease, health, and cleanup internals.
 
 The repository also manages:
 
@@ -469,8 +475,9 @@ Terraform.
 - The primary backup vault uses governance Vault Lock.
 - Weekly/monthly recovery points copy to `us-east-1`; a second copy target lives in the
   isolated `dev-staging` account.
-- Daily cost reports, AWS Budget notifications, runner-count/age alarms, EC2 spend alarms,
-  and instance-status alarms publish through SNS/email.
+- Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
+  `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
+  through SNS/email.
 - The original jumpbox's protected home volume and the fully reproducible `jumpbox-2`
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
