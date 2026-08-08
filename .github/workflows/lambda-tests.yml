@@ -1,0 +1,26 @@
+name: Runner Lambda Tests
+
+# The runner Lambdas are inline Python inside runner-autoscale.tf, so nothing
+# runs them before they are deployed. This exercises the real heredoc bodies
+# against fakes - no AWS credentials, no network, no OIDC role.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Test-only workflow: never expose the checkout token to PR code.
+permissions:
+  contents: read
+
+jobs:
+  lambda-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Runner Lambda logic
+        run: python3 scripts/test-runner-lambdas.py
