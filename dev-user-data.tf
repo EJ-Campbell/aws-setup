@@ -165,7 +165,37 @@ kernel.unprivileged_userns_clone=1
 kernel.apparmor_restrict_unprivileged_userns=0
 vm.dirty_ratio=80
 vm.dirty_background_ratio=50
+# --- diagnostics for a wedged box (see dev-diagnostics.tf) ---
+# panic_on_oops: on 2026-08-08 a kernel BUG in the nested-KVM path killed an fc_vcpu
+# thread "with irqs disabled" and the box then hung INDEFINITELY -- 25 minutes of dead
+# dev box before a human noticed, with no self-recovery. Turning that oops into a panic
+# makes the kernel reboot instead (the cmdline already carries panic=-1, reboot
+# immediately). A reboot does NOT clear the EC2 console ring buffer -- only stop/start
+# does -- so the trace survives for the capture Lambda to archive. Trade accepted: an
+# oops that would NOT have wedged the box now costs a reboot, which on a dev box beats
+# an indefinite hang that costs the whole box.
+kernel.panic_on_oops=1
+# Log D-state pileups (the 2026-08-07 shape: 103 uninterruptible tasks) to the console
+# so they reach the same capture path. Deliberately WARN, not panic: heavy Firecracker
+# and NFS I/O can legitimately block a task, and a spurious reboot mid-build is worse
+# than a log line. 300s is far past any legitimate block on these boxes.
+kernel.hung_task_timeout_secs=300
+kernel.hung_task_warnings=10
+# Let an operator on the serial console dump tasks/memory or force a crash on a box
+# that is too far gone to accept SSH. Inert unless deliberately used.
+kernel.sysrq=1
 SYSCTL
+# Keep the journal across reboots. Without this the journal lives in /run (tmpfs) and
+# every reboot -- including the automatic one a panic now triggers -- discards the last
+# thing the box logged before it died.
+mkdir -p /var/log/journal
+if ! grep -q '^Storage=persistent' /etc/systemd/journald.conf 2>/dev/null; then
+  sed -i 's/^#\?Storage=.*/Storage=persistent/' /etc/systemd/journald.conf
+  grep -q '^Storage=persistent' /etc/systemd/journald.conf || echo 'Storage=persistent' >> /etc/systemd/journald.conf
+  systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+  systemctl restart systemd-journald 2>/dev/null || true
+fi
+
 # Non-fatal: `sysctl -p` exits non-zero if ANY key is missing, and these boxes boot a
 # custom -nested-dsb kernel that lacks kernel.unprivileged_userns_clone and
 # kernel.apparmor_restrict_unprivileged_userns (both Ubuntu-stock-kernel keys). Under

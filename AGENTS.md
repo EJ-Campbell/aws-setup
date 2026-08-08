@@ -247,6 +247,33 @@ restarting the aggregate can kill every managed and interactive t-claude session
 shared server. The Next.js box is different: Colton and Connor are separate Unix users,
 so their `claude-rc@` units own separate tmux servers.
 
+### Diagnosing a wedged dev box
+
+When an instance fails its status check, the reason is in the EC2 serial console ring
+buffer and usually nowhere else. Three things about that buffer decide whether you ever
+learn what happened:
+
+```bash
+# WRONG -- returns a CACHED snapshot that can be hours stale. During the 2026-08-08
+# hang (12:19) this answered with 05:37 data and showed nothing wrong.
+aws ec2 get-console-output --instance-id <id> --region us-west-1
+
+# RIGHT -- reads the live buffer, which held "kernel BUG at arch/arm64/kvm/nested.c:754"
+aws ec2 get-console-output --instance-id <id> --region us-west-1 --latest
+```
+
+**Capture before you recover.** A reboot preserves the buffer; a **stop/start clears it**.
+Stop/start is the remedy for a wedged box, so recovering it destroys the evidence. Always
+snapshot with `--latest` first. `dev-diagnostics.tf` now does this automatically on every
+status-check alarm (archived to CloudWatch Logs `/dev-servers/console-capture`, with the
+panic signature quoted in the SNS alert), so the archive should already exist -- check it
+before assuming the cause is unknowable.
+
+The boxes are also configured to make a hang legible rather than silent: `panic_on_oops`
+turns an oops into a reboot (the cmdline carries `panic=-1`) instead of an indefinite
+hang, hung-task detection logs D-state pileups, sysrq is available on the console, and
+journald is persistent so the last pre-death log survives the reboot.
+
 ### Do not run recursive greps on the jumpbox
 
 Its two volumes are gp3 capped at **125 MB/s**. On 2026-07-25 a
