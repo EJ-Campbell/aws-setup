@@ -5,28 +5,41 @@ This file provides guidance to automation agents working with this repository. R
 
 ## Nested Virtualization (NV2) Kernel
 
-**CRITICAL**: The fcvm project requires a custom kernel with DSB patches for nested virtualization.
+**CRITICAL**: the metal boxes run a custom kernel for nested virtualization. Both the
+host kernel and the VM (guest) kernel come from the SAME fcvm profile and the SAME patch
+set -- there is no separate host build path, and no `kernel/build.sh` (that script is
+gone; earlier revisions of this file documented it).
 
-The host kernel must have these patches from `fcvm/kernel/patches/`:
-- `nv2-vsock-cache-sync.patch` - DSB in KVM nested exit path
-- `nv2-vsock-rx-barrier.patch` - DSB in vsock RX path
-- `mmfr4-override.patch` - ID register override for recursive nesting
+The version is pinned in ONE place, `fcvm/rootfs-config.toml`, across six
+`kernel_version` entries: `nested` arm64/amd64, each of their `host_kernel`
+sub-profiles, and `btrfs` arm64/amd64. Bumping a kernel means editing those together and
+re-verifying the patches, not editing a build script.
 
-**Rebuild host kernel after adding new patches:**
+Patches live in `fcvm/kernel/patches-arm64/` and `patches-x86/`. The FUSE ones are
+symlinks into `fcvm/kernel/patches/`, so a fix there lands on both architectures at once.
+`*.vm.patch` is applied to the VM kernel only -- the `host_kernel` `build_inputs` glob
+deliberately excludes it, so the host takes a strict subset.
+
+**Rebuild and install the host kernel** (fcvm drives the whole thing -- it downloads the
+kernel.org tarball for the pinned version, applies the patch set, builds, installs to
+`/boot`, and runs `update-grub`):
+
 ```bash
 cd /home/ubuntu/fcvm
-./kernel/build.sh  # Builds guest kernel with patches
-
-# For HOST kernel (needs modules too):
-KERNEL_VERSION=6.18.3 BUILD_DIR=/tmp/kernel-build-host ./kernel/build.sh
-cd /tmp/kernel-build-host/linux-6.18.3
-sudo make ARCH=arm64 modules_install
-sudo cp arch/arm64/boot/Image /boot/vmlinuz-6.18.3-nested-dsb
-sudo update-grub
+sudo ./fcvm setup --kernel-profile nested --install-host-kernel
 sudo reboot
 ```
 
-**Current kernel on instance:** Check with `uname -r` - should show `-nested-dsb` suffix if DSB patches are applied.
+**Current kernel on instance:** `uname -r` reports `<version>-fcvm-<build-sha>`, e.g.
+`7.0.14-fcvm-<sha>`. The `-nested-dsb` suffix in older notes was never what the build
+produced. GRUB keeps previously installed kernels, so a bad build can be backed out by
+selecting the prior entry rather than rebuilding from scratch.
+
+**Rebasing the kernel is periodically necessary, not optional.** The 6.18.3 pin sat
+seven months and three upstream releases stale until 2026-08-08, when the ARM box hung
+on `kernel BUG at arch/arm64/kvm/nested.c:754` in the NV2 path. Upstream churns
+`arch/arm64/kvm/nested.c` heavily (21 commits between v6.18 and v7.1-rc7), and no
+upstream bug report is actionable against a stale tree carrying local KVM/NV patches.
 
 ## Project Philosophy
 
