@@ -530,6 +530,27 @@ def case_stale_describe_cannot_overshoot_the_cap():
     assert len(launched_types(ec2)) == 4, launched_types(ec2)
 
 
+def case_github_style_header_casing_verifies():
+    """GitHub sends X-Hub-Signature-256; payload format 1.0 preserves that case.
+
+    The lowercase-only lookup 401'd every real delivery regardless of secret --
+    the actual root cause of the dead webhook path. The handler must verify
+    with the header exactly as GitHub capitalizes it.
+    """
+    import hmac as hmac_mod
+    import hashlib
+    secret = "testsecret"
+    body = json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "ARM64"]},
+    })
+    sig = "sha256=" + hmac_mod.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    event = {"body": body, "requestContext": {}, "headers": {"X-Hub-Signature-256": sig}}
+    ec2 = FakeEC2([])
+    result = webhook(ec2, github=FakeGitHub(), env={"WEBHOOK_SECRET": secret})["handler"](event, None)
+    assert "Launched 1 arm64 runner(s)" in result["body"], result
+
+
 def case_public_webhook_cannot_amplify_launch_count():
     """launch_count is honored only on IAM-authed direct invokes.
 

@@ -246,11 +246,15 @@ Closed (were sharp edges, now hardened):
   (the old `x-internal-invoke: cleanup-retry` bypass is gone — cleanup retries are trusted
   by being direct `lambda:Invoke`, which carry no `requestContext`).
 - **Both halves of that secret come from one Terraform value.** It used to be two hand-copied
-  strings, a tfvar and a form field, with nothing checking they still matched. They stopped
-  matching, and because verification fails closed the failure was silent and total: all 5,026
-  deliveries GitHub retains for hook 589197362 between 2026-08-05T21:11Z and
-  2026-08-07T22:49Z returned 401 or 503, zero returned 200. Event-driven scale-up was dead
-  for two days behind a pool that still looked alive on the five-minute poll.
+  strings, a tfvar and a form field, with nothing checking they still matched — a real
+  structural flaw, though NOT what killed the webhook. The measured root cause: the API
+  Gateway route uses payload format 1.0, which preserves header casing, GitHub sends
+  `X-Hub-Signature-256`, and the handler looked the header up in lowercase only — so it
+  read the signature as absent and fail-closed 401'd every genuine delivery regardless of
+  any secret (all 5,026 deliveries retained for hook 589197362 up to 2026-08-07 were 401
+  or 503, zero 200). Whether the hand-copied secrets also drifted is unknowable from the
+  outside — the case bug alone produces exactly this failure. Both are fixed: the handler
+  normalizes header case, and the secret cannot drift again because there is only one.
   `random_password.github_webhook` feeds the Lambda env and the hook's
   `configuration.secret`, so there is no second copy to drift. This ownership begins at
   the one-time import + apply documented below — until that apply lands on a given state,

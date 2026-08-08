@@ -374,7 +374,13 @@ data "archive_file" "runner_webhook" {
       def handler(event, context):
           # Parse webhook
           body = event.get('body', '{}')
-          headers = event.get('headers', {})
+          # Case-insensitive header lookup. This line IS the webhook fix: the API
+          # Gateway route uses payload format 1.0, which preserves original header
+          # casing, and GitHub sends X-Hub-Signature-256 -- so a lowercase-only
+          # lookup read the signature as absent and fail-closed 401'd EVERY real
+          # delivery, regardless of any secret. (Format 2.0 lowercases headers,
+          # which is how the bug hid in every lowercase-header test.)
+          headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}
 
           # Requests via API Gateway carry requestContext (set by AWS, not the
           # caller) - that is the public, untrusted path, so it must pass HMAC
