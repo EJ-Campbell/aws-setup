@@ -43,6 +43,16 @@ case "$repo" in
   *) exit 0 ;;
 esac
 
+# MAIN CHECKOUTS ONLY -- never a linked `git worktree`. In a linked worktree the
+# per-worktree git dir differs from the repository's common dir; in the main
+# checkout they are the same. Branch worktrees are short-lived and numerous (73 on
+# this box at one point, one agent each), and an agent per branch is neither wanted
+# nor affordable: they consume memory, each stalls on its own trust prompt, and they
+# bury the session that matters.
+gitdir=$(git -C "$repo" rev-parse --path-format=absolute --git-dir 2>/dev/null) || exit 0
+commondir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+[ "$gitdir" = "$commondir" ] || exit 0
+
 origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || exit 0
 case "$origin" in
   https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
@@ -120,6 +130,12 @@ add_repo() {
     /home/ubuntu/*) ;;
     *) return 0 ;;
   esac
+
+  # Main checkouts only -- skip linked worktrees. See the note at the gate above.
+  local gitdir commondir
+  gitdir=$(git -C "$repo" rev-parse --path-format=absolute --git-dir 2>/dev/null) || return 0
+  commondir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  [ "$gitdir" = "$commondir" ] || return 0
 
   origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || return 0
   case "$origin" in
