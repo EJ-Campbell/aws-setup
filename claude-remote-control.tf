@@ -251,14 +251,23 @@ if [ ! -s "$REPOS" ]; then
   exit 0
 fi
 
+# Trust EVERY selected repo before launching ANY of them. Doing it per-repo inside the
+# launch loop is not enough: a Claude started for an earlier repo has already read
+# ~/.claude.json, and when it later writes the file back it drops entries added after
+# that read -- which silently undid the trust for the last repos in the list (observed
+# with dolphin-labs on 2026-08-12). Seeding the whole set first means every instance
+# reads a file that already contains all of them.
+while IFS= read -r repo; do
+  trust_repo "$repo" || echo "fcvm-claude: WARNING could not pre-accept trust for $repo"
+done < "$REPOS"
+
 ready_count=0
 failed_count=0
 while IFS= read -r repo; do
   echo "fcvm-claude: starting remote control in $repo"
 
-  # Clear the trust gate BEFORE launching, or the agent stalls on it forever and
-  # never registers with remote control.
-  trust_repo "$repo" || echo "fcvm-claude: WARNING could not pre-accept trust for $repo"
+  # Idempotent safety net: a no-op when the bulk pass above already trusted this repo.
+  trust_repo "$repo" || true
 
   # t-claude intentionally tries to attach after creating/reusing its tmux window. There
   # is no terminal under systemd, so that final attach fails harmlessly after launch.
