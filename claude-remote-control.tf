@@ -11,8 +11,8 @@ locals {
 # immutable copy for systemd so a failed refresh of the interactive copy cannot silently
 # turn `--remote-control` into an ordinary Claude session.
 install -d -m 755 /usr/local/lib/fcvm
-TCLAUDE_COMMIT=984392a2969371a0dfb69489693121095147a9ac
-TCLAUDE_SHA256=25b9a72dd74e2ae5f52763adde43ace6ef0c5171f896ce48aeeedbb84c7d497a
+TCLAUDE_COMMIT=bf4259ed3c4b86ff580ee34f55199877c0adb0f3
+TCLAUDE_SHA256=5f32a138c50ffcc99609f30397c04963c6b538bfbf07a4cd9dc0f32fcdbb1b88
 TCLAUDE_PINNED=/usr/local/lib/fcvm/t-claude.zsh
 TCLAUDE_TMP=$(mktemp)
 if curl -fsSL --retry 3 \
@@ -274,7 +274,7 @@ while IFS= read -r repo; do
   /usr/bin/zsh -c '
     source /usr/local/lib/fcvm/t-claude.zsh || exit 1
     cd -- "$1" || exit 1
-    t-claude --remote-control
+    t-claude --auto --remote-control
   ' fcvm-claude "$repo" || true
 
   key="$(printf '%s' "$repo" | cksum | awk '{print $1}')_$(printf '' | cksum | awk '{print $1}')"
@@ -323,7 +323,7 @@ Environment=HOME=/home/ubuntu
 Environment=TERM=xterm-256color
 Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/ubuntu
-ExecCondition=/bin/sh -c 'echo "25b9a72dd74e2ae5f52763adde43ace6ef0c5171f896ce48aeeedbb84c7d497a  /usr/local/lib/fcvm/t-claude.zsh" | sha256sum -c - >/dev/null 2>&1'
+ExecCondition=/bin/sh -c 'echo "5f32a138c50ffcc99609f30397c04963c6b538bfbf07a4cd9dc0f32fcdbb1b88  /usr/local/lib/fcvm/t-claude.zsh" | sha256sum -c - >/dev/null 2>&1'
 ExecCondition=/bin/sh -c 'command -v claude >/dev/null 2>&1 && claude auth status >/dev/null 2>&1'
 ExecStart=/usr/local/bin/fcvm-claude-active-repos
 TimeoutStartSec=300
