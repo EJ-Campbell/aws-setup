@@ -46,6 +46,13 @@ esac
 origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || exit 0
 case "$origin" in
   https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
+  # Collaboration repos owned by someone else, allowed ONE AT A TIME by exact name.
+  # Deliberately not an org wildcard: this gate decides which checkouts get an agent
+  # started with --dangerously-skip-permissions at boot, and a wildcard would opt in
+  # every future repo of that owner -- including ones added without our review.
+  https://github.com/skrutzler-disney/dolphin-labs|https://github.com/skrutzler-disney/dolphin-labs.git) ;;
+  git@github.com:skrutzler-disney/dolphin-labs|git@github.com:skrutzler-disney/dolphin-labs.git) ;;
+  ssh://git@github.com/skrutzler-disney/dolphin-labs|ssh://git@github.com/skrutzler-disney/dolphin-labs.git) ;;
   *) exit 0 ;;
 esac
 case "$origin" in
@@ -117,6 +124,10 @@ add_repo() {
   origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || return 0
   case "$origin" in
     https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
+    # Exact-name collaboration repos; see the note at the marker-writing gate above.
+    https://github.com/skrutzler-disney/dolphin-labs|https://github.com/skrutzler-disney/dolphin-labs.git) ;;
+    git@github.com:skrutzler-disney/dolphin-labs|git@github.com:skrutzler-disney/dolphin-labs.git) ;;
+    ssh://git@github.com/skrutzler-disney/dolphin-labs|ssh://git@github.com/skrutzler-disney/dolphin-labs.git) ;;
     *) return 0 ;;
   esac
   case "$origin" in
