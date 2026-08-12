@@ -122,6 +122,53 @@ CUTOFF_MS=$(( CUTOFF_S * 1000 ))
 REPOS=$(mktemp)
 trap 'rm -f "$REPOS"' EXIT
 
+# Pre-accept Claude Code's per-directory trust prompt for a repo we are about to
+# launch in. Without this the agent starts, prints "Is this a project you created or
+# one you trust?", and waits forever for a keypress nobody will send: the session
+# looks alive in tmux but never finishes starting, so it never registers with remote
+# control and never appears in the client. 16 of 50 sessions were wedged exactly this
+# way on 2026-08-12.
+#
+# The flag lives in ~/.claude.json under projects["<abs path>"].hasTrustDialogAccepted.
+# We only ever set it for paths this launcher itself selected -- repos that already
+# passed the origin allowlist above -- so this does not blanket-trust the filesystem.
+#
+# Written via a temp file + atomic rename, and re-read immediately before each write,
+# because Claude Code rewrites this file itself; a read-modify-write held open across
+# the whole loop would clobber concurrent updates.
+trust_repo() {
+  local repo="$1"
+  python3 - "$repo" <<'TRUSTPY'
+import json, os, sys, tempfile
+
+repo = sys.argv[1]
+path = os.path.expanduser("~/.claude.json")
+try:
+    with open(path) as fh:
+        cfg = json.load(fh)
+except (OSError, ValueError):
+    return_code = 0
+    sys.exit(0)          # no config yet: Claude will create it and ask once
+
+projects = cfg.setdefault("projects", {})
+entry = projects.setdefault(repo, {})
+if entry.get("hasTrustDialogAccepted") is True:
+    sys.exit(0)          # already trusted, leave the file untouched
+entry["hasTrustDialogAccepted"] = True
+
+d = os.path.dirname(path)
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".claude.json.")
+try:
+    with os.fdopen(fd, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+except Exception:
+    os.unlink(tmp)
+    raise
+TRUSTPY
+}
+
 add_repo() {
   local candidate="$1" repo origin
   [ -d "$candidate" ] || return 0
@@ -208,6 +255,10 @@ ready_count=0
 failed_count=0
 while IFS= read -r repo; do
   echo "fcvm-claude: starting remote control in $repo"
+
+  # Clear the trust gate BEFORE launching, or the agent stalls on it forever and
+  # never registers with remote control.
+  trust_repo "$repo" || echo "fcvm-claude: WARNING could not pre-accept trust for $repo"
 
   # t-claude intentionally tries to attach after creating/reusing its tmux window. There
   # is no terminal under systemd, so that final attach fails harmlessly after launch.
