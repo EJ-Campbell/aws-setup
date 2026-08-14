@@ -81,7 +81,8 @@ needs:
 - the existing `fcvm-ec2` EC2 key pair and its private key;
 - the existing `AWSBackupDefaultServiceRole`;
 - the Cloudflare `cc-games.dev` zone and Secrets Manager values
-  `cloudflare-tunnel-token`, `cloudflare-tunnel-credentials`, and
+  `cloudflare-tunnel-token` (including Workers Scripts Read/Write),
+  `cloudflare-tunnel-credentials`, and
   `cloudflare-google-idp`;
 - the `github-pat-ejc3` Secrets Manager value, the runner-only GitHub PAT, and
   `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
@@ -425,6 +426,42 @@ token supports non-interactive checks.
 Once credentials exist and their units have been enabled, services and remote-control
 agents start at boot. A reboot restores the published URLs without another interactive
 login.
+
+### Colton Games Cloudflare staging and previews
+
+The `colton-games-stage` Worker is deployed from `CoderColton/colton-games` with Wrangler
+and OpenNext. Terraform deliberately owns only the Worker envelope; after the provider fork
+lands it will also own the Access boundary. Workers Builds owns versions, application assets,
+bindings, and deployments. This prevents an infrastructure apply from replacing an
+application bundle.
+
+The existing Worker is adopted through the checked-in import block with both `workers.dev`
+and preview URLs still disabled, matching its current remote state. Read the plan and stop if
+it proposes creating, replacing, or deleting the Worker or changing its deployed code.
+
+Before enabling either URL, create one Worker-native Access application with a `worker`
+destination. That single application follows every request routed to this Worker, including
+its `workers.dev` hostname once enabled, immutable and branch previews, future Custom
+Domains, and future zone routes. It should reuse the family email allowlist and the
+non-interactive Access service-token policy. The upstream Cloudflare Terraform provider does
+not expose `worker_id` yet, so the URL switches intentionally remain off until the provider
+fork lands. Do not use hostname wildcard applications or a generic REST/local-exec bridge as
+a substitute.
+
+Cloudflare's Terraform provider does not yet model Workers Builds repository connections,
+build tokens, or triggers. The Cloudflare GitHub App also requires a one-time browser grant
+limited to `CoderColton/colton-games`. Until those APIs are added to this stack, configure
+one repository build with separate production and non-production deploy commands:
+
+| Deployment | Branches | Build command | Deploy command |
+|---|---|---|---|
+| Production staging | `main` | `npm run cf:build` | `npm run cf:deploy:built` |
+| Pull-request preview | all except `main` | `npm run cf:build` | `npm run cf:upload:built` |
+
+Use `/` as the root directory and Node 24 from the application's `.nvmrc`. Preview builds
+must remain limited to trusted branches because they inherit the staging Worker's bindings
+and secrets. `stage.colton-games.com` and the production Vercel serving path remain outside
+this change until the domain is deliberately moved to Cloudflare.
 
 ## GitHub Actions and package infrastructure
 

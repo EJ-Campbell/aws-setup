@@ -8,9 +8,10 @@
 # imported here so the whole thing is reproducible from `terraform apply` rather than
 # living only in someone's shell history.
 #
-# CREDENTIALS: the API token lives in Secrets Manager (cloudflare-tunnel-token), scoped to
-# this account with only what the resources below need -- Tunnel Write, Access Apps and
-# Policies Write, Access Organizations/Identity Providers Write, DNS Write, Zone Read/Write.
+# CREDENTIALS: the API token lives in Secrets Manager (cloudflare-tunnel-token) and must be
+# scoped to this account with only what the resources below need -- Tunnel Write, Access Apps
+# and Policies Write, Access Organizations/Identity Providers Write, Workers Scripts
+# Read/Write, DNS Write, and Zone Read/Write.
 # It is never written to disk or into the repo.
 #
 # The IdP permission is the non-obvious one: without it `terraform import` on the identity
@@ -300,4 +301,41 @@ output "cc_games_tunnel_id" {
 output "cc_games_urls" {
   description = "How to publish a project"
   value       = "run `ndev` in a Next.js project -> https://<name>.cc-games.dev (Google login required)"
+}
+
+# ---------------------------------------------------------------------------------
+# Colton Games staging and pull-request previews.
+#
+# Application code, versions, bindings, and deployments remain owned by Wrangler in
+# CoderColton/colton-games. Terraform owns only the Worker envelope and its routing/auth
+# boundary so a plan can never replace the OpenNext bundle.
+#
+# Cloudflare's provider cannot yet express Access's direct `worker` destination. Keep
+# workers.dev and previews disabled until the provider fork can create that application;
+# otherwise the first Terraform apply would expose both URL surfaces.
+# ---------------------------------------------------------------------------------
+locals {
+  colton_games_worker_name = "colton-games-stage"
+  colton_games_worker_id   = "72edf31f83e240448fce38bef56104e3"
+}
+
+resource "cloudflare_worker" "colton_games_stage" {
+  account_id = var.cloudflare_account_id
+  name       = local.colton_games_worker_name
+
+  subdomain = {
+    enabled          = false
+    previews_enabled = false
+  }
+
+  # The Worker already exists and carries an OpenNext deployment. It must be adopted by
+  # the import block below; replacement or destruction would sever the staging service.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+import {
+  to = cloudflare_worker.colton_games_stage
+  id = "${var.cloudflare_account_id}/${local.colton_games_worker_id}"
 }
