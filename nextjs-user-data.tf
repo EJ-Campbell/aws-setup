@@ -54,13 +54,14 @@ locals {
   # Same reason as the case arms: these emit whole STATEMENTS, and the directive form ran
   # them together into "systemctl daemon-reloadsystemctl enable ..." -- a syntax error
   # rather than merely ugly, because statements need a separator and case arms do not.
-  nextjs_zone_seed = join("\n", [
-    for z, t in local.nextjs_zone_tunnel :
-    "[ -s /etc/cloudflared/config-${z}.yml ] || printf 'tunnel: ${t}\\ncredentials-file: /etc/cloudflared/creds-${z}.json\\ningress:\\n  - service: http_status:404\\n' > /etc/cloudflared/config-${z}.yml"
+  nextjs_zone_rebuild = join("\n", [
+    for z, t in local.nextjs_zone_tunnel : "/usr/local/bin/ndev-rebuild ${z}"
   ])
+  # enable --now does nothing to an already-running unit, so a re-provision would leave
+  # cloudflared serving the config it read at boot rather than the one just rebuilt.
   nextjs_zone_enable = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
-    "systemctl enable --now \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
+    "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl reload-or-restart \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
   ])
 
   # Unix accounts. Each gets the fcvm key initially so you can get in as them and help;
@@ -175,6 +176,32 @@ esac
 ZONE
 chmod 755 /usr/local/bin/ndev-zone
 
+# Regenerates one zone's cloudflared ingress from that zone's registry. Split out so the
+# publish path and the boot path build the config the same way -- when they were separate,
+# boot wrote a 404-only config and silently dropped every already-published hostname.
+cat > /usr/local/bin/ndev-rebuild <<'REBUILD'
+#!/bin/bash
+set -euo pipefail
+ZONE="$1"
+TUNNEL_ID=$(/usr/local/bin/ndev-zone --tunnel "$ZONE")
+REGISTRY=/var/lib/ndev/registry-$ZONE
+{
+  echo "tunnel: $TUNNEL_ID"
+  echo "credentials-file: /etc/cloudflared/creds-$ZONE.json"
+  echo "ingress:"
+  if [ -f "$REGISTRY" ]; then
+    while IFS=$'\t' read -r h p rest; do
+      [ -n "$h" ] || continue
+      echo "  - hostname: $h"
+      echo "    service: http://127.0.0.1:$p"
+    done < "$REGISTRY"
+  fi
+  echo "  - service: http_status:404"
+} > /etc/cloudflared/config-$ZONE.yml
+REBUILD
+chmod 755 /usr/local/bin/ndev-rebuild
+
+
 cat > /usr/local/bin/ndev-register <<'REG'
 #!/bin/bash
 # ndev-register <hostname> <port> <user> <projectdir>
@@ -218,19 +245,7 @@ sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
 # nobody logged in: the unit needs no argument beyond the username.
 printf 'HOST=%s\nPORT=%s\nDIR=%s\n' "$HOST" "$PORT" "$DIR" > "/var/lib/ndev/$WHO.env"
 
-TUNNEL_ID=$(/usr/local/bin/ndev-zone --tunnel "$ZONE")
-CREDS=/etc/cloudflared/creds-$ZONE.json
-{
-  echo "tunnel: $TUNNEL_ID"
-  echo "credentials-file: $CREDS"
-  echo "ingress:"
-  while IFS=$'\t' read -r h p rest; do
-    [ -n "$h" ] || continue
-    echo "  - hostname: $h"
-    echo "    service: http://127.0.0.1:$p"
-  done < "$REGISTRY"
-  echo "  - service: http_status:404"
-} > /etc/cloudflared/config-$ZONE.yml
+/usr/local/bin/ndev-rebuild "$ZONE"
 
 systemctl reload-or-restart "cloudflared@$ZONE" 2>/dev/null || systemctl restart "cloudflared@$ZONE"
 systemctl enable --now "ndev@$WHO.service" >/dev/null 2>&1 || systemctl restart "ndev@$WHO.service"
@@ -493,10 +508,25 @@ UNIT
 
 systemctl daemon-reload
 
-# Seed an empty config per zone so each cloudflared can start before anything is
-# registered. Without this a fresh box has a tunnel service that crash-loops until the
-# first `ndev`, which looks like a broken tunnel rather than an empty one.
-${local.nextjs_zone_seed}
+# Split the old single shared registry into one per zone. Without this the per-zone config
+# is rebuilt from a registry that does not exist yet, so every already-published hostname
+# silently drops to the 404 catch-all: the site stays reachable through Access and then
+# 404s, which looks like the app broke rather than the routing.
+if [ -f /var/lib/ndev/registry ]; then
+  while IFS=$'\t' read -r h p who dir; do
+    [ -n "$h" ] || continue
+    z=$(/usr/local/bin/ndev-zone "$who")
+    [ -n "$z" ] || { echo "migrate: skipping $h -- $who has no zone"; continue; }
+    printf '%s\t%s\t%s\t%s\n' "$h" "$p" "$who" "$dir" >> "/var/lib/ndev/registry-$z"
+  done < /var/lib/ndev/registry
+  for f in /var/lib/ndev/registry-*; do [ -f "$f" ] && sort -u "$f" -o "$f"; done
+  mv /var/lib/ndev/registry /var/lib/ndev/registry.migrated
+  echo "migrated shared ndev registry into per-zone registries"
+fi
+
+# Build each zone's ingress from its registry. Also the reason a fresh box has a working
+# tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
+${local.nextjs_zone_rebuild}
 
 # Templated per zone: cloudflared serves ONE tunnel per process, so two zones means two
 # services. cloudflared@cc-games.dev and cloudflared@dolphin-labs.dev fail and restart
