@@ -151,6 +151,93 @@ chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
 # Keep the old path working for anything that still references it.
 ln -sf /etc/cloudflared/creds-cc-games.dev.json /etc/cloudflared/credentials.json
 
+# --------------------------------------------------------- agent enable watcher
+# The units above are enabled only when a user's credentials already exist, and that check
+# ran at boot. Someone who logs in to Claude afterwards used to wait for "the next setup
+# run" -- an event they could not trigger -- or reach for sudo. This timer closes that gap:
+# it re-runs the same guarded enable every few minutes, so logging in is the only step.
+cat > /usr/local/bin/agents-enable <<'AGENTSENABLE'
+#!/bin/bash
+# Enable each user's agent units once their credentials exist. Idempotent and quiet.
+set -uo pipefail
+for u in ${join(" ", local.nextjs_users)}; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  if [ -s "/home/$u/.claude/.credentials.json" ]; then
+    systemctl is-enabled "claude-rc@$u.service" >/dev/null 2>&1       || systemctl enable --now "claude-rc@$u.service" >/dev/null 2>&1 || true
+  fi
+  if [ -s "/home/$u/.codex/auth.json" ]; then
+    systemctl is-enabled "codex-rc@$u.service" >/dev/null 2>&1       || systemctl enable --now "codex-rc@$u.service" >/dev/null 2>&1 || true
+  fi
+done
+AGENTSENABLE
+chmod 755 /usr/local/bin/agents-enable
+
+cat > /etc/systemd/system/agents-enable.service <<'AESVC'
+[Unit]
+Description=Enable per-user agent units once their credentials exist
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agents-enable
+AESVC
+
+cat > /etc/systemd/system/agents-enable.timer <<'AETIMER'
+[Unit]
+Description=Check for newly logged-in agent users
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+AETIMER
+systemctl daemon-reload
+systemctl enable --now agents-enable.timer >/dev/null 2>&1 || true
+
+# ------------------------------------------------------- playwright system deps
+# Installed once, as root, at provision time so that nobody needs `--with-deps` (which
+# shells out to apt and therefore needs sudo) just to run the e2e suite. Playwright is
+# asked what it wants rather than us pinning a package list that rots with each Ubuntu
+# release -- the browser binaries themselves stay per-user and per-version.
+if command -v npx >/dev/null 2>&1; then
+  npx --yes playwright install-deps chromium >/dev/null 2>&1 \
+    || echo "WARNING: playwright system deps not installed; e2e will need --with-deps"
+fi
+
+# ------------------------------------------------------------- polkit: own units
+# systemctl talks to systemd over D-Bus, and D-Bus asks polkit, which by default demands
+# interactive auth for managing system units. That is why restarting your own dev server
+# needed `sudo systemctl restart ndev@$USER`. Everyone here has passwordless root anyway,
+# so the sudo was never a barrier -- just friction on the most common command on the box,
+# and friction that teaches people to reach for root by reflex.
+#
+# This grants each user start/stop/restart/reload on THEIR OWN instance of these templates
+# and nothing else: ndev@bob is bob's, and bob still cannot touch ndev@alice.
+mkdir -p /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/50-ndev-own-units.rules <<'POLKIT'
+polkit.addRule(function(action, subject) {
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var verb = action.lookup("verb");
+  var allowed = ["start", "stop", "restart", "reload", "reload-or-restart", "try-restart"];
+  if (allowed.indexOf(verb) < 0) {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var unit = action.lookup("unit");
+  var templates = ["ndev@", "claude-rc@", "codex-rc@"];
+  for (var i = 0; i < templates.length; i++) {
+    if (unit === templates[i] + subject.user + ".service") {
+      return polkit.Result.YES;
+    }
+  }
+  return polkit.Result.NOT_HANDLED;
+});
+POLKIT
+chmod 644 /etc/polkit-1/rules.d/50-ndev-own-units.rules
+systemctl restart polkit 2>/dev/null || true
+
 # ---------------------------------------------------------------- ndev registry
 # hostname<TAB>port, one per line. ndev-register rewrites the cloudflared ingress from
 # this file, so adding a project never means hand-editing YAML.
@@ -663,6 +750,11 @@ for u in ${join(" ", local.nextjs_users)}; do
     rm -f "/etc/sudoers.d/ndev-$u.new"
     echo "WARNING: sudoers for $u failed validation; leaving previous file in place"
   fi
+
+  # Read your own service's logs without sudo. These accounts already have full root, so
+  # this grants no new reach -- it removes a sudo from `journalctl -u ndev@$USER -f`, which
+  # people run twenty times a day while chasing a broken page.
+  usermod -aG systemd-journal "$u" 2>/dev/null || true
 
   # Let their user services and tmux survive logout / start without a login session.
   loginctl enable-linger "$u" 2>/dev/null || true
