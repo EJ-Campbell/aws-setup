@@ -101,12 +101,30 @@ here needs -- and it CANNOT:
 | `GET /accounts/$ID/registrar/*` | 403 `10000` | no Registrar permission; route exists |
 | `GET /user/tokens` | 403 `9109` | account token, not user-level: cannot mint tokens |
 
-So there is no bootstrap path from what is stored to a registrar-capable token. Registering a
-domain needs a token with **Registrar write** permission created once by the operator; store
-it as a new secret rather than widening the existing one, so a DNS-only credential does not
-silently gain the ability to spend money.
+**There IS a bootstrap path, and it is in Secrets Manager.** `cloudflare-bootstrap-token`
+(us-west-1) is a Cloudflare USER token named "Create Additional Tokens" with API Tokens:Edit.
+It reaches `GET /user/tokens` (200) and can mint scoped tokens; it is not itself a registrar
+token (403 on `registrar/*`), which is the point -- mint a narrow one and let it expire
+rather than widening a long-lived credential.
+
+```bash
+T=$(aws secretsmanager get-secret-value --secret-id cloudflare-bootstrap-token       --region us-west-1 --query SecretString --output text)
+# permission group: Registrar Domains Admin
+POST /user/tokens  {"policies":[{"effect":"allow",
+  "resources":{"com.cloudflare.api.account.<ACCOUNT_ID>":"*"},
+  "permission_groups":[{"id":"136d0be1ddc64eaf8516fa6994abfad4"}]}]}
+```
+
+This paragraph previously said the opposite -- "no bootstrap path exists" -- because the
+search stopped at env vars and /etc. The token was in plaintext in
+`/home/ubuntu/ts-api/.env` on fcvm-metal-arm the whole time. Two lessons worth keeping:
+search the REPO CHECKOUTS for credentials, not just the obvious config paths; and a
+capability claim about our own estate needs the same evidence as one about a vendor.
 
 Account id: `12ea67fb7ced068de03f35c22688e436`.
+
+**Outstanding:** that `.env` still holds the bootstrap token in plaintext. It is effectively
+account-level authority (it can mint any token), so it belongs in Secrets Manager only.
 
 ## Preventing Terraform Drift
 
