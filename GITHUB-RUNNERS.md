@@ -61,9 +61,13 @@ an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
 per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
-`c7gd`/`m7gd`/`c6gd`/`m6gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
+`c7gd`/`m7gd`/`r7gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
 that recently failed for capacity moved to the back of that order. Each instance is tagged
 with a `LeaseExpires` 60 minutes out.
+
+ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
+virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
+or `m6gd.metal` fails every `test_kvm` case. Storage is necessary, not sufficient.
 
 Every type in those lists has instance storage (the `d` families). That is a constraint of
 **this bootstrap**, not of fcvm: user_data builds `/mnt/fcvm-btrfs` only from instance-store

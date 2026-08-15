@@ -360,6 +360,31 @@ def case_every_launchable_type_has_instance_storage():
             )
 
 
+def case_arm_types_are_graviton3_or_newer():
+    """Graviton2 cannot run the nested-virtualisation tests.
+
+    fcvm's test_kvm cases need FEAT_NV2, which arrived with Graviton3. On
+    2026-08-15 c6gd.metal and m6gd.metal were added to the ARM list for spot
+    availability -- both have instance storage, so the storage check passed --
+    and the next job to land on a c6gd.metal turned main red with 9 failures
+    (nested KVM, NFS, reflink, copy_file_range). Having a local disk is
+    necessary, not sufficient.
+
+    The family digit is the generation: c6gd -> 6 (Graviton2),
+    c7gd -> 7 (Graviton3), r8gd -> 8 (Graviton4).
+    """
+    module = webhook(FakeEC2([]))
+    for t in module["get_instance_types"]("arm64"):
+        family = t.split(".")[0]
+        digits = re.findall(r"\d+", family)
+        assert digits, f"cannot read a generation out of {t}"
+        assert int(digits[0]) >= 7, (
+            f"{t} is Graviton{int(digits[0]) - 4} class (family digit "
+            f"{digits[0]}); nested virtualisation needs FEAT_NV2, so ARM "
+            f"runners must be Graviton3+ (family digit >= 7)"
+        )
+
+
 def case_synchronous_exception_still_falls_through():
     """The original exception path still advances when AWS does raise."""
     ec2 = FakeEC2(run_instances_errors={type_order()[0]: "InsufficientInstanceCapacity"})
