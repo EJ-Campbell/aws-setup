@@ -4,12 +4,13 @@
 # pattern as the other dev boxes, so it can be updated without recreating the instance).
 #
 # Three things it sets up:
-#   1. Separate Unix users (colton, connor, ej) so each has their own home, their own
+#   1. Separate Unix users (colton, connor, ejc3, skevh) so each has their own home, their own
 #      `gh auth login`, and their own projects. Nobody shares a GitHub identity.
 #   2. cloudflared, running as a system service, holding the tunnel to Cloudflare.
 #   3. `ndev` -- run it in a Next.js project and it starts `next dev` on a deterministic
-#      port, registers <name>.cc-games.dev -> that port with the tunnel, and prints the
-#      URL. Cloudflare Access gates every hostname behind the Gmail allowlist.
+#      port, registers <name>.<their zone> -> that port with the tunnel, and prints the
+#      URL. Cloudflare Access gates every hostname; which zone and which identity provider
+#      follows from the account (cc-games/Google, dolphin-labs/GitHub).
 
 locals {
   nextjs_tunnel_id = "60234535-279b-4b20-bbc3-7fd353abb7f6"
@@ -520,7 +521,10 @@ systemctl daemon-reload
 ${local.nextjs_zone_enable}
 # The old un-templated unit is superseded by cloudflared@<zone>; stop it so two processes
 # do not both claim the cc-games tunnel (cloudflared allows it and the traffic splits).
-if systemctl list-unit-files 2>/dev/null | grep -q '^cloudflared\.service'; then
+# Tested with [ -f ] rather than `list-unit-files | grep -q`: this script runs under
+# `set -o pipefail`, and grep -q exits at the first match, which kills systemctl with
+# SIGPIPE. The pipeline then reports 141 and the branch is skipped BECAUSE it matched.
+if [ -f /etc/systemd/system/cloudflared.service ]; then
   systemctl disable --now cloudflared 2>/dev/null || true
   rm -f /etc/systemd/system/cloudflared.service
   systemctl daemon-reload
@@ -529,14 +533,16 @@ fi
 # ---------------------------------------------------------------- ndev
 cat > /usr/local/bin/ndev <<'NDEV'
 #!/bin/bash
-# ndev [name] -- start `next dev` in this project and expose it at <name>.cc-games.dev
+# ndev [name] -- start `next dev` in this project and expose it at <name>.<your zone>
 #
-# Defaults to your username, so `ndev` as colton publishes colton.cc-games.dev. Pass a
-# name for a second project: `ndev tetris` -> tetris.cc-games.dev.
+# Defaults to your username, so `ndev` as colton publishes colton.cc-games.dev and as
+# ejc3 publishes ejc3.dolphin-labs.dev. Pass a name for a second project:
+# `ndev tetris` -> tetris.<your zone>. The zone comes from your account, not a flag.
 #
 # The port is derived from the hostname, so restarting gives you the same port and the
 # tunnel mapping stays valid. Binds 127.0.0.1 only -- the box has no inbound web ports;
-# the tunnel is the sole path in, and Cloudflare Access gates it by Google login.
+# the tunnel is the sole path in, and Cloudflare Access gates it (Google for cc-games,
+# GitHub for dolphin-labs).
 set -euo pipefail
 DOMAIN=$(/usr/local/bin/ndev-zone "$USER")
 [ -n "$DOMAIN" ] || { echo "no publishing zone for $USER -- add them to nextjs_user_zone" >&2; exit 1; }
@@ -555,7 +561,7 @@ PORT=$(( 3100 + ( $(printf '%s' "$HOST" | cksum | awk '{print $1}') % 800 ) ))
 sudo /usr/local/bin/ndev-register "$HOST" "$PORT" "$USER" "$(pwd)"
 echo ""
 echo "  https://$HOST   (port $PORT)"
-echo "  sign in with your Google account -- only the allowlist gets through"
+echo "  sign in when prompted -- Cloudflare Access gates every hostname"
 echo ""
 echo "  it keeps running after you log out, and comes back by itself if the box reboots."
 echo "    logs:    journalctl -u ndev@$USER -f"
@@ -673,7 +679,7 @@ for u in ${join(" ", local.nextjs_users)}; do
 You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.
 That folder is NOT the project.
 
-The project is a Next.js game at:
+The project is a Next.js app at:
 
     $PDIR
 
@@ -683,7 +689,7 @@ a git repository, and it is writable inside your sandbox.
 ## The dev server is already running -- do not start one
 
 It is a systemd service, not something you launch. It is published at
-https://$u.cc-games.dev and listens on 127.0.0.1 only.
+https://$u.$(/usr/local/bin/ndev-zone "$u") and listens on 127.0.0.1 only.
 
 **Your sandbox has no network access, so \`curl http://localhost:...\` WILL FAIL even
 though the server is running fine.** A failed curl does not mean the server is down. Do
@@ -799,7 +805,8 @@ systemctl enable --now agent-update.timer >/dev/null 2>&1 || true
 # 8GB is comfortable for two kids, but each `next dev` compile spikes hard and there are
 # now six long-lived node processes (2x next, 2x claude, 2x codex). A swapfile costs
 # nothing on a 50GB volume and turns a would-be OOM kill into a slow moment.
-if ! swapon --show=NAME --noheadings | grep -q .; then
+# Same pipefail/SIGPIPE trap as above; command substitution has no pipeline to poison.
+if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi
