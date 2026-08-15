@@ -291,6 +291,15 @@ data "archive_file" "runner_webhook" {
           raised to advance it. The previous attempt's outcome is what advances the
           list, which is why this takes the failures as an argument.
           """
+          # ARM types must ALSO be Graviton3 or newer (family digit >= 7).
+          # fcvm's nested-virtualisation tests need FEAT_NV2, which Graviton2
+          # does not have, so a job landing on c6gd/m6gd.metal fails every
+          # test_kvm case. That is exactly what happened on 2026-08-15: adding
+          # c6gd.metal and m6gd.metal for spot availability turned main red
+          # with 9 failures (nested KVM, NFS, reflink, copy_file_range) on
+          # runner-i-01eb621cc8b41c0bf, a c6gd.metal. Storage is necessary,
+          # not sufficient.
+          #
           # Every type here must have instance storage - the 'd' families -
           # because THIS BOOTSTRAP builds /mnt/fcvm-btrfs only from instance-store
           # NVMe. fcvm itself does not need it (setup falls back to a loopback
@@ -305,7 +314,7 @@ data "archive_file" "runner_webhook" {
           if arch == 'x86_64':
               types = ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal']
           else:
-              types = ['c7gd.metal', 'm7gd.metal', 'c6gd.metal', 'm6gd.metal']
+              types = ['c7gd.metal', 'm7gd.metal', 'r7gd.metal']
           return ([t for t in types if t not in deprioritized]
                   + [t for t in types if t in deprioritized])
 
