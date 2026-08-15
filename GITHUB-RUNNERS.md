@@ -107,11 +107,26 @@ under-counting launches metal spot instances on data it could not verify.
 
 **Scale-up is observable.** Every decision prints one CloudWatch Embedded Metric Format
 line (`event: runner_scale_decision`) carrying `QueuedJobs`, `HealthyRunners`,
-`InstancesCounted`, `ScaleUpStarved`, the `Architecture` dimension, and the reason — a
-structured log and a real metric in `GitHubRunners` with no `PutMetricData` call and no
-extra IAM. `ScaleUpStarved` is 1 only when the instance ceiling blocks a launch that
-healthy-runner accounting would have allowed; `cost-alerts.tf` alarms on it
-(`runner-scale-up-starved`).
+`OnlineRunners`, `InstancesCounted`, `ScaleUpStarved`, `ZeroOnlineRunners`, the
+`Architecture` dimension, and the reason — a structured log and a real metric in
+`GitHubRunners` with no `PutMetricData` call and no extra IAM.
+
+`ScaleUpStarved` is 1 whenever work was queued and the decision refused to add capacity.
+It deliberately includes ordinary saturation: it was previously gated on the instance
+ceiling blocking a launch that healthy-runner accounting would have allowed, and during
+the 2026-08-07 collapse the two wedged ARM runners were GitHub-online the whole time, so
+that gate held the metric at 0 for the entire incident it was written for. Nothing in a
+single poll separates wedged from busy — a host that wedges mid-job keeps reporting
+`busy=true` — so the discrimination is left to time: `runner-scale-up-starved` needs 24
+consecutive polls (2 hours), which several waves of the longest measured job (43.5 min)
+can also reach, and which is worth investigating either way.
+
+`ZeroOnlineRunners` is 1 when jobs are queued and nothing is online *or booting* to take
+them — the pool is empty rather than merely busy. That is the signal for a runner that
+refused to register (no global IPv6, no instance-store NVMe), which is otherwise
+indistinguishable from one that never launched. `runner-zero-online` fires after 2 polls;
+it is suppressed while GitHub is unreachable, where `online` is 0 by construction and
+`runner-pat-unusable` covers the gap.
 
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
 Advanced tier, base64 — too big for Lambda's 4 KB env limit). On boot it sets up the box

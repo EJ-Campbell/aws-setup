@@ -304,18 +304,25 @@ resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
 resource "aws_cloudwatch_metric_alarm" "runner_scale_up_starved" {
   alarm_name          = "runner-scale-up-starved"
   comparison_operator = "GreaterThanThreshold"
-  # Twelve consecutive 5-minute polls, not two. ScaleUpStarved now means "work was
-  # queued and we refused to add capacity", which ordinary saturation also produces --
-  # the previous `counted < max_runners` gate excluded saturation at the cost of
-  # reading 0 through the 3.5-hour incident it was built for, because the wedged
-  # runners were GitHub-online the whole time.
+  # Twenty-four consecutive 5-minute polls (2 hours), not two.
   #
-  # So the discrimination moved here. 60 minutes is longer than the longest measured
-  # self-hosted job (43.5 min), so a legitimate over-capacity push drains before this
-  # fires, while a pool that cannot recover keeps the metric pinned and does trip it.
-  evaluation_periods = 12
+  # ScaleUpStarved now means "work was queued and we refused to add capacity", which
+  # ordinary saturation also produces. The previous `counted < max_runners` gate excluded
+  # saturation, but at the cost of reading 0 through the entire 3.5-hour incident it was
+  # built for, because the wedged runners were GitHub-online the whole time.
+  #
+  # An interim version used 12 periods and justified it against the longest SINGLE job
+  # (43.5 min). That reasoning was wrong: consecutive waves of ordinary 30-40 minute jobs
+  # keep the queue non-empty for well over an hour, so one job duration does not bound
+  # queue-drain time. Nothing visible to a single poll separates a wedged pool from a deep
+  # one either -- a host that wedges mid-job keeps reporting busy=true, exactly like a
+  # healthy runner.
+  #
+  # So this alarm deliberately does not claim to tell them apart. Two hours of a queue
+  # that will not drain is worth a look whichever it is.
+  evaluation_periods = 24
   threshold          = 0
-  alarm_description  = "Runner scale-up refused capacity for queued work across 12 consecutive polls (60 min) - the pool is not draining"
+  alarm_description  = "Queued work went unserved for 2 hours - the pool is wedged, or genuinely that far behind"
   alarm_actions      = [aws_sns_topic.cost_alerts.arn]
   ok_actions         = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data = "notBreaching"

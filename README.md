@@ -507,8 +507,12 @@ has the pre-Terraform secret live on the hook.
 
 The maximum is four runners per architecture, counted as runners GitHub can actually hand a
 job to rather than instances that merely exist, so a wedged box cannot hold a slot. Each
-scale-up decision emits a `GitHubRunners` metric and a structured log line, and the
-`runner-scale-up-starved` alarm fires if launches are ever blocked while under that cap.
+scale-up decision emits a `GitHubRunners` metric and a structured log line. Two alarms
+watch them: `runner-scale-up-starved` fires when queued work goes unserved for two hours
+(a wedged pool, or one genuinely that far behind — a single poll cannot tell them apart,
+because a host that wedges mid-job keeps reporting `busy` to GitHub), and
+`runner-zero-online` fires within ten minutes when jobs are queued and nothing is online
+or booting to take them.
 Runner roots and instance-store data are disposable. See `GITHUB-RUNNERS.md` for the
 webhook, AMI, lease, health, and cleanup internals.
 

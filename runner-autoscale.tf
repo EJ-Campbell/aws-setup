@@ -185,18 +185,33 @@ data "archive_file" "runner_webhook" {
           # reads 0 through its own motivating outage is worse than none: it gets
           # trusted.
           #
-          # Ordinary saturation raises this too, so the discrimination lives in the
-          # alarm, not here: runner-scale-up-starved needs 12 consecutive polls
-          # (60 min), longer than the longest measured self-hosted job (43.5 min), so
-          # one over-capacity push drains before it fires while a pool that cannot
-          # recover does not.
+          # Ordinary saturation raises this too, and -- worth being straight about --
+          # a single poll CANNOT separate the two. In the incident the wedged runners
+          # reported busy=true to GitHub, which is exactly what a healthy runner mid-job
+          # reports, so there is no field here that distinguishes "working" from "stuck
+          # holding a job forever".
+          #
+          # So the alarm does not try. It is keyed on the queue failing to drain for two
+          # hours, which is longer than several waves of the longest measured job
+          # (43.5 min) and is worth a look whichever cause it turns out to be: a pool
+          # that is wedged and a pool that is genuinely two hours behind are both
+          # situations someone wants to know about. An earlier version claimed 60 min
+          # separated them by comparing against a SINGLE job duration; it does not,
+          # because consecutive waves keep the queue non-empty indefinitely.
           starved = 1 if decision == 'blocked' and queued_jobs > 0 else 0
-          # Jobs are waiting and GitHub has nothing to hand them to. Booting instances
-          # count toward the cap -- that is what stops a launch herd -- but they cannot
-          # serve a job, so this keys on `online` alone. Suppressed while degraded:
-          # with GitHub unreachable `online` is 0 by construction and this would be
-          # pure noise; runner-pat-unusable covers that blind spot.
-          no_online = 1 if queued_jobs > 0 and not capacity['degraded'] and capacity['online'] == 0 else 0
+          # Jobs are waiting and there is nothing that can take them: nothing online,
+          # and nothing on the way either.
+          #
+          # `booting == 0` is load-bearing, not caution. A normal cold start emits a
+          # successful launch decision with online == 0, and metal takes minutes to
+          # register -- BOOT_GRACE_MINUTES allows 15 of them. Keying on `online` alone
+          # would raise this on the poll after every cold start and page in ten minutes
+          # while all requested capacity was arriving exactly as intended.
+          #
+          # Suppressed while degraded too: with GitHub unreachable `online` is 0 by
+          # construction and this would be pure noise; runner-pat-unusable covers that.
+          no_online = 1 if (queued_jobs > 0 and not capacity['degraded']
+                            and capacity['online'] == 0 and capacity['booting'] == 0) else 0
           print(json.dumps({
               '_aws': {
                   'Timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),

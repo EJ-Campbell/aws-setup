@@ -479,14 +479,34 @@ def case_starved_is_quiet_when_nothing_is_queued():
 
 
 def case_zero_online_fires_when_the_pool_is_empty():
-    """Queued work and nothing online: booting instances cannot take a job."""
+    """Queued work, nothing online, and nothing on the way either.
+
+    `booting: 0` is the point. An earlier version of this case used booting: 4, which
+    is a cold start rather than an outage -- it asserted the very false positive the
+    boot-grace suppression exists to prevent, and only passed because the bug was there.
+    """
     emit = webhook(FakeEC2([]))["emit_decision"]
     line = capture_emf(emit, arch="x86_64", queued_jobs=2,
-                       capacity={"counted": 4, "instances": 4, "online": 0,
-                                 "booting": 4, "degraded": False},
-                       max_runners=4, decision="blocked", detail="cap reached")
+                       capacity={"counted": 0, "instances": 0, "online": 0,
+                                 "booting": 0, "degraded": False},
+                       max_runners=4, decision="blocked", detail="all husks reaped")
     assert line["ZeroOnlineRunners"] == 1, line
     assert line["OnlineRunners"] == 0, line
+
+
+def case_zero_online_is_quiet_during_a_cold_start():
+    """A normal cold start has online == 0 while metal boots -- that is not an outage.
+
+    BOOT_GRACE_MINUTES allows 15 minutes for registration, so keying on `online` alone
+    would raise this on the poll after every cold start and page in ten minutes while
+    the capacity that was just requested was arriving exactly as intended.
+    """
+    emit = webhook(FakeEC2([]))["emit_decision"]
+    line = capture_emf(emit, arch="arm64", queued_jobs=2,
+                       capacity={"counted": 2, "instances": 2, "online": 0,
+                                 "booting": 2, "degraded": False},
+                       max_runners=4, decision="launched", detail="cold start")
+    assert line["ZeroOnlineRunners"] == 0, line
 
 
 def case_zero_online_is_suppressed_while_degraded():
