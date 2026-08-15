@@ -94,21 +94,46 @@ ADDR_OUT="    inet6 fd00:1::1/64 scope global
 ROUTE_OUT="2600:1f1c:208:c01::/64 dev enp0s1 proto ra metric 100"
 check "ULA alongside a usable /128" 0
 
-# --- 3. The gate must actually be wired to the registration decision. A gate
+# --- 3. A storeless instance type must fail legibly, not take the bootstrap
+#        down at an unrelated line. `grep -v` matching nothing returns 1, and
+#        under `set -e` that killed everything after it (2026-08-15, c7g.metal).
+echo "instance store:"
+if grep -q 'grep -v "\^\$ROOT_DEV\$" || true' "$USERDATA"; then
+    ok "NVMe probe tolerates a no-match instead of aborting the bootstrap"
+else
+    bad "NVMe probe can still abort the bootstrap when there is no instance store"
+fi
+if grep -q "no instance-store NVMe on this instance type" "$USERDATA"; then
+    ok "storeless instance refuses to register, with a reason"
+else
+    bad "no explicit refusal for a storeless instance"
+fi
+
+# --- 4. The gate must actually be wired to the registration decision. A gate
 #        nothing consults is the same as no gate.
 echo "wiring:"
-if grep -q "refusing to register this runner" "$USERDATA"; then
-    ok "failure path refuses registration"
-else
-    bad "no refusal path found -- does a failed gate still register the runner?"
-fi
-GATE_LINE=$(grep -n "refusing to register this runner" "$USERDATA" | head -1 | cut -d: -f1)
 CONFIG_LINE=$(grep -n "config.sh --url" "$USERDATA" | head -1 | cut -d: -f1)
-if [ -n "$GATE_LINE" ] && [ -n "$CONFIG_LINE" ] && [ "$GATE_LINE" -lt "$CONFIG_LINE" ]; then
-    ok "gate runs before config.sh registers the runner (line $GATE_LINE < $CONFIG_LINE)"
+if [ -z "$CONFIG_LINE" ]; then
+    bad "config.sh registration not found -- cannot tell whether any gate precedes it"
 else
-    bad "gate does not precede registration (gate=$GATE_LINE config=$CONFIG_LINE)"
+    ok "found the registration call (line $CONFIG_LINE)"
 fi
+
+# Each gate is checked BY ITS OWN message: both say "refusing to register", so a
+# single grep would let one of them sit after registration unnoticed.
+gate_precedes_registration() {  # label, message
+    local line
+    line=$(grep -n "$2" "$USERDATA" | head -1 | cut -d: -f1)
+    if [ -z "$line" ]; then
+        bad "$1: no refusal path found -- does a failed gate still register the runner?"
+    elif [ -n "$CONFIG_LINE" ] && [ "$line" -lt "$CONFIG_LINE" ]; then
+        ok "$1 refuses before registration (line $line < $CONFIG_LINE)"
+    else
+        bad "$1 does not precede registration (gate=$line config=$CONFIG_LINE)"
+    fi
+}
+gate_precedes_registration "IPv6 gate"  "no global IPv6 on"
+gate_precedes_registration "NVMe gate"  "no instance-store NVMe on this instance type"
 
 echo
 echo "passed=$PASS failed=$FAIL"

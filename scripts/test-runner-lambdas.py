@@ -279,19 +279,27 @@ def launched_types(ec2):
     return [kw["InstanceType"] for kw in ec2.ops("run_instances")]
 
 
+def type_order(arch="x86_64"):
+    """The launcher's own list, so these cases follow it instead of pinning it.
+
+    Pinned copies went stale the moment the storeless types were removed.
+    """
+    return webhook(FakeEC2([]))["get_instance_types"](arch)
+
+
 def case_aws_capacity_verdict_advances_the_type():
     """AWS's own state reason on a dead instance moves the launcher along."""
     ec2 = FakeEC2([instance("i-dead", "c5d.metal", "terminated", 60,
                             state_reason="Server.InsufficientInstanceCapacity")])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
 
 
 def case_stalled_pending_launch_advances_the_type():
     """A launch still pending past the startup window is a capacity failure."""
     ec2 = FakeEC2([instance("i-stuck", "c5d.metal", "pending", 20)])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
 
 
 def case_capacity_failed_tag_advances_the_type():
@@ -299,7 +307,7 @@ def case_capacity_failed_tag_advances_the_type():
     ec2 = FakeEC2([instance("i-reaped", "c5d.metal", "terminated", 30,
                             tags={"CapacityFailedAt": NOW.isoformat()})])
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
 
 
 def case_pending_inside_the_startup_window_is_not_a_failure():
@@ -311,21 +319,48 @@ def case_pending_inside_the_startup_window_is_not_a_failure():
 
 def case_every_type_failed_still_launches():
     """Deprioritising must never empty the list."""
+    module = webhook(FakeEC2([]))
+    every = module["get_instance_types"]("x86_64")
     dead = [instance(f"i-{t}", t, "terminated", 10, state_reason="Server.InsufficientInstanceCapacity")
-            for t in ("c5d.metal", "c5.metal", "c6i.metal", "m5d.metal")]
+            for t in every]
     ec2 = FakeEC2(dead)
     module = webhook(ec2)
-    order = module["get_instance_types"]("x86_64", {"c5d.metal", "c5.metal", "c6i.metal", "m5d.metal"})
-    assert sorted(order) == sorted(["c5d.metal", "c5.metal", "c6i.metal", "m5d.metal"]), order
+    order = module["get_instance_types"]("x86_64", set(every))
+    assert sorted(order) == sorted(every), order
     module["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5d.metal"], launched_types(ec2)
+    assert launched_types(ec2) == [every[0]], launched_types(ec2)
+
+
+def case_every_launchable_type_has_instance_storage():
+    """A storeless type launches a machine that can never run a job.
+
+    The user_data builds /mnt/fcvm-btrfs on the instance-store NVMe. On
+    2026-08-15 a c7g.metal spot instance came up, died in user_data with no
+    disk to find, never registered, and billed while jobs queued -- while
+    c5.metal and c6i.metal sat in the x86 list with the same defect.
+
+    AWS marks instance storage with a 'd' in the family (c5d, m5d, c7gd,
+    m6id). Confirm any addition for real with:
+      aws ec2 describe-instance-types --instance-types <t> \
+        --query 'InstanceTypes[].InstanceStorageSupported'
+    """
+    module = webhook(FakeEC2([]))
+    for arch in ("x86_64", "arm64"):
+        types = module["get_instance_types"](arch)
+        assert types, f"{arch} has no launchable types"
+        for t in types:
+            family = t.split(".")[0]
+            assert family.endswith("d") or "d" in family[2:], (
+                f"{arch}: {t} has no instance storage; it would boot a runner "
+                f"that cannot build /mnt/fcvm-btrfs"
+            )
 
 
 def case_synchronous_exception_still_falls_through():
     """The original exception path still advances when AWS does raise."""
-    ec2 = FakeEC2(run_instances_errors={"c5d.metal": "InsufficientInstanceCapacity"})
+    ec2 = FakeEC2(run_instances_errors={type_order()[0]: "InsufficientInstanceCapacity"})
     webhook(ec2)["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5d.metal", "c5.metal"], launched_types(ec2)
+    assert launched_types(ec2) == type_order()[:2], launched_types(ec2)
 
 
 def case_incident_replay_three_dead_c5d_launches():
@@ -333,8 +368,8 @@ def case_incident_replay_three_dead_c5d_launches():
 
     All three returned an instance ID, none reached `running`, and AWS did not
     report instance-terminated-no-capacity until 20:31. The old loop saw no
-    exception, so every retry picked c5d.metal again and c5.metal, c6i.metal and
-    m5d.metal were never tried.
+    exception, so every retry picked c5d.metal again and the rest of the list
+    was never tried.
     """
     ec2 = FakeEC2([
         instance("i-001e64c56eb71053b", "c5d.metal", "pending", 79),
@@ -346,7 +381,7 @@ def case_incident_replay_three_dead_c5d_launches():
     # count and husks WOULD hold slots (fail toward over-counting).
     module = webhook(ec2, github=FakeGitHub())
     module["launch_runner"]("x86_64")
-    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
     # And the husks are not counted as runners, so the pool is not "full":
     # stalled pending instances are past BOOT_GRACE_MINUTES and not online.
     assert module["get_capacity"]("x86_64")["counted"] == 0
@@ -371,8 +406,8 @@ def case_handler_launches_next_type_when_the_pool_is_all_husks():
     })}
     # GitHub reachable, nothing registered: see the husk-counting note above.
     result = webhook(ec2, github=FakeGitHub())["handler"](event, None)
-    assert "Launched 1 x86_64 runner(s) (c5.metal)" in result["body"], result
-    assert launched_types(ec2) == ["c5.metal"], launched_types(ec2)
+    assert f"Launched 1 x86_64 runner(s) ({type_order()[1]})" in result["body"], result
+    assert launched_types(ec2) == [type_order()[1]], launched_types(ec2)
 
 
 def case_handler_still_refuses_when_the_pool_is_genuinely_full():
@@ -391,8 +426,7 @@ def case_ordinary_spot_reclaim_does_not_rotate():
     """A reclaimed runner is not a failed launch.
 
     Server.SpotInstanceTermination covers a runner that worked for an hour and was
-    taken back. Rotating on it would send ARM to c7g.metal, which has no
-    instance-store NVMe, so user_data never builds /mnt/fcvm-btrfs.
+    taken back, so it must not push the working type to the back of the list.
     """
     ec2 = FakeEC2([instance("i-reclaimed", "c7gd.metal", "terminated", 90, arch="arm64",
                             state_reason="Server.SpotInstanceTermination")])

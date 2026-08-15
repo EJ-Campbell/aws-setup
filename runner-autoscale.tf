@@ -291,11 +291,18 @@ data "archive_file" "runner_webhook" {
           raised to advance it. The previous attempt's outcome is what advances the
           list, which is why this takes the failures as an argument.
           """
+          # Every type here MUST have instance storage - the 'd' families. The
+          # user_data builds /mnt/fcvm-btrfs on the instance-store NVMe, so a
+          # storeless type launches a machine that can never run a job: on
+          # 2026-08-15 a c7g.metal spot instance came up, died in user_data at
+          # NVME_DEVS with no disk to find, never registered, and sat there
+          # billing while jobs queued. Verify additions with:
+          #   aws ec2 describe-instance-types --instance-types <t> \
+          #     --query 'InstanceTypes[].InstanceStorageSupported'
           if arch == 'x86_64':
-              # Try multiple x86 metal types for better spot availability
-              types = ['c5d.metal', 'c5.metal', 'c6i.metal', 'm5d.metal']
+              types = ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal']
           else:
-              types = ['c7gd.metal', 'c7g.metal']
+              types = ['c7gd.metal', 'm7gd.metal', 'c6gd.metal', 'm6gd.metal']
           return ([t for t in types if t not in deprioritized]
                   + [t for t in types if t in deprioritized])
 
@@ -741,8 +748,18 @@ sysctl -w kernel.printk="7 4 1 7" || true
 
 # Mount NVMe as btrfs RAID0 at /mnt/fcvm-btrfs
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
-NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$")
+# `|| true`: on a storeless instance type grep matches nothing and returns 1,
+# which under `set -e` killed the whole bootstrap right here -- before the
+# NVME_COUNT check below could report anything, before the IPv6 gate, and before
+# registration. The box then sat billing, unregistered, with the real reason
+# only visible in its console log.
+NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" || true)
 NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
+if [ "$NVME_COUNT" -eq 0 ]; then
+  echo "FATAL: no instance-store NVMe on this instance type; /mnt/fcvm-btrfs cannot be built, refusing to register this runner"
+  lsblk -dn -o NAME,TYPE,SIZE || true
+  exit 1
+fi
 if [ "$NVME_COUNT" -gt 0 ]; then
   CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
   BTRFS_DEVS=$(btrfs filesystem show /mnt/fcvm-btrfs 2>/dev/null | grep -c 'devid' || echo 0)
