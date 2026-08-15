@@ -291,12 +291,15 @@ data "archive_file" "runner_webhook" {
           raised to advance it. The previous attempt's outcome is what advances the
           list, which is why this takes the failures as an argument.
           """
-          # Every type here MUST have instance storage - the 'd' families. The
-          # user_data builds /mnt/fcvm-btrfs on the instance-store NVMe, so a
-          # storeless type launches a machine that can never run a job: on
-          # 2026-08-15 a c7g.metal spot instance came up, died in user_data at
-          # NVME_DEVS with no disk to find, never registered, and sat there
-          # billing while jobs queued. Verify additions with:
+          # Every type here must have instance storage - the 'd' families -
+          # because THIS BOOTSTRAP builds /mnt/fcvm-btrfs only from instance-store
+          # NVMe. fcvm itself does not need it (setup falls back to a loopback
+          # btrfs image, src/setup/storage.rs); what fcvm requires is btrfs, for
+          # reflink CoW. So a storeless type is unusable until user_data grows
+          # that fallback, not unusable in principle. On 2026-08-15 a c7g.metal
+          # spot instance came up, died in user_data at NVME_DEVS with no disk to
+          # find, never registered, and sat there billing while jobs queued.
+          # Verify additions with:
           #   aws ec2 describe-instance-types --instance-types <t> \
           #     --query 'InstanceTypes[].InstanceStorageSupported'
           if arch == 'x86_64':
