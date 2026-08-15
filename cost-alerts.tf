@@ -304,17 +304,49 @@ resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
 resource "aws_cloudwatch_metric_alarm" "runner_scale_up_starved" {
   alarm_name          = "runner-scale-up-starved"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2 # two consecutive 5-minute polls
-  threshold           = 0
-  alarm_description   = "Runner scale-up blocked while under the healthy-runner cap - slots held by instances that cannot take work"
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # Twelve consecutive 5-minute polls, not two. ScaleUpStarved now means "work was
+  # queued and we refused to add capacity", which ordinary saturation also produces --
+  # the previous `counted < max_runners` gate excluded saturation at the cost of
+  # reading 0 through the 3.5-hour incident it was built for, because the wedged
+  # runners were GitHub-online the whole time.
+  #
+  # So the discrimination moved here. 60 minutes is longer than the longest measured
+  # self-hosted job (43.5 min), so a legitimate over-capacity push drains before this
+  # fires, while a pool that cannot recover keeps the metric pinned and does trip it.
+  evaluation_periods = 12
+  threshold          = 0
+  alarm_description  = "Runner scale-up refused capacity for queued work across 12 consecutive polls (60 min) - the pool is not draining"
+  alarm_actions      = [aws_sns_topic.cost_alerts.arn]
+  ok_actions         = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data = "notBreaching"
 
   metric_query {
     id          = "starved"
     expression  = "SELECT MAX(ScaleUpStarved) FROM SCHEMA(\"GitHubRunners\", Architecture)"
     label       = "Scale-up starved"
+    period      = 300
+    return_data = true
+  }
+}
+
+# Queued work with nothing online to take it. Distinct from scale-up-starved: that one
+# says "we refused to grow", this one says "there is nothing to grow FROM" -- every
+# runner is booting, wedged, or gone. It fires fast (two polls) because unlike
+# saturation there is no benign version of it.
+resource "aws_cloudwatch_metric_alarm" "runner_zero_online" {
+  alarm_name          = "runner-zero-online"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2 # two consecutive 5-minute polls
+  threshold           = 0
+  alarm_description   = "Jobs are queued and no runner is online to take them - the pool is empty, not merely busy"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "zero_online"
+    expression  = "SELECT MAX(ZeroOnlineRunners) FROM SCHEMA(\"GitHubRunners\", Architecture)"
+    label       = "Zero online runners"
     period      = 300
     return_data = true
   }

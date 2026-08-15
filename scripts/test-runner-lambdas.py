@@ -15,6 +15,8 @@ replaced by fakes. No AWS or GitHub credentials, and no network.
 Run from the repo root:  python3 scripts/test-runner-lambdas.py
 Exit code 1 if any case fails.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -200,6 +202,15 @@ class FakeGitHub:
 
 
 _BASE_ENV = dict(os.environ)
+
+
+
+def capture_emf(emit, **kwargs):
+    """Run emit_decision and return the EMF dict it printed."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        emit(**kwargs)
+    return json.loads(buf.getvalue().strip().splitlines()[-1])
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW):
@@ -436,6 +447,56 @@ def case_ordinary_spot_reclaim_does_not_rotate():
                             state_reason="Server.SpotInstanceTermination")])
     webhook(ec2)["launch_runner"]("arm64")
     assert launched_types(ec2) == ["c7gd.metal"], launched_types(ec2)
+
+
+def case_starved_fires_when_wedged_runners_hold_the_cap():
+    """The 2026-08-07 shape: the pool is FULL of runners that cannot take work.
+
+    Both wedged ARM runners were GitHub-online for the whole 3.5-hour window, so
+    `counted` was 4 of 4 and the original `counted < max_runners` gate held
+    ScaleUpStarved at 0 for exactly the incident it was written for. Queued work plus
+    a refusal is the signal; whether the cap is full is not.
+    """
+    emit = webhook(FakeEC2([]))["emit_decision"]
+    line = capture_emf(emit, arch="arm64", queued_jobs=3,
+                       capacity={"counted": 4, "instances": 4, "online": 4,
+                                 "booting": 0, "degraded": False},
+                       max_runners=4, decision="blocked", detail="cap reached")
+    assert line["ScaleUpStarved"] == 1, line
+    assert line["OnlineRunners"] == 4, line
+    # Runners exist and answer GitHub; they just cannot drain the queue.
+    assert line["ZeroOnlineRunners"] == 0, line
+
+
+def case_starved_is_quiet_when_nothing_is_queued():
+    """A refusal with no queued work is just the cap doing its job."""
+    emit = webhook(FakeEC2([]))["emit_decision"]
+    line = capture_emf(emit, arch="arm64", queued_jobs=0,
+                       capacity={"counted": 4, "instances": 4, "online": 4,
+                                 "booting": 0, "degraded": False},
+                       max_runners=4, decision="blocked", detail="cap reached")
+    assert line["ScaleUpStarved"] == 0, line
+
+
+def case_zero_online_fires_when_the_pool_is_empty():
+    """Queued work and nothing online: booting instances cannot take a job."""
+    emit = webhook(FakeEC2([]))["emit_decision"]
+    line = capture_emf(emit, arch="x86_64", queued_jobs=2,
+                       capacity={"counted": 4, "instances": 4, "online": 0,
+                                 "booting": 4, "degraded": False},
+                       max_runners=4, decision="blocked", detail="cap reached")
+    assert line["ZeroOnlineRunners"] == 1, line
+    assert line["OnlineRunners"] == 0, line
+
+
+def case_zero_online_is_suppressed_while_degraded():
+    """With GitHub unreachable `online` is 0 by construction -- pure noise."""
+    emit = webhook(FakeEC2([]))["emit_decision"]
+    line = capture_emf(emit, arch="x86_64", queued_jobs=2,
+                       capacity={"counted": 4, "instances": 4, "online": 0,
+                                 "booting": 0, "degraded": True},
+                       max_runners=4, decision="blocked", detail="github unreachable")
+    assert line["ZeroOnlineRunners"] == 0, line
 
 
 def case_arm_is_unaffected():

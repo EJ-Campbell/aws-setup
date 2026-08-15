@@ -174,11 +174,29 @@ data "archive_file" "runner_webhook" {
           The only evidence that scale-up was gated for 3.5 hours on 2026-08-07 was
           an unstructured log line nobody was watching. EMF makes this line both
           greppable in Logs Insights and a real metric, with no PutMetricData call
-          and no extra IAM. ScaleUpStarved is the pathological case - refusing to
-          launch while fewer than max_runners runners can take work - which cannot
-          happen in normal operation and is what cost-alerts.tf alarms on.
+          and no extra IAM.
           """
-          starved = 1 if decision == 'blocked' and capacity['counted'] < max_runners else 0
+          # Work is queued and this decision refused to add capacity for it.
+          #
+          # Deliberately NOT gated on counted < max_runners, which is what this
+          # started as. On 2026-08-07 both wedged ARM runners were GitHub-online, so
+          # counted was 4 of 4 for the whole 3.5-hour window -- that gate pinned the
+          # metric to 0 for precisely the incident it was written for. A metric that
+          # reads 0 through its own motivating outage is worse than none: it gets
+          # trusted.
+          #
+          # Ordinary saturation raises this too, so the discrimination lives in the
+          # alarm, not here: runner-scale-up-starved needs 12 consecutive polls
+          # (60 min), longer than the longest measured self-hosted job (43.5 min), so
+          # one over-capacity push drains before it fires while a pool that cannot
+          # recover does not.
+          starved = 1 if decision == 'blocked' and queued_jobs > 0 else 0
+          # Jobs are waiting and GitHub has nothing to hand them to. Booting instances
+          # count toward the cap -- that is what stops a launch herd -- but they cannot
+          # serve a job, so this keys on `online` alone. Suppressed while degraded:
+          # with GitHub unreachable `online` is 0 by construction and this would be
+          # pure noise; runner-pat-unusable covers that blind spot.
+          no_online = 1 if queued_jobs > 0 and not capacity['degraded'] and capacity['online'] == 0 else 0
           print(json.dumps({
               '_aws': {
                   'Timestamp': int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -188,8 +206,10 @@ data "archive_file" "runner_webhook" {
                       'Metrics': [
                           {'Name': 'QueuedJobs', 'Unit': 'Count'},
                           {'Name': 'HealthyRunners', 'Unit': 'Count'},
+                          {'Name': 'OnlineRunners', 'Unit': 'Count'},
                           {'Name': 'InstancesCounted', 'Unit': 'Count'},
-                          {'Name': 'ScaleUpStarved', 'Unit': 'Count'}
+                          {'Name': 'ScaleUpStarved', 'Unit': 'Count'},
+                          {'Name': 'ZeroOnlineRunners', 'Unit': 'Count'}
                       ]
                   }]
               },
@@ -199,7 +219,12 @@ data "archive_file" "runner_webhook" {
               'HealthyRunners': capacity['counted'],
               'InstancesCounted': capacity['instances'],
               'ScaleUpStarved': starved,
-              'online_runners': capacity['online'],
+              # Promoted from the plain `online_runners` property to a real metric:
+              # a value you can only reach by grepping logs is not something an alarm
+              # can watch, and this is the number that says whether anything can
+              # actually take a job.
+              'OnlineRunners': capacity['online'],
+              'ZeroOnlineRunners': no_online,
               'booting_runners': capacity['booting'],
               'max_runners': max_runners,
               'health_source': 'instances-only' if capacity['degraded'] else 'github',
