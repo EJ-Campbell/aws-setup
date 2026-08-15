@@ -38,8 +38,10 @@ Normal operation from an admin box:
 ```bash
 cd ~/aws
 git pull --ff-only
+terraform init
 terraform fmt -recursive
 terraform validate
+terraform providers
 terraform plan
 terraform apply
 git add <changed-files>
@@ -57,6 +59,21 @@ provider release. That fork adds typed Worker-native Access destinations while p
 ordinary `terraform init` on both ARM64 jumpboxes and amd64 CI; there is no local provider
 override or machine-specific installation step. Return to `cloudflare/cloudflare` only
 after an upstream release includes the same fields and regression coverage.
+
+The fork has a different provider source address. On the first live-jumpbox update to
+`5.23.1`, stop after `terraform providers` if state still lists `cloudflare/cloudflare`.
+Under the exclusive state lock, migrate the eight existing Cloudflare resources before
+planning:
+
+```bash
+terraform state replace-provider \
+  registry.terraform.io/cloudflare/cloudflare \
+  registry.terraform.io/ejc3/cloudflare
+```
+
+Terraform writes a mandatory state backup. Do not repeat the command once state lists
+`ejc3/cloudflare`, and never apply a plan made before the migration. The reverse command
+is required when the stack eventually returns to the upstream provider namespace.
 
 ## Prerequisites
 
@@ -106,20 +123,7 @@ cd ~/aws
 terraform init
 ```
 
-The fork uses a different provider source address. During its first rollout only, inspect
-`terraform providers`; if the state still lists `cloudflare/cloudflare`, migrate the eight
-existing Cloudflare resources under the state lock before planning:
-
-```bash
-terraform state replace-provider \
-  registry.terraform.io/cloudflare/cloudflare \
-  registry.terraform.io/ejc3/cloudflare
-```
-
-Terraform writes a mandatory state backup for this command. Do not repeat it once the
-state already lists `ejc3/cloudflare`, and do not apply a plan made before the migration.
-The reverse command is required when the stack eventually returns to the upstream
-provider namespace.
+Follow the normal provider-migration gate above before planning from a replacement host.
 
 `terraform plan` should then refresh the recovered remote state and propose no unexplained
 re-creation. Stop if the backend appears empty. The configuration contains imported
