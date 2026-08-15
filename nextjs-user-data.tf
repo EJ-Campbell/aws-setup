@@ -17,7 +17,31 @@ locals {
 
   # Unix accounts. Each gets the fcvm key initially so you can get in as them and help;
   # they can add their own keys to ~/.ssh/authorized_keys afterwards.
-  nextjs_users = ["colton", "connor", "ej"]
+  # `ej` was replaced by `ejc3`, matching the GitHub login so the account name, the git
+  # identity and the repos all read the same. Created FRESH rather than renamed: the old
+  # home held only tooling (zsh/atuin/fzf) with no credentials and no repos, and building
+  # it from nothing exercises the same path a new person takes -- which is the point, since
+  # `skevh` is arriving the same way. A rename would have preserved 363MB and proven
+  # nothing. This list only decides which accounts must EXIST; removing a name from it does
+  # not delete the account.
+  nextjs_users = ["colton", "connor", "ejc3", "skevh"]
+
+  # Keys the account owner logs in with, on top of the shared fcvm key above. Declared
+  # here rather than pasted into the box so a rebuild does not lose someone's access --
+  # the fcvm key is for US getting in to help, this is for THEM getting in at all.
+  # Public keys only; nothing secret lives in this file.
+  nextjs_user_keys = {
+    skevh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3GGQEbA+7pChjnXMBagHA1G26vH8BQJj9Bgva21eVH skevh@yahoo.com"
+  }
+
+  # Repositories to lay down for a user on first setup, so the box is useful the moment
+  # they log in instead of starting at an empty home directory. Cloned only when that
+  # user's own `gh` is authenticated -- these are private repos, and cloning them with
+  # anyone else's credentials would either fail or, worse, leave a token behind.
+  nextjs_user_repos = {
+    skevh = ["dolphin-labs-hq/dolphin-labs"]
+    ejc3  = ["dolphin-labs-hq/dolphin-labs"]
+  }
 
   nextjs_user_data = <<-SCRIPT
 #!/bin/bash
@@ -444,6 +468,19 @@ for u in ${join(" ", local.nextjs_users)}; do
   chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
   chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
 
+  # The account owner's own key, if one is declared for them. Appended, never replacing
+  # the file: a user may have added keys by hand and this must not take their access away.
+  case "$u" in
+%{~for ku, kk in local.nextjs_user_keys~}
+    ${ku})
+      grep -qxF "${kk}" "/home/$u/.ssh/authorized_keys" 2>/dev/null || \
+        echo "${kk}" >> "/home/$u/.ssh/authorized_keys"
+      chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+      chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+      ;;
+%{~endfor~}
+  esac
+
   # FULL passwordless sudo, deliberately.
   #
   # This box IS the sandbox: it holds nothing but these projects, exposes no inbound web
@@ -845,6 +882,25 @@ for u in ${join(" ", local.nextjs_users)}; do
     sudo -u "$u" -H env HOME="/home/$u" git config --global user.email "$GH_ID+$GH_LOGIN@users.noreply.github.com"
     # git needs a credential helper of its own; gh being authenticated is not enough.
     sudo -u "$u" -H env HOME="/home/$u" gh auth setup-git >/dev/null 2>&1 || true
+
+    # Lay down this user's starter repositories. Deliberately inside the "gh is
+    # authenticated" branch: these are private, so cloning them as anyone else would
+    # either fail outright or leave another account's token in the checkout. Skipped
+    # when the directory already exists, so it never clobbers local work.
+    case "$u" in
+%{~for ru, rl in local.nextjs_user_repos~}
+      ${ru})
+%{~for repo in rl~}
+        if [ ! -d "/home/$u/${basename(repo)}" ]; then
+          echo "cloning ${repo} for $u"
+          sudo -u "$u" -H env HOME="/home/$u" \
+            gh repo clone ${repo} "/home/$u/${basename(repo)}" >/dev/null 2>&1 \
+            || echo "WARNING: could not clone ${repo} for $u (no access?)"
+        fi
+%{~endfor~}
+        ;;
+%{~endfor~}
+    esac
     for r in /home/$u/*/; do
       [ -d "$r/.git" ] || continue
       sudo -u "$u" -H env HOME="/home/$u" git -C "$r" config --unset user.email 2>/dev/null || true
