@@ -81,12 +81,18 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Resource = "*"
       },
       {
+        # Named the real bucket. This pattern matched NOTHING: the backend bucket is
+        # `ejc3-terraform-state` (see the backend block in main.tf), not
+        # `aws-infrastructure-*-tf-state`. State access worked only because the ReadOnly
+        # statement above grants s3:Get*/s3:List* on "*" -- so this statement read like it
+        # was doing the scoping while contributing nothing, and tightening the broad grant
+        # would have broken `terraform init` with a confusing AccessDenied.
         Sid    = "TerraformState"
         Effect = "Allow"
         Action = ["s3:GetObject", "s3:ListBucket"]
         Resource = [
-          "arn:aws:s3:::aws-infrastructure-*-tf-state",
-          "arn:aws:s3:::aws-infrastructure-*-tf-state/*"
+          "arn:aws:s3:::ejc3-terraform-state",
+          "arn:aws:s3:::ejc3-terraform-state/*"
         ]
       },
       {
@@ -99,25 +105,66 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         ]
         Resource = "arn:aws:dynamodb:us-west-1:928413605543:table/ejc3-terraform-locks"
       },
+      # THIS ROLE IS NOT READ-ONLY, despite what the drift-only workflow suggests. The
+      # statements below exist for ejc3/fcvm's .github/workflows/build-runner-ami.yml,
+      # which runs scripts/build-ami.sh: it launches a builder instance, snapshots it into
+      # a runner AMI, and terminates it. Say so plainly here rather than let "CI can only
+      # plan" survive as folklore -- ejc3/aws's own workflow really is plan-only, so the
+      # write capability is invisible from this repo alone.
+      #
+      # The reach is worth understanding before extending it: the trust policy admits
+      # `repo:ejc3/fcvm:*` (any ref, not just main), and build-ami.sh launches with
+      # `--iam-instance-profile Name=jumpbox-admin-profile`. So this role can start an
+      # instance that IS an admin. The conditions below keep that path pointed at AMI
+      # builds instead of leaving it open-ended.
       {
-        Sid    = "AMIBuilder"
+        Sid    = "AMIBuilderLaunch"
         Effect = "Allow"
         Action = [
           "ec2:RunInstances",
-          "ec2:StopInstances",
-          "ec2:TerminateInstances",
           "ec2:CreateImage",
           "ec2:CreateTags",
           "ec2:RegisterImage",
           "ec2:DeregisterImage"
         ]
+        # Deliberately unconditioned. RunInstances authorises every resource it creates --
+        # volumes, ENIs, the security group and subnet it references -- and build-ami.sh
+        # tags only the instance, so an aws:RequestTag condition here would deny volume
+        # creation and break the build. Narrowing this needs the script to tag every
+        # created resource type first; tracked rather than guessed at.
         Resource = "*"
       },
       {
+        # Stop/terminate ARE scoped: build-ami.sh only ever stops or terminates instances
+        # it launched with Name=ami-builder-temp, including its orphan sweep, which
+        # filters on exactly that tag. So this cannot reach a dev box or a runner.
+        Sid    = "AMIBuilderLifecycle"
+        Effect = "Allow"
+        Action = [
+          "ec2:StopInstances",
+          "ec2:TerminateInstances"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Name" = "ami-builder-temp"
+          }
+        }
+      },
+      {
+        # Constrained to EC2. Without this, the grant is "hand the admin role to any
+        # service that accepts one"; with it, the only thing this role can do with
+        # jumpbox_admin is launch an instance carrying it -- which is what the AMI build
+        # needs and nothing more.
         Sid      = "PassRole"
         Effect   = "Allow"
         Action   = "iam:PassRole"
         Resource = aws_iam_role.jumpbox_admin[0].arn
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ec2.amazonaws.com"
+          }
+        }
       },
       {
         Sid    = "CodeArtifact"
