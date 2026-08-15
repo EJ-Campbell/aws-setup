@@ -123,7 +123,6 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         Action = [
           "ec2:RunInstances",
           "ec2:CreateImage",
-          "ec2:CreateTags",
           "ec2:RegisterImage",
           "ec2:DeregisterImage"
         ]
@@ -134,10 +133,55 @@ resource "aws_iam_role_policy" "github_actions_terraform" {
         # created resource type first; tracked rather than guessed at.
         Resource = "*"
       },
+      # CreateTags is split out from the launch statement because leaving it unrestricted
+      # made the lifecycle scoping below decorative: the role could rename ANY instance --
+      # a dev box, a runner -- to `ami-builder-temp` and then satisfy the terminate
+      # condition. A tag-based guard is only as strong as who can write the tag.
+      #
+      # build-ami.sh does need to tag after launch (BuildStatus as the build progresses,
+      # KernelVersion, and the AMI's own Name), so a blanket ec2:CreateAction restriction
+      # would break it. The split below follows what the script actually does: `Name` on an
+      # INSTANCE only at RunInstances; anything else afterwards; `Name` on an image freely.
+      {
+        Sid      = "AMIBuilderTagAtLaunch"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringEquals = {
+            # Only as part of the RunInstances call itself, i.e. --tag-specifications on
+            # an instance this role is creating. Never on one that already exists.
+            "ec2:CreateAction" = "RunInstances"
+          }
+        }
+      },
+      {
+        Sid      = "AMIBuilderTagProgress"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          # BuildStatus and KernelVersion on the running builder: allowed. `Name` on an
+          # existing instance: denied, which is what keeps the terminate condition honest.
+          "ForAllValues:StringNotEquals" = {
+            "aws:TagKeys" = ["Name"]
+          }
+        }
+      },
+      {
+        # Images and their snapshots. build-ami.sh names the finished AMI, and nothing
+        # about that can reach a running instance, so `Name` is unrestricted here.
+        Sid      = "AMIBuilderTagImage"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = ["arn:aws:ec2:*::image/*", "arn:aws:ec2:*::snapshot/*"]
+      },
       {
         # Stop/terminate ARE scoped: build-ami.sh only ever stops or terminates instances
         # it launched with Name=ami-builder-temp, including its orphan sweep, which
-        # filters on exactly that tag. So this cannot reach a dev box or a runner.
+        # filters on exactly that tag. Combined with the tagging split above -- where only
+        # RunInstances can put that Name on an instance -- this cannot reach a dev box or
+        # a runner.
         Sid    = "AMIBuilderLifecycle"
         Effect = "Allow"
         Action = [
