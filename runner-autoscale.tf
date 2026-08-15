@@ -917,12 +917,31 @@ EOF
 }
 
 # SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
+#
+# GZIPPED, not just base64. The two runner gates pushed this script from 5,482 to 8,386
+# characters, and base64 inflates by a third: 11,184 against a hard ceiling of 8,192.
+# Advanced is the largest SSM tier, so the apply failed outright --
+#
+#   ValidationException: The specified parameter value is too large.
+#   Advanced-tier parameters support a maximum parameter value of 8192 characters.
+#
+# base64gzip brings it to 4,712, with room for the script to keep growing.
+#
+# Safe because BOTH decoders are already in the path, and neither is new behaviour:
+#   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
+#     (sources/DataSourceEc2.py), which validates and decodes, or passes it through
+#     untouched. That is why the existing double-encoding works at all: botocore
+#     base64-encodes UserData again in before-parameter-build.ec2.RunInstances.
+#   - cloud-init then calls util.decomp_gzip (user_data.py) on the payload.
+#
+# Anything that reads this parameter back must gunzip as well as decode:
+#   aws ssm get-parameter ... --output text | base64 -d | gunzip
 resource "aws_ssm_parameter" "runner_user_data" {
   count = var.enable_github_runner ? 1 : 0
   name  = "/github-runner/user-data"
   type  = "String"
   tier  = "Advanced"
-  value = base64encode(local.runner_user_data)
+  value = base64gzip(local.runner_user_data)
   tags = {
     Name = "github-runner-user-data"
   }
