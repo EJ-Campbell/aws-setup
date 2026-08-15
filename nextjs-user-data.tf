@@ -99,7 +99,11 @@ set -uxo pipefail
 # ---------------------------------------------------------------- base packages
 export DEBIAN_FRONTEND=noninteractive
 apt-get update || true
-apt-get install -y curl git build-essential zsh jq unzip || echo "WARNING: some packages failed"
+# python3-venv is here because Ubuntu ships `venv` without `ensurepip`, so `python3 -m venv`
+# fails on a stock image with an error that reads like a Python bug rather than a missing
+# package. dolphin-labs' data pipeline is the first thing a new person runs, and it starts
+# with exactly that command.
+apt-get install -y curl git build-essential zsh jq unzip python3-venv || echo "WARNING: some packages failed"
 # No awscli apt package on Ubuntu 24.04 -- use the official installer.
 if ! command -v aws >/dev/null 2>&1; then
   curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
