@@ -257,7 +257,7 @@ users, print it, or commit it. See the official
 
 GitHub authentication is separate from Codex. The metal boxes have a limited PAT fallback
 for a brand-new bootstrap, but each person should run `gh auth login` for their own
-identity. On `nextjs-dev`, log in as `colton`, `connor`, or `ej` rather than sharing
+identity. On `nextjs-dev`, log in as `colton`, `connor`, `ejc3`, or `skevh` rather than sharing
 credentials, then also run:
 
 ```bash
@@ -442,11 +442,21 @@ Inside a project:
 ndev
 ```
 
-`ndev` derives a stable port, registers the hostname, and enables a systemd service. The
-project becomes `https://<name>.cc-games.dev`. `cloudflared` dials out to Cloudflare, so
-there are no inbound web ports and `next dev` remains bound to `127.0.0.1`. Cloudflare
-Access enforces the email allowlist through Google or one-time PIN; a separate service
-token supports non-interactive checks.
+`ndev` derives a stable port, registers the hostname, and enables a systemd service.
+`cloudflared` dials out to Cloudflare, so there are no inbound web ports and `next dev`
+remains bound to `127.0.0.1`.
+
+**The zone follows the account, not a flag.** `colton` and `connor` publish to
+`https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.
+`/usr/local/bin/ndev-zone` is the single source of truth for user -> zone -> tunnel, and
+`ndev-register` refuses a hostname outside the caller's zone -- it runs as root through
+sudoers, so that check is a privilege boundary, not a convenience.
+
+Each zone has its own tunnel, its own credentials, its own registry, and its own
+`cloudflared@<zone>.service`, so a bad ingress rewrite on one project cannot take the other
+project's URLs down. Access gates both: `cc-games.dev` through Google or one-time PIN
+against an email allowlist, `dolphin-labs.dev` through GitHub against membership of the
+`dolphin-labs-hq` organization. A separate service token supports non-interactive checks.
 
 Once credentials exist and their units have been enabled, services and remote-control
 agents start at boot. A reboot restores the published URLs without another interactive

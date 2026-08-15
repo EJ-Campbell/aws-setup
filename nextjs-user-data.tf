@@ -132,13 +132,14 @@ chmod 600 /etc/cloudflared/creds-*.json
 
 # The dolphin secret holds only the TunnelSecret; cloudflared also wants AccountTag and
 # TunnelID in the same file. Fill them in rather than storing three copies of the same
-# facts in Secrets Manager.
+# facts in Secrets Manager. Both come from the Terraform resource, so replacing the tunnel
+# cannot leave the credentials naming one id while the ingress config names another.
 python3 - <<'CREDFIX'
 import json
 p = "/etc/cloudflared/creds-dolphin-labs.dev.json"
 d = json.load(open(p))
-d.setdefault("AccountTag", "12ea67fb7ced068de03f35c22688e436")
-d.setdefault("TunnelID", "92ad014f-2aa1-4a6e-b700-fa6bd3f35663")
+d.setdefault("AccountTag", "${var.cloudflare_account_id}")
+d.setdefault("TunnelID", "${local.dolphin_tunnel_id}")
 json.dump(d, open(p, "w"))
 CREDFIX
 chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
