@@ -68,7 +68,7 @@ resource "aws_iam_instance_profile" "jumpbox_admin" {
 resource "aws_ebs_volume" "jumpbox_home" {
   count             = var.enable_jumpbox ? 1 : 0
   availability_zone = "us-west-1a"
-  size              = 20
+  size              = 40
   type              = "gp3"
 
   tags = {
@@ -103,9 +103,9 @@ resource "aws_instance" "jumpbox" {
   # Admin IAM role
   iam_instance_profile = aws_iam_instance_profile.jumpbox_admin[0].name
 
-  # Minimal root volume
+  # Root volume sized for packages, provider builds, and system caches
   root_block_device {
-    volume_size           = 8
+    volume_size           = 40
     volume_type           = "gp3"
     delete_on_termination = true
   }

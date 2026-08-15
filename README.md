@@ -149,7 +149,7 @@ historical and must not be reused. Terraform creates its VNC password.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
-| `jumpbox` | `us-west-1`, on-demand `t4g.large` | 20 GB protected `/home/ubuntu` EBS; separate 8 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
+| `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 300 GB EBS root; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |

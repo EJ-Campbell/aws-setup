@@ -300,8 +300,8 @@ genuinely large scans to fcvm-metal-arm (64 vCPU) instead.
 ### Jumpbox Storage
 
 The jumpbox has separate root and home volumes:
-- **Root volume**: 8GB (`/dev/nvme0n1`) - OS, packages, boot
-- **Home volume**: 20GB (`/dev/nvme1n1`) mounted at `/home/ubuntu` - user data, projects
+- **Root volume**: 40GB (`/dev/nvme0n1`) - OS, packages, boot
+- **Home volume**: 40GB (`/dev/nvme1n1`) mounted at `/home/ubuntu` - user data, projects
 - **Swap**: 4GB at `/home/ubuntu/.swapfile` (on home volume to save root space)
 
 The home volume is backed up daily/weekly via AWS Backup.
