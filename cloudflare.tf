@@ -215,6 +215,16 @@ resource "cloudflare_zero_trust_access_application" "cc_games_dev" {
   type             = "self_hosted"
   session_duration = "24h"
 
+  # Pinned to the providers this app actually uses. Adding the GitHub idp for dolphin-labs
+  # otherwise makes a GitHub button appear on the twins' login page too -- it would be
+  # refused by the email policy, but they should not be offered a door that never opens.
+  # Splat rather than [0]: google is count-gated, and indexing it would fail the plan
+  # whenever Google login is turned off instead of just leaving one-time PIN.
+  allowed_idps = concat(
+    cloudflare_zero_trust_access_identity_provider.google[*].id,
+    [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
+  )
+
   # The policy attachment MUST be declared here. Leaving it out makes terraform drop the
   # link on the next apply -- which would leave every *.cc-games.dev hostname reachable
   # with no Google login at all. Caught by reading the plan before applying.

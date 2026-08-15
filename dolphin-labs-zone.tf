@@ -152,6 +152,13 @@ resource "cloudflare_zero_trust_access_application" "dolphin_labs" {
   type             = "self_hosted"
   session_duration = "24h"
 
+  # Every identity provider on the account is offered by default, so without this the
+  # login page shows Google next to GitHub on a zone that is meant to be gated by GitHub
+  # org membership. A Google sign-in would still be refused by the policy, but only after
+  # the user has picked it, which reads as a broken login rather than a deliberate one.
+  allowed_idps              = [cloudflare_zero_trust_access_identity_provider.github[0].id]
+  auto_redirect_to_identity = true
+
   # The policy attachment MUST be declared here. Leaving it out makes terraform drop the
   # link on the next apply, which would leave every *.dolphin-labs.dev hostname reachable
   # with no login at all. That exact mistake is documented on the cc-games application in
