@@ -65,12 +65,23 @@ per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda)
 that recently failed for capacity moved to the back of that order. Each instance is tagged
 with a `LeaseExpires` 60 minutes out.
 
-Every type in those lists has instance storage (the `d` families), and that is a
-correctness requirement, not a preference: user_data builds `/mnt/fcvm-btrfs` on the
-instance-store NVMe, so a storeless type boots a machine that cannot run a job. The lists
-previously carried `c7g.metal`, `c5.metal` and `c6i.metal`, all
-`InstanceStorageSupported=false`; on 2026-08-15 a `c7g.metal` spot instance came up, died in
-user_data with no disk to find, never registered, and billed while jobs queued. Verify any
+Every type in those lists has instance storage (the `d` families). That is a constraint of
+**this bootstrap**, not of fcvm: user_data builds `/mnt/fcvm-btrfs` only from instance-store
+NVMe, and the asset directories, the `containers` symlink and `CARGO_TARGET_DIR` all sit
+inside that branch, so on a storeless box the mount never happens and every job fails.
+
+fcvm itself does not need instance store. `fcvm setup` falls back to a sparse loopback image
+formatted as btrfs when the mount point is not already btrfs (`src/setup/storage.rs`, root
+required). What fcvm genuinely requires is **btrfs**, because clone disks are reflink CoW
+copies; it refuses to run on a non-btrfs mount at that path. Instance store is what makes it
+big and fast — 3.8 TB of local NVMe against a 100 GB gp3 root on ARM, for a workload that
+writes multi-GB memory snapshots and a container image cache.
+
+So a storeless type is unusable *until user_data grows that fallback*, which is a real option
+if spot capacity for the `d` families ever gets tight. Until then it must not be launched: the
+lists previously carried `c7g.metal`, `c5.metal` and `c6i.metal`, all
+`InstanceStorageSupported=false`, and on 2026-08-15 a `c7g.metal` spot instance came up, died
+in user_data with no disk to find, never registered, and billed while jobs queued. Verify any
 addition before adding it:
 
 ```bash

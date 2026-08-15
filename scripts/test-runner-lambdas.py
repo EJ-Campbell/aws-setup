@@ -332,12 +332,16 @@ def case_every_type_failed_still_launches():
 
 
 def case_every_launchable_type_has_instance_storage():
-    """A storeless type launches a machine that can never run a job.
+    """A storeless type is unusable to THIS bootstrap, so do not launch one.
 
-    The user_data builds /mnt/fcvm-btrfs on the instance-store NVMe. On
-    2026-08-15 a c7g.metal spot instance came up, died in user_data with no
-    disk to find, never registered, and billed while jobs queued -- while
-    c5.metal and c6i.metal sat in the x86 list with the same defect.
+    user_data builds /mnt/fcvm-btrfs only from instance-store NVMe. fcvm itself
+    does not need instance store (setup falls back to a loopback btrfs image,
+    src/setup/storage.rs); what it requires is btrfs, for reflink CoW. So the
+    constraint is the bootstrap's, and holds until user_data grows that
+    fallback. On 2026-08-15 a c7g.metal spot instance came up, died in
+    user_data with no disk to find, never registered, and billed while jobs
+    queued -- while c5.metal and c6i.metal sat in the x86 list with the same
+    defect.
 
     AWS marks instance storage with a 'd' in the family (c5d, m5d, c7gd,
     m6id). Confirm any addition for real with:
