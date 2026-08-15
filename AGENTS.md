@@ -64,6 +64,49 @@ This project is opinionated and minimal:
    create/modify/delete operations. Read-only `describe`/`list`/`get` commands are fine.
    The scoped `DevEBS=true` working-volume policy, automation Lambdas, and documented
    break-glass recovery are deliberate exceptions; do not expand them casually.
+6. **THE BROWSER IS THE ABSOLUTE LAST RESORT**: If a thing can be done by API or CLI, do it
+   that way. Do not hand the operator a dashboard click-path until you have checked that no
+   API exists AND no available credential can reach it, and can say which call failed and
+   how. "You'll need to do this in the dashboard" is a claim that requires evidence like any
+   other -- see the Cloudflare Registrar note below for what happens when it is guessed.
+
+## Cloudflare: domains, tokens, and what is actually true
+
+Registered through **Cloudflare Registrar**: `cc-games.dev` (2026-07-25 -> 2027-07-25,
+registrar of record "CloudFlare, Inc."). The account therefore already has a billing profile
+with a default payment method, a registrant contact, and an accepted Domain Registration
+Agreement. Do not tell the operator to go set those up; they exist.
+
+**Domains CAN be registered by API.** Cloudflare shipped a Registrar API (beta) with a real
+registration workflow -- Search -> Check -> Register:
+
+```
+POST https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/registrar/registrations
+```
+
+Call `Check` immediately before `Register`: the docs are explicit that Search is not the
+source of truth, and a successful registration is **billable and non-refundable**. Confirm
+the price from `Check` with the operator before committing.
+
+This was previously asserted here, and to the operator, as "dashboard only, no purchase
+API". That was stale knowledge stated as fact, and it wasted a round trip. If a capability
+question turns on a vendor's current API surface, search the docs before answering.
+
+**Tokens.** `cloudflare-api-token` in Secrets Manager (us-west-1) is a SCOPED ACCOUNT token,
+53 chars. It can read zones and drive DNS/Zero Trust/tunnels -- which is all the Terraform
+here needs -- and it CANNOT:
+
+| call | result | meaning |
+|---|---|---|
+| `GET /accounts/$ID/registrar/*` | 403 `10000` | no Registrar permission; route exists |
+| `GET /user/tokens` | 403 `9109` | account token, not user-level: cannot mint tokens |
+
+So there is no bootstrap path from what is stored to a registrar-capable token. Registering a
+domain needs a token with **Registrar write** permission created once by the operator; store
+it as a new secret rather than widening the existing one, so a DNS-only credential does not
+silently gain the ability to spend money.
+
+Account id: `12ea67fb7ced068de03f35c22688e436`.
 
 ## Preventing Terraform Drift
 
