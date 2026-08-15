@@ -304,17 +304,56 @@ resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
 resource "aws_cloudwatch_metric_alarm" "runner_scale_up_starved" {
   alarm_name          = "runner-scale-up-starved"
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2 # two consecutive 5-minute polls
-  threshold           = 0
-  alarm_description   = "Runner scale-up blocked while under the healthy-runner cap - slots held by instances that cannot take work"
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  ok_actions          = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
+  # Twenty-four consecutive 5-minute polls (2 hours), not two.
+  #
+  # ScaleUpStarved now means "work was queued and we refused to add capacity", which
+  # ordinary saturation also produces. The previous `counted < max_runners` gate excluded
+  # saturation, but at the cost of reading 0 through the entire 3.5-hour incident it was
+  # built for, because the wedged runners were GitHub-online the whole time.
+  #
+  # An interim version used 12 periods and justified it against the longest SINGLE job
+  # (43.5 min). That reasoning was wrong: consecutive waves of ordinary 30-40 minute jobs
+  # keep the queue non-empty for well over an hour, so one job duration does not bound
+  # queue-drain time. Nothing visible to a single poll separates a wedged pool from a deep
+  # one either -- a host that wedges mid-job keeps reporting busy=true, exactly like a
+  # healthy runner.
+  #
+  # So this alarm deliberately does not claim to tell them apart. Two hours of a queue
+  # that will not drain is worth a look whichever it is.
+  evaluation_periods = 24
+  threshold          = 0
+  alarm_description  = "Queued work went unserved for 2 hours - the pool is wedged, or genuinely that far behind"
+  alarm_actions      = [aws_sns_topic.cost_alerts.arn]
+  ok_actions         = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data = "notBreaching"
 
   metric_query {
     id          = "starved"
     expression  = "SELECT MAX(ScaleUpStarved) FROM SCHEMA(\"GitHubRunners\", Architecture)"
     label       = "Scale-up starved"
+    period      = 300
+    return_data = true
+  }
+}
+
+# Queued work with nothing online to take it. Distinct from scale-up-starved: that one
+# says "we refused to grow", this one says "there is nothing to grow FROM" -- every
+# runner is booting, wedged, or gone. It fires fast (two polls) because unlike
+# saturation there is no benign version of it.
+resource "aws_cloudwatch_metric_alarm" "runner_zero_online" {
+  alarm_name          = "runner-zero-online"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2 # two consecutive 5-minute polls
+  threshold           = 0
+  alarm_description   = "Jobs are queued and no runner is online to take them - the pool is empty, not merely busy"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  treat_missing_data  = "notBreaching"
+
+  metric_query {
+    id          = "zero_online"
+    expression  = "SELECT MAX(ZeroOnlineRunners) FROM SCHEMA(\"GitHubRunners\", Architecture)"
+    label       = "Zero online runners"
     period      = 300
     return_data = true
   }
