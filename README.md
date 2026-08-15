@@ -38,8 +38,10 @@ Normal operation from an admin box:
 ```bash
 cd ~/aws
 git pull --ff-only
+terraform init
 terraform fmt -recursive
 terraform validate
+terraform providers
 terraform plan
 terraform apply
 git add <changed-files>
@@ -51,6 +53,27 @@ The jumpboxes already have Terraform, Git, the AWS CLI, this repository, and an 
 administrator instance role. There is no AWS login or credential-refresh step. The
 committed `.terraform.lock.hcl` keeps provider resolution identical across admin hosts;
 review and commit any intentional provider upgrade.
+
+Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.23.1`
+provider release. That fork adds typed Worker-native Access destinations while preserving
+ordinary `terraform init` on both ARM64 jumpboxes and amd64 CI; there is no local provider
+override or machine-specific installation step. Return to `cloudflare/cloudflare` only
+after an upstream release includes the same fields and regression coverage.
+
+The fork has a different provider source address. On the first live-jumpbox update to
+`5.23.1`, stop after `terraform providers` if state still lists `cloudflare/cloudflare`.
+Under the exclusive state lock, migrate the eight existing Cloudflare resources before
+planning:
+
+```bash
+terraform state replace-provider \
+  registry.terraform.io/cloudflare/cloudflare \
+  registry.terraform.io/ejc3/cloudflare
+```
+
+Terraform writes a mandatory state backup. Do not repeat the command once state lists
+`ejc3/cloudflare`, and never apply a plan made before the migration. The reverse command
+is required when the stack eventually returns to the upstream provider namespace.
 
 ## Prerequisites
 
@@ -81,7 +104,8 @@ needs:
 - the existing `fcvm-ec2` EC2 key pair and its private key;
 - the existing `AWSBackupDefaultServiceRole`;
 - the Cloudflare `cc-games.dev` zone and Secrets Manager values
-  `cloudflare-tunnel-token`, `cloudflare-tunnel-credentials`, and
+  `cloudflare-tunnel-token` (including Workers Scripts Read/Write),
+  `cloudflare-tunnel-credentials`, and
   `cloudflare-google-idp`;
 - the `github-pat-ejc3` Secrets Manager value, the runner-only GitHub PAT, and
   `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
@@ -98,6 +122,8 @@ git clone https://github.com/ejc3/aws.git ~/aws
 cd ~/aws
 terraform init
 ```
+
+Follow the normal provider-migration gate above before planning from a replacement host.
 
 `terraform plan` should then refresh the recovered remote state and propose no unexplained
 re-creation. Stop if the backend appears empty. The configuration contains imported
@@ -425,6 +451,40 @@ token supports non-interactive checks.
 Once credentials exist and their units have been enabled, services and remote-control
 agents start at boot. A reboot restores the published URLs without another interactive
 login.
+
+### Colton Games Cloudflare staging and previews
+
+The `colton-games-stage` Worker is deployed from `CoderColton/colton-games` with Wrangler
+and OpenNext. Terraform owns the Worker envelope and its Worker-native Access boundary;
+Workers Builds owns versions, application assets, bindings, and deployments. This prevents
+an infrastructure apply from replacing an application bundle.
+
+The existing Worker is adopted through the checked-in import block with both `workers.dev`
+and preview URLs still disabled, matching its current remote state. Read the plan and stop if
+it proposes creating, replacing, or deleting the Worker or changing its deployed code.
+
+The checked-in Worker-native Access application uses a `worker` destination with no domain.
+That single application follows every request routed to this Worker, including its
+`workers.dev` hostname once enabled, immutable and branch previews, future Custom Domains,
+and future zone routes. It reuses the family email allowlist and the non-interactive Access
+service-token policy. The URL switches intentionally remain off until the application has
+been applied and a second clean plan confirms the policy attachment. Do not use hostname
+wildcard applications or a generic REST/local-exec bridge as a substitute.
+
+Cloudflare's Terraform provider does not yet model Workers Builds repository connections,
+build tokens, or triggers. The Cloudflare GitHub App also requires a one-time browser grant
+limited to `CoderColton/colton-games`. Until those APIs are added to this stack, configure
+one repository build with separate production and non-production deploy commands:
+
+| Deployment | Branches | Build command | Deploy command |
+|---|---|---|---|
+| Production staging | `main` | `npm run cf:build` | `npm run cf:deploy:built` |
+| Pull-request preview | all except `main` | `npm run cf:build` | `npm run cf:upload:built` |
+
+Use `/` as the root directory and Node 24 from the application's `.nvmrc`. Preview builds
+must remain limited to trusted branches because they inherit the staging Worker's bindings
+and secrets. `stage.colton-games.com` and the production Vercel serving path remain outside
+this change until the domain is deliberately moved to Cloudflare.
 
 ## GitHub Actions and package infrastructure
 
