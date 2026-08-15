@@ -241,6 +241,25 @@ placement score was 3/10 in every US region and for every alternative instance t
 neither moving region nor changing family was a way out. Sized down large -> medium so the
 durable option costs about what the unreliable one did (~$29/mo vs ~$24/mo spot).
 
+### Shape of the shared-box design
+
+One machine, several people, and no coordination between them. Three ideas do the work, and
+they recur -- reach for them before inventing a registry or a lock:
+
+1. **Derive, don't allocate.** A port is `3100 + cksum(hostname) % 800`; a t-claude window
+   key is `cksum(path)`. Nothing is handed out, so nothing needs releasing, and the same
+   input gives the same answer after a reboot, a rebuild, or a spot reclaim.
+2. **Be explicit where a default would drift.** `ndev` passes `--port "$PORT"` rather than
+   letting `next dev` pick: on a busy port Next does not fail, it silently moves to the next
+   one, and the tunnel then serves someone else's app. An explicit value turns a silent
+   mix-up into a loud bind error.
+3. **Separate identity, shared machine.** Own Unix account, own GitHub login, own Anthropic
+   login, own checkout. Only the admin key is common. Per-user systemd units (`ndev@`,
+   `claude-rc@`, `codex-rc@`) mean each person's services start and fail independently.
+
+The failure this prevents is not a crash -- it is two people quietly sharing one thing and
+believing it is theirs.
+
 ### The kids' dev box and `cc-games.dev`
 
 Each kid has their own Unix account, GitHub login, Vercel identity, and a permanent URL:
