@@ -783,74 +783,14 @@ sysctl -w vm.unprivileged_userfaultfd=1
 sysctl -w kernel.unprivileged_userns_clone=1 || true
 iptables -P FORWARD ACCEPT || true
 
-# Assign a global IPv6 address, make the OS acquire it, and PROVE it before
-# this runner is allowed to register.
-#
+# Assign a global IPv6 address to the ENI
 # AWS run_instances can't set both Ipv6AddressCount and Ipv6PrefixCount in the same
-# NetworkInterfaces entry, so we assign the IPv6 address post-launch. Assigning it
-# to the ENI is only half the job: the guest still has to pick it up over DHCPv6,
-# on its own schedule. On 2026-08-15 a job ran on a runner whose ENI already held
-# 2600:1f1c:208:c01::baca while the OS had no global IPv6 at all; every routed and
-# IPv6 test failed with "No global IPv6 address found on host", which reads as a
-# code flake rather than the runner defect it is. A runner that cannot run the
-# suite must not take jobs, so this fails closed: no address, no registration.
-
-# Same rule fcvm uses (detect_host_ipv6 in src/network/routed.rs): a
-# non-deprecated scope-global inet6 that is not a ULA, either carrying a /64
-# prefix or a /128 backed by an on-link /64 route.
-have_global_v6() {
-  local addrs a p
-  addrs=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 /&&!/deprecated/{print $2}' | grep -v '^fd') || return 1
-  [ -n "$addrs" ] || return 1
-  if echo "$addrs" | grep -q '/64$'; then return 0; fi
-  for a in $addrs; do
-    p=$(echo "$a" | cut -d/ -f1 | awk -F: '{printf "%s:%s:%s:%s", $1,$2,$3,$4}')
-    if ip -6 route show | grep -q "^$p::/64 "; then return 0; fi
-  done
-  return 1
-}
-
+# NetworkInterfaces entry, so we assign the IPv6 address post-launch.
 TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
 ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
-
-# Idempotent: only add an address if the ENI has none, and retry the API rather
-# than letting one throttled call decide the fate of the instance.
-ENI_V6=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" --region "$REGION" \
-  --query 'NetworkInterfaces[0].Ipv6Addresses[*].Ipv6Address' --output text 2>/dev/null || true)
-if [ -z "$ENI_V6" ]; then
-  for attempt in 1 2 3 4 5; do
-    if aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION"; then
-      echo "IPv6 address assigned to $ENI_ID"
-      break
-    fi
-    sleep $((attempt * 3))
-  done
-else
-  echo "ENI $ENI_ID already holds IPv6: $ENI_V6"
-fi
-
-# Ask the OS for it now instead of waiting for the next DHCPv6 renew.
-V6_IFACE=$(ip -o -4 route show to default | awk '{print $5; exit}')
-for round in 1 2 3; do
-  if have_global_v6; then break; fi
-  netplan apply || true
-  networkctl renew "$V6_IFACE" || true
-  for i in $(seq 1 15); do
-    if have_global_v6; then break; fi
-    sleep 2
-  done
-done
-
-if ! have_global_v6; then
-  echo "FATAL: no global IPv6 on $V6_IFACE after assign+renew; refusing to register this runner"
-  ip -6 addr show || true
-  ip -6 route show || true
-  exit 1
-fi
-echo "global IPv6 ready on $V6_IFACE:"
-ip -6 addr show scope global
+aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION" && echo "IPv6 address assigned to $ENI_ID"
 
 # Raise dirty_ratio to prevent writeback throttling during snapshot creation
 sysctl -w vm.dirty_ratio=80
