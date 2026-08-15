@@ -101,25 +101,36 @@ here needs -- and it CANNOT:
 | `GET /accounts/$ID/registrar/*` | 403 `10000` | no Registrar permission; route exists |
 | `GET /user/tokens` | 403 `9109` | account token, not user-level: cannot mint tokens |
 
-**There IS a bootstrap path, and it is in Secrets Manager.** `cloudflare-bootstrap-token`
-(us-west-1) is a Cloudflare USER token named "Create Additional Tokens" with API Tokens:Edit.
-It reaches `GET /user/tokens` (200) and can mint scoped tokens; it is not itself a registrar
-token (403 on `registrar/*`), which is the point -- mint a narrow one and let it expire
-rather than widening a long-lived credential.
+**Minting tokens.** `cloudflare-account-token` (us-west-1) is an ACCOUNT token (`cfat_`)
+with Account API Tokens Read+Write. It mints scoped tokens on demand -- that is how
+`dolphin-labs.dev` was bought without a browser:
 
 ```bash
-T=$(aws secretsmanager get-secret-value --secret-id cloudflare-bootstrap-token       --region us-west-1 --query SecretString --output text)
-# permission group: Registrar Domains Admin
-POST /user/tokens  {"policies":[{"effect":"allow",
-  "resources":{"com.cloudflare.api.account.<ACCOUNT_ID>":"*"},
-  "permission_groups":[{"id":"136d0be1ddc64eaf8516fa6994abfad4"}]}]}
+M=$(aws secretsmanager get-secret-value --secret-id cloudflare-account-token \
+      --region us-west-1 --query SecretString --output text)
+# Registrar Domains Admin = 136d0be1ddc64eaf8516fa6994abfad4
+curl -4 -X POST -H "Authorization: Bearer $M" -H 'Content-Type: application/json' \
+  -d '{"name":"registrar-agent","policies":[{"effect":"allow",
+       "resources":{"com.cloudflare.api.account.<ACCOUNT_ID>":"*"},
+       "permission_groups":[{"id":"136d0be1ddc64eaf8516fa6994abfad4"}]}]}' \
+  https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/tokens
 ```
 
-This paragraph previously said the opposite -- "no bootstrap path exists" -- because the
-search stopped at env vars and /etc. The token was in plaintext in
-`/home/ubuntu/ts-api/.env` on fcvm-metal-arm the whole time. Two lessons worth keeping:
-search the REPO CHECKOUTS for credentials, not just the obvious config paths; and a
-capability claim about our own estate needs the same evidence as one about a vendor.
+Three things that cost time and are not guessable:
+
+- **`curl -4` is required.** The token is IP-pinned to the jumpboxes' IPv4 addresses, and this
+  host egresses IPv6 by default -- you get `9109 Cannot use the access token from location:`
+  with an IPv6 address, which reads like a permissions error and is not.
+- **Account tokens use account endpoints.** `POST /accounts/{id}/tokens`, and verify is
+  `/accounts/{id}/tokens/verify`; `/user/tokens*` returns 1000 Invalid API Token for them.
+- **Registrar paths are `domain-search`, `domain-check`, `registrations`** -- not `/check`.
+  `privacy_mode` is a string (`"redaction"` / `"off"`), not a boolean. A first
+  `domain-check` may return `1011 Unable to check...`; it is transient, but do not blind-retry
+  `registrations` the same way -- that one spends money.
+
+Revoke minted tokens when the task is done; re-minting is one command. The old user-scoped
+`cloudflare-bootstrap-token` was revoked and deleted -- it could not attach account
+permissions, which is exactly why it was useless for this.
 
 Account id: `12ea67fb7ced068de03f35c22688e436`.
 
