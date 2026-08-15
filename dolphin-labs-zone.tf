@@ -26,16 +26,20 @@
 #
 #   3. terraform apply -var enable_dolphin_zone=true -var dolphin_zone_id=<id>
 
+# These defaulted to off/empty while dolphin-labs.dev was still unregistered. It is now
+# registered and the zone is live, so they default ON: with the old defaults every plan run
+# without -var flags proposed destroying the whole zone, which is a trap for whoever plans
+# next (including CI drift checks). Set enable_dolphin_zone=false to take it down on purpose.
 variable "enable_dolphin_zone" {
   description = "Stand up *.dolphin-labs.dev. Needs the domain registered, a zone id, and the cloudflare-github-idp secret."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "dolphin_zone_id" {
   description = "Cloudflare zone id for dolphin-labs.dev (created automatically when registered through Cloudflare Registrar)."
   type        = string
-  default     = ""
+  default     = "48eb9c7cae15cd0a58207a594297418c"
 }
 
 variable "dolphin_allowed_github_org" {
