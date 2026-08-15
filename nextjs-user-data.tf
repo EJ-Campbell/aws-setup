@@ -787,7 +787,7 @@ npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claud
 npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel update failed"
 echo "claude: $${BEFORE_CLAUDE:-none} -> $(claude --version 2>/dev/null | head -1)"
 
-for u in colton connor ej; do
+for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   # Codex ships its own installer and self-updates the standalone bundle; re-running it is
   # the supported refresh. Must run AS the user from a directory they can read -- from
@@ -802,7 +802,7 @@ for u in colton connor ej; do
   /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
 done
 
-for u in colton connor ej; do
+for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   for s in claude-rc codex-rc; do
     systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
