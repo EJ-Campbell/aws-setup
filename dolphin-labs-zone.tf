@@ -26,16 +26,20 @@
 #
 #   3. terraform apply -var enable_dolphin_zone=true -var dolphin_zone_id=<id>
 
+# These defaulted to off/empty while dolphin-labs.dev was still unregistered. It is now
+# registered and the zone is live, so they default ON: with the old defaults every plan run
+# without -var flags proposed destroying the whole zone, which is a trap for whoever plans
+# next (including CI drift checks). Set enable_dolphin_zone=false to take it down on purpose.
 variable "enable_dolphin_zone" {
   description = "Stand up *.dolphin-labs.dev. Needs the domain registered, a zone id, and the cloudflare-github-idp secret."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "dolphin_zone_id" {
   description = "Cloudflare zone id for dolphin-labs.dev (created automatically when registered through Cloudflare Registrar)."
   type        = string
-  default     = ""
+  default     = "48eb9c7cae15cd0a58207a594297418c"
 }
 
 variable "dolphin_allowed_github_org" {
@@ -147,6 +151,13 @@ resource "cloudflare_zero_trust_access_application" "dolphin_labs" {
   domain           = "*.dolphin-labs.dev"
   type             = "self_hosted"
   session_duration = "24h"
+
+  # Every identity provider on the account is offered by default, so without this the
+  # login page shows Google next to GitHub on a zone that is meant to be gated by GitHub
+  # org membership. A Google sign-in would still be refused by the policy, but only after
+  # the user has picked it, which reads as a broken login rather than a deliberate one.
+  allowed_idps              = [cloudflare_zero_trust_access_identity_provider.github[0].id]
+  auto_redirect_to_identity = true
 
   # The policy attachment MUST be declared here. Leaving it out makes terraform drop the
   # link on the next apply, which would leave every *.dolphin-labs.dev hostname reachable

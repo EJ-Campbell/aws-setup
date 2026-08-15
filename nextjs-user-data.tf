@@ -4,16 +4,65 @@
 # pattern as the other dev boxes, so it can be updated without recreating the instance).
 #
 # Three things it sets up:
-#   1. Separate Unix users (colton, connor, ej) so each has their own home, their own
+#   1. Separate Unix users (colton, connor, ejc3, skevh) so each has their own home, their own
 #      `gh auth login`, and their own projects. Nobody shares a GitHub identity.
 #   2. cloudflared, running as a system service, holding the tunnel to Cloudflare.
 #   3. `ndev` -- run it in a Next.js project and it starts `next dev` on a deterministic
-#      port, registers <name>.cc-games.dev -> that port with the tunnel, and prints the
-#      URL. Cloudflare Access gates every hostname behind the Gmail allowlist.
+#      port, registers <name>.<their zone> -> that port with the tunnel, and prints the
+#      URL. Cloudflare Access gates every hostname; which zone and which identity provider
+#      follows from the account (cc-games/Google, dolphin-labs/GitHub).
 
 locals {
   nextjs_tunnel_id = "60234535-279b-4b20-bbc3-7fd353abb7f6"
   nextjs_domain    = "cc-games.dev"
+
+  # Second zone on the same box. Deliberately a SEPARATE tunnel from cc-games: a bad
+  # ingress rewrite on one project must not take the other project's URLs down, and these
+  # are different people's work.
+  #
+  # Read from the resource rather than pasted in, so that recreating the tunnel cannot
+  # leave the box pointing at a UUID that no longer exists. Null when the zone is disabled.
+  dolphin_tunnel_id = one(cloudflare_zero_trust_tunnel_cloudflared.dolphin_labs[*].id)
+  dolphin_domain    = "dolphin-labs.dev"
+
+  # Zone -> tunnel. dolphin drops out entirely when the zone is off, which is what makes
+  # the "no zone" branch in ndev-zone reachable instead of theoretical.
+  nextjs_zone_tunnel = merge(
+    { (local.nextjs_domain) = local.nextjs_tunnel_id },
+    local.dolphin_tunnel_id == null ? {} : { (local.dolphin_domain) = local.dolphin_tunnel_id },
+  )
+
+  # Which zone a user publishes to. Derived from the account rather than chosen at publish
+  # time, so nobody can accidentally put a preview on the other project's domain -- and so
+  # `ndev` stays a bare command with no flags to remember. Users whose zone is not currently
+  # enabled are simply absent, and ndev refuses for them by name.
+  nextjs_user_zone = {
+    for u, z in {
+      colton = local.nextjs_domain
+      connor = local.nextjs_domain
+      ejc3   = local.dolphin_domain
+      skevh  = local.dolphin_domain
+    } : u => z if contains(keys(local.nextjs_zone_tunnel), z)
+  }
+
+  # The case arms below are built as data rather than with %{ for } directives inside the
+  # heredoc: the directive form trims the newlines between arms and emits the whole case
+  # statement on one line. Valid shell, but unreadable when debugging on the box.
+  nextjs_zone_arms = join("\n", [for z, t in local.nextjs_zone_tunnel : "      ${z}) echo \"${t}\" ;;"])
+  nextjs_user_arms = join("\n", [for u, z in local.nextjs_user_zone : "      ${u}) echo \"${z}\" ;;"])
+
+  # Same reason as the case arms: these emit whole STATEMENTS, and the directive form ran
+  # them together into "systemctl daemon-reloadsystemctl enable ..." -- a syntax error
+  # rather than merely ugly, because statements need a separator and case arms do not.
+  nextjs_zone_rebuild = join("\n", [
+    for z, t in local.nextjs_zone_tunnel : "/usr/local/bin/ndev-rebuild ${z}"
+  ])
+  # enable --now does nothing to an already-running unit, so a re-provision would leave
+  # cloudflared serving the config it read at boot rather than the one just rebuilt.
+  nextjs_zone_enable = join("\n", [
+    for z, t in local.nextjs_zone_tunnel :
+    "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl reload-or-restart \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
+  ])
 
   # Unix accounts. Each gets the fcvm key initially so you can get in as them and help;
   # they can add their own keys to ~/.ssh/authorized_keys afterwards.
@@ -74,9 +123,29 @@ fi
 
 mkdir -p /etc/cloudflared
 # Credentials come from Secrets Manager, never baked into this script or the AMI.
+# One file per zone; the tunnel id is embedded so cloudflared can match them up.
 aws secretsmanager get-secret-value --secret-id cloudflare-tunnel-credentials \
-  --region us-west-1 --query SecretString --output text > /etc/cloudflared/credentials.json
-chmod 600 /etc/cloudflared/credentials.json
+  --region us-west-1 --query SecretString --output text > /etc/cloudflared/creds-cc-games.dev.json
+aws secretsmanager get-secret-value --secret-id cloudflare-dolphin-tunnel-credentials \
+  --region us-west-1 --query SecretString --output text > /etc/cloudflared/creds-dolphin-labs.dev.json
+chmod 600 /etc/cloudflared/creds-*.json
+
+# The dolphin secret holds only the TunnelSecret; cloudflared also wants AccountTag and
+# TunnelID in the same file. Fill them in rather than storing three copies of the same
+# facts in Secrets Manager. Both come from the Terraform resource, so replacing the tunnel
+# cannot leave the credentials naming one id while the ingress config names another.
+python3 - <<'CREDFIX'
+import json
+p = "/etc/cloudflared/creds-dolphin-labs.dev.json"
+d = json.load(open(p))
+d.setdefault("AccountTag", "${var.cloudflare_account_id}")
+d.setdefault("TunnelID", "${local.dolphin_tunnel_id}")
+json.dump(d, open(p, "w"))
+CREDFIX
+chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
+
+# Keep the old path working for anything that still references it.
+ln -sf /etc/cloudflared/creds-cc-games.dev.json /etc/cloudflared/credentials.json
 
 # ---------------------------------------------------------------- ndev registry
 # hostname<TAB>port, one per line. ndev-register rewrites the cloudflared ingress from
@@ -84,6 +153,55 @@ chmod 600 /etc/cloudflared/credentials.json
 mkdir -p /var/lib/ndev
 touch /var/lib/ndev/registry
 chmod 666 /var/lib/ndev/registry
+
+# ---------------------------------------------------------------- zone lookup
+# One place that answers "which zone does this user publish to" and "which tunnel serves
+# that zone". Both ndev and ndev-register read it, so the mapping cannot drift between the
+# thing that builds a hostname and the thing that validates it -- which would be a
+# privilege bug, not just an inconsistency, since ndev-register runs as root.
+cat > /usr/local/bin/ndev-zone <<'ZONE'
+#!/bin/bash
+set -euo pipefail
+case "$${1:-}" in
+  --tunnel)
+    case "$${2:-}" in
+${local.nextjs_zone_arms}
+      *) exit 1 ;;
+    esac ;;
+  *)
+    case "$${1:-}" in
+${local.nextjs_user_arms}
+      *) exit 0 ;;   # unknown user: no zone, callers must refuse
+    esac ;;
+esac
+ZONE
+chmod 755 /usr/local/bin/ndev-zone
+
+# Regenerates one zone's cloudflared ingress from that zone's registry. Split out so the
+# publish path and the boot path build the config the same way -- when they were separate,
+# boot wrote a 404-only config and silently dropped every already-published hostname.
+cat > /usr/local/bin/ndev-rebuild <<'REBUILD'
+#!/bin/bash
+set -euo pipefail
+ZONE="$1"
+TUNNEL_ID=$(/usr/local/bin/ndev-zone --tunnel "$ZONE")
+REGISTRY=/var/lib/ndev/registry-$ZONE
+{
+  echo "tunnel: $TUNNEL_ID"
+  echo "credentials-file: /etc/cloudflared/creds-$ZONE.json"
+  echo "ingress:"
+  if [ -f "$REGISTRY" ]; then
+    while IFS=$'\t' read -r h p rest; do
+      [ -n "$h" ] || continue
+      echo "  - hostname: $h"
+      echo "    service: http://127.0.0.1:$p"
+    done < "$REGISTRY"
+  fi
+  echo "  - service: http_status:404"
+} > /etc/cloudflared/config-$ZONE.yml
+REBUILD
+chmod 755 /usr/local/bin/ndev-rebuild
+
 
 cat > /usr/local/bin/ndev-register <<'REG'
 #!/bin/bash
@@ -96,7 +214,15 @@ cat > /usr/local/bin/ndev-register <<'REG'
 set -euo pipefail
 HOST="$1"; PORT="$2"; WHO="$3"; DIR="$4"
 
-case "$HOST" in *.cc-games.dev) ;; *) echo "refusing: $HOST is not under cc-games.dev" >&2; exit 1 ;; esac
+# The caller's zone decides what they may publish. Previously this hardcoded one domain,
+# which is the check that has to change for a second project -- and it must stay a check:
+# this script runs as root via sudoers, so the hostname is attacker-controlled input.
+ZONE=$(/usr/local/bin/ndev-zone "$WHO")
+case "$ZONE" in "") echo "refusing: $WHO has no publishing zone" >&2; exit 1 ;; esac
+case "$HOST" in
+  *".$ZONE") ;;
+  *) echo "refusing: $HOST is not under $ZONE (the zone for $WHO)" >&2; exit 1 ;;
+esac
 case "$PORT" in ''|*[!0-9]*) echo "refusing: bad port $PORT" >&2; exit 1 ;; esac
 id "$WHO" >/dev/null 2>&1 || { echo "refusing: no such user $WHO" >&2; exit 1; }
 
@@ -108,7 +234,10 @@ fi
 case "$DIR" in "/home/$WHO"|"/home/$WHO"/*) ;; *) echo "refusing: $DIR is outside /home/$WHO" >&2; exit 1 ;; esac
 [ -f "$DIR/package.json" ] || { echo "refusing: no package.json in $DIR" >&2; exit 1; }
 
-REGISTRY=/var/lib/ndev/registry
+# One registry and one cloudflared config PER ZONE. A single shared registry would mean
+# rewriting both tunnels' ingress on every publish, so a malformed entry from one project
+# could break the other -- the exact coupling the separate tunnels exist to avoid.
+REGISTRY=/var/lib/ndev/registry-$ZONE
 grep -v -P "^\Q$HOST\E\t" "$REGISTRY" > "$REGISTRY.new" 2>/dev/null || true
 printf '%s\t%s\t%s\t%s\n' "$HOST" "$PORT" "$WHO" "$DIR" >> "$REGISTRY.new"
 sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
@@ -117,19 +246,9 @@ sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
 # nobody logged in: the unit needs no argument beyond the username.
 printf 'HOST=%s\nPORT=%s\nDIR=%s\n' "$HOST" "$PORT" "$DIR" > "/var/lib/ndev/$WHO.env"
 
-{
-  echo "tunnel: ${local.nextjs_tunnel_id}"
-  echo "credentials-file: /etc/cloudflared/credentials.json"
-  echo "ingress:"
-  while IFS=$'\t' read -r h p rest; do
-    [ -n "$h" ] || continue
-    echo "  - hostname: $h"
-    echo "    service: http://127.0.0.1:$p"
-  done < "$REGISTRY"
-  echo "  - service: http_status:404"
-} > /etc/cloudflared/config.yml
+/usr/local/bin/ndev-rebuild "$ZONE"
 
-systemctl reload-or-restart cloudflared 2>/dev/null || systemctl restart cloudflared
+systemctl reload-or-restart "cloudflared@$ZONE" 2>/dev/null || systemctl restart "cloudflared@$ZONE"
 systemctl enable --now "ndev@$WHO.service" >/dev/null 2>&1 || systemctl restart "ndev@$WHO.service"
 echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$WHO, enabled at boot)"
 REG
@@ -158,14 +277,20 @@ cd "$DIR"
 # node_modules lives on the root volume and survives reboots, but a fresh volume (or a
 # dependency change) would otherwise leave the service crash-looping on a missing module.
 [ -d node_modules ] || { echo "installing dependencies..."; pnpm install || npm install; }
+# Prefer `npm run dev` so package.json lifecycle hooks fire. dolphin-labs generates a
+# git-ignored dataset in `predev`; running `next dev` directly skipped it and every page
+# 500'd on a missing import -- which reads as a broken checkout, not a missing build step.
+if node -e 'process.exit(require("./package.json").scripts && require("./package.json").scripts.dev ? 0 : 1)' 2>/dev/null; then
+  exec npm run dev -- --port "$PORT" --hostname 127.0.0.1
+fi
 exec npx next dev --port "$PORT" --hostname 127.0.0.1
 RUN
 chmod 755 /usr/local/bin/ndev-run
 
 cat > /etc/systemd/system/ndev@.service <<'UNIT'
 [Unit]
-Description=next dev server for %i (published to the cc-games.dev tunnel)
-After=network-online.target cloudflared.service
+Description=next dev server for %i (published through that user's zone tunnel)
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -390,21 +515,38 @@ UNIT
 
 systemctl daemon-reload
 
-# seed an empty config so cloudflared can start before anything is registered
-[ -s /etc/cloudflared/config.yml ] || {
-  printf 'tunnel: %s\ncredentials-file: /etc/cloudflared/credentials.json\ningress:\n  - service: http_status:404\n' \
-    "${local.nextjs_tunnel_id}" > /etc/cloudflared/config.yml
-}
+# Split the old single shared registry into one per zone. Without this the per-zone config
+# is rebuilt from a registry that does not exist yet, so every already-published hostname
+# silently drops to the 404 catch-all: the site stays reachable through Access and then
+# 404s, which looks like the app broke rather than the routing.
+if [ -f /var/lib/ndev/registry ]; then
+  while IFS=$'\t' read -r h p who dir; do
+    [ -n "$h" ] || continue
+    z=$(/usr/local/bin/ndev-zone "$who")
+    [ -n "$z" ] || { echo "migrate: skipping $h -- $who has no zone"; continue; }
+    printf '%s\t%s\t%s\t%s\n' "$h" "$p" "$who" "$dir" >> "/var/lib/ndev/registry-$z"
+  done < /var/lib/ndev/registry
+  for f in /var/lib/ndev/registry-*; do [ -f "$f" ] && sort -u "$f" -o "$f"; done
+  mv /var/lib/ndev/registry /var/lib/ndev/registry.migrated
+  echo "migrated shared ndev registry into per-zone registries"
+fi
 
-cat > /etc/systemd/system/cloudflared.service <<'SVC'
+# Build each zone's ingress from its registry. Also the reason a fresh box has a working
+# tunnel service before anyone runs `ndev`: with no registry it writes the 404 catch-all.
+${local.nextjs_zone_rebuild}
+
+# Templated per zone: cloudflared serves ONE tunnel per process, so two zones means two
+# services. cloudflared@cc-games.dev and cloudflared@dolphin-labs.dev fail and restart
+# independently -- which is the point of separate tunnels in the first place.
+cat > /etc/systemd/system/cloudflared@.service <<'SVC'
 [Unit]
-Description=Cloudflare Tunnel for cc-games.dev
+Description=Cloudflare Tunnel for %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml --no-autoupdate tunnel run
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config-%i.yml --no-autoupdate tunnel run
 Restart=always
 RestartSec=5
 User=root
@@ -413,21 +555,34 @@ User=root
 WantedBy=multi-user.target
 SVC
 systemctl daemon-reload
-systemctl enable --now cloudflared
+${local.nextjs_zone_enable}
+# The old un-templated unit is superseded by cloudflared@<zone>; stop it so two processes
+# do not both claim the cc-games tunnel (cloudflared allows it and the traffic splits).
+# Tested with [ -f ] rather than `list-unit-files | grep -q`: this script runs under
+# `set -o pipefail`, and grep -q exits at the first match, which kills systemctl with
+# SIGPIPE. The pipeline then reports 141 and the branch is skipped BECAUSE it matched.
+if [ -f /etc/systemd/system/cloudflared.service ]; then
+  systemctl disable --now cloudflared 2>/dev/null || true
+  rm -f /etc/systemd/system/cloudflared.service
+  systemctl daemon-reload
+fi
 
 # ---------------------------------------------------------------- ndev
 cat > /usr/local/bin/ndev <<'NDEV'
 #!/bin/bash
-# ndev [name] -- start `next dev` in this project and expose it at <name>.cc-games.dev
+# ndev [name] -- start `next dev` in this project and expose it at <name>.<your zone>
 #
-# Defaults to your username, so `ndev` as colton publishes colton.cc-games.dev. Pass a
-# name for a second project: `ndev tetris` -> tetris.cc-games.dev.
+# Defaults to your username, so `ndev` as colton publishes colton.cc-games.dev and as
+# ejc3 publishes ejc3.dolphin-labs.dev. Pass a name for a second project:
+# `ndev tetris` -> tetris.<your zone>. The zone comes from your account, not a flag.
 #
 # The port is derived from the hostname, so restarting gives you the same port and the
 # tunnel mapping stays valid. Binds 127.0.0.1 only -- the box has no inbound web ports;
-# the tunnel is the sole path in, and Cloudflare Access gates it by Google login.
+# the tunnel is the sole path in, and Cloudflare Access gates it (Google for cc-games,
+# GitHub for dolphin-labs).
 set -euo pipefail
-DOMAIN=cc-games.dev
+DOMAIN=$(/usr/local/bin/ndev-zone "$USER")
+[ -n "$DOMAIN" ] || { echo "no publishing zone for $USER -- add them to nextjs_user_zone" >&2; exit 1; }
 NAME="$${1:-$USER}"
 NAME=$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z' | sed 's/^-*//;s/-*$//')
 [ -n "$NAME" ] || { echo "usage: ndev [name]" >&2; exit 1; }
@@ -443,7 +598,7 @@ PORT=$(( 3100 + ( $(printf '%s' "$HOST" | cksum | awk '{print $1}') % 800 ) ))
 sudo /usr/local/bin/ndev-register "$HOST" "$PORT" "$USER" "$(pwd)"
 echo ""
 echo "  https://$HOST   (port $PORT)"
-echo "  sign in with your Google account -- only the allowlist gets through"
+echo "  sign in when prompted -- Cloudflare Access gates every hostname"
 echo ""
 echo "  it keeps running after you log out, and comes back by itself if the box reboots."
 echo "    logs:    journalctl -u ndev@$USER -f"
@@ -561,7 +716,7 @@ for u in ${join(" ", local.nextjs_users)}; do
 You have been started in an empty scratch folder under Documents/Codex/<date>/<task>/.
 That folder is NOT the project.
 
-The project is a Next.js game at:
+The project is a Next.js app at:
 
     $PDIR
 
@@ -571,7 +726,7 @@ a git repository, and it is writable inside your sandbox.
 ## The dev server is already running -- do not start one
 
 It is a systemd service, not something you launch. It is published at
-https://$u.cc-games.dev and listens on 127.0.0.1 only.
+https://$u.$(/usr/local/bin/ndev-zone "$u") and listens on 127.0.0.1 only.
 
 **Your sandbox has no network access, so \`curl http://localhost:...\` WILL FAIL even
 though the server is running fine.** A failed curl does not mean the server is down. Do
@@ -687,7 +842,8 @@ systemctl enable --now agent-update.timer >/dev/null 2>&1 || true
 # 8GB is comfortable for two kids, but each `next dev` compile spikes hard and there are
 # now six long-lived node processes (2x next, 2x claude, 2x codex). A swapfile costs
 # nothing on a 50GB volume and turns a would-be OOM kill into a slow moment.
-if ! swapon --show=NAME --noheadings | grep -q .; then
+# Same pipefail/SIGPIPE trap as above; command substitution has no pipeline to poison.
+if [ -z "$(swapon --show=NAME --noheadings)" ]; then
   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 fi

@@ -74,12 +74,16 @@ resource "aws_iam_role_policy" "nextjs_dev" {
         Resource = "${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs.sh"
       },
       {
-        # Two secrets, named individually rather than by a broad prefix.
+        # Tunnel credentials plus the hop key, named narrowly rather than by a broad prefix.
         Sid    = "ReadOwnSecrets"
         Effect = "Allow"
         Action = "secretsmanager:GetSecretValue"
         Resource = [
           "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-tunnel-*",
+          # dolphin-labs.dev runs a separate tunnel, so it has separate credentials. This
+          # does NOT match the cloudflare-tunnel-* prefix above, and omitting it fails the
+          # box at boot rather than at first publish.
+          "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-dolphin-tunnel-*",
           # Hop key for reaching the other dev servers. Grants nothing beyond them: its
           # public half is never installed on the jumpbox. See dev-hop-key.tf.
           aws_secretsmanager_secret.dev_hop.arn,
