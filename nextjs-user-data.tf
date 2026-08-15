@@ -276,6 +276,12 @@ cd "$DIR"
 # node_modules lives on the root volume and survives reboots, but a fresh volume (or a
 # dependency change) would otherwise leave the service crash-looping on a missing module.
 [ -d node_modules ] || { echo "installing dependencies..."; pnpm install || npm install; }
+# Prefer `npm run dev` so package.json lifecycle hooks fire. dolphin-labs generates a
+# git-ignored dataset in `predev`; running `next dev` directly skipped it and every page
+# 500'd on a missing import -- which reads as a broken checkout, not a missing build step.
+if node -e 'process.exit(require("./package.json").scripts && require("./package.json").scripts.dev ? 0 : 1)' 2>/dev/null; then
+  exec npm run dev -- --port "$PORT" --hostname 127.0.0.1
+fi
 exec npx next dev --port "$PORT" --hostname 127.0.0.1
 RUN
 chmod 755 /usr/local/bin/ndev-run
