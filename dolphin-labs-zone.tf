@@ -43,6 +43,7 @@ variable "dolphin_allowed_github_users" {
   type        = list(string)
   default = [
     "ejc3",
+    "skrutzler-disney",
   ]
 }
 
