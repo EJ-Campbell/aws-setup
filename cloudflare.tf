@@ -310,9 +310,8 @@ output "cc_games_urls" {
 # CoderColton/colton-games. Terraform owns only the Worker envelope and its routing/auth
 # boundary so a plan can never replace the OpenNext bundle.
 #
-# Cloudflare's provider cannot yet express Access's direct `worker` destination. Keep
-# workers.dev and previews disabled until the provider fork can create that application;
-# otherwise the first Terraform apply would expose both URL surfaces.
+# Keep workers.dev and previews disabled while this application is first created and
+# verified; otherwise the first Terraform apply would expose both URL surfaces.
 # ---------------------------------------------------------------------------------
 locals {
   colton_games_worker_name = "colton-games-stage"
@@ -333,6 +332,36 @@ resource "cloudflare_worker" "colton_games_stage" {
   lifecycle {
     prevent_destroy = true
   }
+}
+
+resource "cloudflare_zero_trust_access_application" "colton_games_stage" {
+  account_id       = var.cloudflare_account_id
+  name             = "Colton Games staging and previews"
+  type             = "self_hosted"
+  session_duration = "24h"
+
+  # URLs must be disabled before this protection boundary can be removed.
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  # Worker-native protection follows every production and preview request for this
+  # Worker. Unlike a hostname application, it intentionally has no domain.
+  destinations = [{
+    type      = "worker"
+    worker_id = cloudflare_worker.colton_games_stage.id
+  }]
+
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.cc_games_allowed.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.cc_games_service.id
+      precedence = 2
+    },
+  ]
 }
 
 import {

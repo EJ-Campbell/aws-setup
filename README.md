@@ -52,6 +52,12 @@ administrator instance role. There is no AWS login or credential-refresh step. T
 committed `.terraform.lock.hcl` keeps provider resolution identical across admin hosts;
 review and commit any intentional provider upgrade.
 
+Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.23.1`
+provider release. That fork adds typed Worker-native Access destinations while preserving
+ordinary `terraform init` on both ARM64 jumpboxes and amd64 CI; there is no local provider
+override or machine-specific installation step. Return to `cloudflare/cloudflare` only
+after an upstream release includes the same fields and regression coverage.
+
 ## Prerequisites
 
 ### Existing deployment
@@ -99,6 +105,21 @@ git clone https://github.com/ejc3/aws.git ~/aws
 cd ~/aws
 terraform init
 ```
+
+The fork uses a different provider source address. During its first rollout only, inspect
+`terraform providers`; if the state still lists `cloudflare/cloudflare`, migrate the eight
+existing Cloudflare resources under the state lock before planning:
+
+```bash
+terraform state replace-provider \
+  registry.terraform.io/cloudflare/cloudflare \
+  registry.terraform.io/ejc3/cloudflare
+```
+
+Terraform writes a mandatory state backup for this command. Do not repeat it once the
+state already lists `ejc3/cloudflare`, and do not apply a plan made before the migration.
+The reverse command is required when the stack eventually returns to the upstream
+provider namespace.
 
 `terraform plan` should then refresh the recovered remote state and propose no unexplained
 re-creation. Stop if the backend appears empty. The configuration contains imported
@@ -430,23 +451,21 @@ login.
 ### Colton Games Cloudflare staging and previews
 
 The `colton-games-stage` Worker is deployed from `CoderColton/colton-games` with Wrangler
-and OpenNext. Terraform deliberately owns only the Worker envelope; after the provider fork
-lands it will also own the Access boundary. Workers Builds owns versions, application assets,
-bindings, and deployments. This prevents an infrastructure apply from replacing an
-application bundle.
+and OpenNext. Terraform owns the Worker envelope and its Worker-native Access boundary;
+Workers Builds owns versions, application assets, bindings, and deployments. This prevents
+an infrastructure apply from replacing an application bundle.
 
 The existing Worker is adopted through the checked-in import block with both `workers.dev`
 and preview URLs still disabled, matching its current remote state. Read the plan and stop if
 it proposes creating, replacing, or deleting the Worker or changing its deployed code.
 
-Before enabling either URL, create one Worker-native Access application with a `worker`
-destination. That single application follows every request routed to this Worker, including
-its `workers.dev` hostname once enabled, immutable and branch previews, future Custom
-Domains, and future zone routes. It should reuse the family email allowlist and the
-non-interactive Access service-token policy. The upstream Cloudflare Terraform provider does
-not expose `worker_id` yet, so the URL switches intentionally remain off until the provider
-fork lands. Do not use hostname wildcard applications or a generic REST/local-exec bridge as
-a substitute.
+The checked-in Worker-native Access application uses a `worker` destination with no domain.
+That single application follows every request routed to this Worker, including its
+`workers.dev` hostname once enabled, immutable and branch previews, future Custom Domains,
+and future zone routes. It reuses the family email allowlist and the non-interactive Access
+service-token policy. The URL switches intentionally remain off until the application has
+been applied and a second clean plan confirms the policy attachment. Do not use hostname
+wildcard applications or a generic REST/local-exec bridge as a substitute.
 
 Cloudflare's Terraform provider does not yet model Workers Builds repository connections,
 build tokens, or triggers. The Cloudflare GitHub App also requires a one-time browser grant
