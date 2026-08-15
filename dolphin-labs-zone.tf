@@ -38,13 +38,10 @@ variable "dolphin_zone_id" {
   default     = ""
 }
 
-variable "dolphin_allowed_github_users" {
-  description = "GitHub logins allowed through Access to every *.dolphin-labs.dev host. Adding someone is a one-line change here."
-  type        = list(string)
-  default = [
-    "ejc3",
-    "skrutzler-disney",
-  ]
+variable "dolphin_allowed_github_org" {
+  description = "GitHub org whose members may reach every *.dolphin-labs.dev host. Membership IS the access list -- add someone to the org, they get in."
+  type        = string
+  default     = "dolphin-labs-hq"
 }
 
 locals {
@@ -124,14 +121,20 @@ resource "cloudflare_zero_trust_access_policy" "dolphin_allowed" {
   decision         = "allow"
   session_duration = "24h"
 
-  # Matched on GitHub LOGIN rather than email. A GitHub account's email can be private or
-  # change; the login is the stable identifier and is what people actually know about
-  # each other here.
+  # Matched on ORG MEMBERSHIP, which is what this selector actually does. An earlier version
+  # passed each person's LOGIN as the org name -- that applies cleanly and then denies
+  # everyone, because there is no org called "ejc3". Cloudflare's github_organization rule
+  # matches an organization (optionally a team); individuals are matched by email, and a
+  # GitHub email can be private or change.
+  #
+  # Org membership is also the better list: both people here are already in dolphin-labs-hq
+  # because that is where the repo lives, so access follows the repo instead of drifting
+  # from it.
   include = [
-    for login in var.dolphin_allowed_github_users : {
+    {
       github_organization = {
         identity_provider_id = cloudflare_zero_trust_access_identity_provider.github[0].id
-        name                 = login
+        name                 = var.dolphin_allowed_github_org
       }
     }
   ]
