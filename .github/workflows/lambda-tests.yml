@@ -24,3 +24,6 @@ jobs:
 
       - name: Runner Lambda logic
         run: python3 scripts/test-runner-lambdas.py
+
+      - name: Runner user_data IPv6 gate
+        run: bash scripts/test-runner-userdata.sh

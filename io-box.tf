@@ -282,6 +282,20 @@ resource "aws_instance" "io_box" {
     ignore_changes = [
       ami,
       user_data,
+      # A STOPPED instance with no Elastic IP reports associate_public_ip_address as
+      # false, because AWS releases the auto-assigned address on stop. That field forces
+      # replacement, so with the box stopped — its normal resting state — a routine
+      # `terraform apply` planned "2 to add, 2 to destroy" and would have DESTROYED the
+      # box and its EBS root. Nothing had changed: the config still says true, and the
+      # attribute goes back to true the moment it starts.
+      #
+      # Every other box escapes this only by holding an Elastic IP; us-west-2 has none.
+      # An EIP here would be a permanent charge for an address this box does not publish
+      # (clients use the private IP; the public one is outbound package access only), so
+      # ignore the field instead. It is a launch-time property — changing it in config
+      # would require a rebuild anyway, which is the deliberate act, not a side effect of
+      # an unrelated apply.
+      associate_public_ip_address,
     ]
   }
 
@@ -294,11 +308,26 @@ resource "aws_instance" "io_box" {
 # Terraform normally treats a stopped aws_instance as valid and will not start it on
 # apply. Model the desired running state explicitly so the supported wake path stays
 # Terraform-native:
-#   terraform apply -target=aws_ec2_instance_state.io_box
+#   terraform apply -var io_box_wake=true -target=aws_ec2_instance_state.io_box
 #
-# This does not fight the idle Lambda continuously -- Terraform is not a daemon. It only
-# wakes the box on the next deliberate apply after the watchdog has stopped it.
+# Gated on a variable rather than declared unconditionally. Hardcoding state = "running"
+# meant EVERY full apply woke the box — a routine unrelated apply silently started a
+# machine that had been deliberately stopped, and billed for it. Waking a box should be
+# something you ask for, not something you catch.
+#
+# Default false removes the resource from state instead of stopping the box: the
+# provider's delete for aws_ec2_instance_state is a no-op (DeleteWithoutTimeout:
+# schema.NoopContext), so a full apply never touches a box that is already awake and in
+# use. That asymmetry is deliberate — Terraform is not a daemon, and the idle Lambda
+# owns putting it back to sleep.
+variable "io_box_wake" {
+  description = "Start the shared I/O box on the next apply. Deliberate, and only ever passed on the command line."
+  type        = bool
+  default     = false
+}
+
 resource "aws_ec2_instance_state" "io_box" {
+  count       = var.io_box_wake ? 1 : 0
   provider    = aws.west2
   instance_id = aws_instance.io_box.id
   state       = "running"
@@ -360,7 +389,7 @@ output "io_box_ssh_command" {
 
 output "io_box_wake_command" {
   description = "Terraform-native wake command to run on the jumpbox after an idle stop"
-  value       = "terraform apply -target=aws_ec2_instance_state.io_box"
+  value       = "terraform apply -var io_box_wake=true -target=aws_ec2_instance_state.io_box"
 }
 
 output "io_box_mount" {

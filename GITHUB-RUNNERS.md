@@ -61,9 +61,25 @@ an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
 self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **4 runners
 per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
-`c7gd.metal`→`c7g.metal`; x86 tries `c5d`/`c5`/`c6i`/`m5d.metal`, with any type that
-recently failed for capacity moved to the back of that order. Each instance is tagged with a
-`LeaseExpires` 60 minutes out.
+`c7gd`/`m7gd`/`c6gd`/`m6gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
+that recently failed for capacity moved to the back of that order. Each instance is tagged
+with a `LeaseExpires` 60 minutes out.
+
+Every type in those lists has instance storage (the `d` families), and that is a
+correctness requirement, not a preference: user_data builds `/mnt/fcvm-btrfs` on the
+instance-store NVMe, so a storeless type boots a machine that cannot run a job. The lists
+previously carried `c7g.metal`, `c5.metal` and `c6i.metal`, all
+`InstanceStorageSupported=false`; on 2026-08-15 a `c7g.metal` spot instance came up, died in
+user_data with no disk to find, never registered, and billed while jobs queued. Verify any
+addition before adding it:
+
+```bash
+aws ec2 describe-instance-types --instance-types <type> \
+  --query 'InstanceTypes[].InstanceStorageSupported'
+```
+
+`case_every_launchable_type_has_instance_storage` in `scripts/test-runner-lambdas.py` fails
+if a storeless type is added back.
 
 **What holds a slot.** The cap counts runners that can *take work*, not EC2 instances that
 exist. The Lambda reads the same PAT from SSM, lists `GET /repos/ejc3/fcvm/actions/runners`,
@@ -95,6 +111,27 @@ Advanced tier, base64 — too big for Lambda's 4 KB env limit). On boot it sets 
 --labels self-hosted,Linux,<ARM64|X64> --unattended --replace`, then installs the runner as
 a service. The PAT itself never leaves AWS; what touches `config.sh` is the ephemeral
 registration token derived from it.
+
+Two of those setup steps are **gates, and they run before `config.sh`**: a runner that
+cannot host a job must not join the pool, because from CI's side a broken runner is
+indistinguishable from a code defect.
+
+- **Instance store.** No instance-store NVMe means `/mnt/fcvm-btrfs` cannot be built, so the
+  script refuses to register.
+- **Global IPv6.** Assigning the address to the ENI is only half the job; the guest still has
+  to acquire it over DHCPv6, on its own schedule. user_data assigns it (idempotently, with
+  retries), runs `netplan apply` / `networkctl renew` to ask for it now rather than at the
+  next renew, then polls until a usable address appears, using the same rule fcvm's
+  `detect_host_ipv6` uses: a non-deprecated scope-global inet6 that is not a ULA, either /64
+  or /128 with an on-link /64 route. No address within ~90s, no registration.
+
+  Not hypothetical: on 2026-08-15 a job ran on a runner whose ENI held
+  `2600:1f1c:208:c01::baca` while the OS had nothing, and every routed and IPv6 test in the
+  fcvm suite failed with `No global IPv6 address found on host` — on a PR that had touched
+  only `bench/chromium/*.py`.
+
+`scripts/test-runner-userdata.sh` extracts the real heredoc from the `.tf` and checks that
+both gates refuse the shapes they exist for, and that each precedes registration.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`) and does six things, four of them using the PAT: deregisters GitHub

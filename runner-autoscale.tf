@@ -291,11 +291,18 @@ data "archive_file" "runner_webhook" {
           raised to advance it. The previous attempt's outcome is what advances the
           list, which is why this takes the failures as an argument.
           """
+          # Every type here MUST have instance storage - the 'd' families. The
+          # user_data builds /mnt/fcvm-btrfs on the instance-store NVMe, so a
+          # storeless type launches a machine that can never run a job: on
+          # 2026-08-15 a c7g.metal spot instance came up, died in user_data at
+          # NVME_DEVS with no disk to find, never registered, and sat there
+          # billing while jobs queued. Verify additions with:
+          #   aws ec2 describe-instance-types --instance-types <t> \
+          #     --query 'InstanceTypes[].InstanceStorageSupported'
           if arch == 'x86_64':
-              # Try multiple x86 metal types for better spot availability
-              types = ['c5d.metal', 'c5.metal', 'c6i.metal', 'm5d.metal']
+              types = ['c5d.metal', 'm5d.metal', 'r5d.metal', 'm6id.metal']
           else:
-              types = ['c7gd.metal', 'c7g.metal']
+              types = ['c7gd.metal', 'm7gd.metal', 'c6gd.metal', 'm6gd.metal']
           return ([t for t in types if t not in deprioritized]
                   + [t for t in types if t in deprioritized])
 
@@ -741,8 +748,18 @@ sysctl -w kernel.printk="7 4 1 7" || true
 
 # Mount NVMe as btrfs RAID0 at /mnt/fcvm-btrfs
 ROOT_DEV=$(lsblk -no PKNAME $(findmnt -no SOURCE /) | head -1)
-NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$")
+# `|| true`: on a storeless instance type grep matches nothing and returns 1,
+# which under `set -e` killed the whole bootstrap right here -- before the
+# NVME_COUNT check below could report anything, before the IPv6 gate, and before
+# registration. The box then sat billing, unregistered, with the real reason
+# only visible in its console log.
+NVME_DEVS=$(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && /^nvme/ {print $1}' | grep -v "^$ROOT_DEV$" || true)
 NVME_COUNT=$(echo "$NVME_DEVS" | wc -w)
+if [ "$NVME_COUNT" -eq 0 ]; then
+  echo "FATAL: no instance-store NVMe on this instance type; /mnt/fcvm-btrfs cannot be built, refusing to register this runner"
+  lsblk -dn -o NAME,TYPE,SIZE || true
+  exit 1
+fi
 if [ "$NVME_COUNT" -gt 0 ]; then
   CURRENT_MOUNT=$(findmnt -no SOURCE /mnt/fcvm-btrfs 2>/dev/null || true)
   BTRFS_DEVS=$(btrfs filesystem show /mnt/fcvm-btrfs 2>/dev/null | grep -c 'devid' || echo 0)
@@ -783,14 +800,74 @@ sysctl -w vm.unprivileged_userfaultfd=1
 sysctl -w kernel.unprivileged_userns_clone=1 || true
 iptables -P FORWARD ACCEPT || true
 
-# Assign a global IPv6 address to the ENI
+# Assign a global IPv6 address, make the OS acquire it, and PROVE it before
+# this runner is allowed to register.
+#
 # AWS run_instances can't set both Ipv6AddressCount and Ipv6PrefixCount in the same
-# NetworkInterfaces entry, so we assign the IPv6 address post-launch.
+# NetworkInterfaces entry, so we assign the IPv6 address post-launch. Assigning it
+# to the ENI is only half the job: the guest still has to pick it up over DHCPv6,
+# on its own schedule. On 2026-08-15 a job ran on a runner whose ENI already held
+# 2600:1f1c:208:c01::baca while the OS had no global IPv6 at all; every routed and
+# IPv6 test failed with "No global IPv6 address found on host", which reads as a
+# code flake rather than the runner defect it is. A runner that cannot run the
+# suite must not take jobs, so this fails closed: no address, no registration.
+
+# Same rule fcvm uses (detect_host_ipv6 in src/network/routed.rs): a
+# non-deprecated scope-global inet6 that is not a ULA, either carrying a /64
+# prefix or a /128 backed by an on-link /64 route.
+have_global_v6() {
+  local addrs a p
+  addrs=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 /&&!/deprecated/{print $2}' | grep -v '^fd') || return 1
+  [ -n "$addrs" ] || return 1
+  if echo "$addrs" | grep -q '/64$'; then return 0; fi
+  for a in $addrs; do
+    p=$(echo "$a" | cut -d/ -f1 | awk -F: '{printf "%s:%s:%s:%s", $1,$2,$3,$4}')
+    if ip -6 route show | grep -q "^$p::/64 "; then return 0; fi
+  done
+  return 1
+}
+
 TOKEN6=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/mac)
 ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id")
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN6" http://169.254.169.254/latest/meta-data/placement/region)
-aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION" && echo "IPv6 address assigned to $ENI_ID"
+
+# Idempotent: only add an address if the ENI has none, and retry the API rather
+# than letting one throttled call decide the fate of the instance.
+ENI_V6=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI_ID" --region "$REGION" \
+  --query 'NetworkInterfaces[0].Ipv6Addresses[*].Ipv6Address' --output text 2>/dev/null || true)
+if [ -z "$ENI_V6" ]; then
+  for attempt in 1 2 3 4 5; do
+    if aws ec2 assign-ipv6-addresses --network-interface-id "$ENI_ID" --ipv6-address-count 1 --region "$REGION"; then
+      echo "IPv6 address assigned to $ENI_ID"
+      break
+    fi
+    sleep $((attempt * 3))
+  done
+else
+  echo "ENI $ENI_ID already holds IPv6: $ENI_V6"
+fi
+
+# Ask the OS for it now instead of waiting for the next DHCPv6 renew.
+V6_IFACE=$(ip -o -4 route show to default | awk '{print $5; exit}')
+for round in 1 2 3; do
+  if have_global_v6; then break; fi
+  netplan apply || true
+  networkctl renew "$V6_IFACE" || true
+  for i in $(seq 1 15); do
+    if have_global_v6; then break; fi
+    sleep 2
+  done
+done
+
+if ! have_global_v6; then
+  echo "FATAL: no global IPv6 on $V6_IFACE after assign+renew; refusing to register this runner"
+  ip -6 addr show || true
+  ip -6 route show || true
+  exit 1
+fi
+echo "global IPv6 ready on $V6_IFACE:"
+ip -6 addr show scope global
 
 # Raise dirty_ratio to prevent writeback throttling during snapshot creation
 sysctl -w vm.dirty_ratio=80
@@ -840,12 +917,31 @@ EOF
 }
 
 # SSM Parameter to store user_data (avoids Lambda 4KB env var limit)
+#
+# GZIPPED, not just base64. The two runner gates pushed this script from 5,482 to 8,386
+# characters, and base64 inflates by a third: 11,184 against a hard ceiling of 8,192.
+# Advanced is the largest SSM tier, so the apply failed outright --
+#
+#   ValidationException: The specified parameter value is too large.
+#   Advanced-tier parameters support a maximum parameter value of 8192 characters.
+#
+# base64gzip brings it to 4,712, with room for the script to keep growing.
+#
+# Safe because BOTH decoders are already in the path, and neither is new behaviour:
+#   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
+#     (sources/DataSourceEc2.py), which validates and decodes, or passes it through
+#     untouched. That is why the existing double-encoding works at all: botocore
+#     base64-encodes UserData again in before-parameter-build.ec2.RunInstances.
+#   - cloud-init then calls util.decomp_gzip (user_data.py) on the payload.
+#
+# Anything that reads this parameter back must gunzip as well as decode:
+#   aws ssm get-parameter ... --output text | base64 -d | gunzip
 resource "aws_ssm_parameter" "runner_user_data" {
   count = var.enable_github_runner ? 1 : 0
   name  = "/github-runner/user-data"
   type  = "String"
   tier  = "Advanced"
-  value = base64encode(local.runner_user_data)
+  value = base64gzip(local.runner_user_data)
   tags = {
     Name = "github-runner-user-data"
   }
