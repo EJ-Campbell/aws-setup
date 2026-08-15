@@ -331,6 +331,11 @@ resource "cloudflare_worker" "colton_games_stage" {
   # the import block below; replacement or destruction would sever the staging service.
   lifecycle {
     prevent_destroy = true
+
+    # Wrangler owns application observability alongside the deployed bundle. The provider
+    # defaults this nested object to disabled when it is omitted, which must not overwrite
+    # the live Worker setting during import or fight later application deployments.
+    ignore_changes = [observability]
   }
 }
 
