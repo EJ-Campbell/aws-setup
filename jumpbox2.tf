@@ -57,12 +57,17 @@ resource "aws_security_group" "jumpbox_2" {
     description = "Eternal Terminal"
   }
 
+  # ipv6_cidr_blocks matters even though nothing here is IPv6-first: the subnet assigns
+  # IPv6 addresses and DNS returns AAAA records first, so without it every outbound v6
+  # connection sits in SYN-SENT until TCP gives up. On nextjs-dev that cost 60-90s per
+  # AWS CLI call for three weeks before anyone traced it.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "All outbound"
   }
 
   tags = { Name = "jumpbox-2" }

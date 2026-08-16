@@ -125,12 +125,19 @@ resource "aws_security_group" "nextjs_dev" {
 
   # Deliberately NO 3000-3999 / 80 / 443 ingress: cloudflared connects outbound and
   # proxies to 127.0.0.1, so opening web ports would only create a way to bypass Access.
+  # ipv6_cidr_blocks is NOT optional here. The subnet assigns IPv6 addresses and the route
+  # table has ::/0 to the IGW, so the box believes it has IPv6 and DNS hands back AAAA
+  # records first -- but with no IPv6 egress rule every outbound v6 SYN was dropped by this
+  # security group. Symptoms were slow and confusing rather than obviously "no network":
+  # `aws` calls sat in SYN-SENT retransmitting for 60-90s before falling back, and
+  # cloudflared logged "failed to dial to edge with quic" against 2606:4700:a0::8.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound (incl. the tunnel to Cloudflare)"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+    description      = "All outbound, v4 and v6 (incl. the tunnel to Cloudflare)"
   }
 
   tags = { Name = "nextjs-dev" }
