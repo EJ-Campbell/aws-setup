@@ -7,24 +7,31 @@
 # then kill every other repository's Claude session.
 locals {
   metal_claude_remote_control = <<-SETUP
-# The managed boot service needs t-claude's argument-passthrough support. Keep a verified,
-# immutable copy for systemd so a failed refresh of the interactive copy cannot silently
-# turn `--remote-control` into an ordinary Claude session.
+# The managed boot service needs t-claude's argument-passthrough support, so systemd gets
+# its own copy rather than depending on a user's interactive one.
+#
+# Tracks main, deliberately unpinned. t-claude is ours: fixes land upstream and should reach
+# every box on the next setup run, which is how the empty-picker fix arrived. A commit pin
+# plus a sha256 was worse than nothing here -- the two constants have to be updated in
+# lockstep, and when only the commit was bumped the download failed its hash check, fell
+# through to "keeping verified installed copy", and would have frozen these boxes on the old
+# version while printing a reassuring message.
+#
+# Integrity is still checked, just not against a constant that rots: a truncated or garbled
+# download fails `zsh -n`, and the previous copy is kept instead.
 install -d -m 755 /usr/local/lib/fcvm
-TCLAUDE_COMMIT=8ecd040fc2b6a85b52018cf1d42d681602985d46
-TCLAUDE_SHA256=5f32a138c50ffcc99609f30397c04963c6b538bfbf07a4cd9dc0f32fcdbb1b88
-TCLAUDE_PINNED=/usr/local/lib/fcvm/t-claude.zsh
+TCLAUDE_SYSTEM=/usr/local/lib/fcvm/t-claude.zsh
 TCLAUDE_TMP=$(mktemp)
 if curl -fsSL --retry 3 \
-  "https://raw.githubusercontent.com/ejc3/t-claude/$TCLAUDE_COMMIT/t-claude.zsh" \
+  "https://raw.githubusercontent.com/ejc3/t-claude/main/t-claude.zsh" \
   -o "$TCLAUDE_TMP" \
-  && [ "$(sha256sum "$TCLAUDE_TMP" | awk '{print $1}')" = "$TCLAUDE_SHA256" ]; then
-  install -m 644 -o root -g root "$TCLAUDE_TMP" "$TCLAUDE_PINNED"
-elif [ -f "$TCLAUDE_PINNED" ] \
-  && [ "$(sha256sum "$TCLAUDE_PINNED" | awk '{print $1}')" = "$TCLAUDE_SHA256" ]; then
-  echo "fcvm-claude: pinned t-claude download failed; keeping verified installed copy"
+  && [ -s "$TCLAUDE_TMP" ] \
+  && zsh -n "$TCLAUDE_TMP" 2>/dev/null; then
+  install -m 644 -o root -g root "$TCLAUDE_TMP" "$TCLAUDE_SYSTEM"
+elif [ -s "$TCLAUDE_SYSTEM" ]; then
+  echo "fcvm-claude: t-claude download failed or was malformed; keeping the installed copy"
 else
-  echo "WARNING: fcvm-claude has no verified t-claude; boot service will stay skipped" >&2
+  echo "WARNING: fcvm-claude has no usable t-claude; boot service will stay skipped" >&2
 fi
 rm -f "$TCLAUDE_TMP"
 
