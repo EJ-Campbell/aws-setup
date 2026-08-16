@@ -35,9 +35,12 @@ variable "nextjs_instance_type" {
 }
 
 variable "nextjs_volume_size" {
+  # Doubled from 50 on 2026-08-16, when the disk hit 100% with 13MB free. Four accounts now
+  # share this box, and the space goes to caches that legitimately grow: Go build caches,
+  # ms-playwright browsers, npm _cacache, and a node_modules per project per user.
   description = "Root volume GB. Holds the projects and their node_modules."
   type        = number
-  default     = 50
+  default     = 100
 }
 
 # ---------------------------------------------------------------------------------
