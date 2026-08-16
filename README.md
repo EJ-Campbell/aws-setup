@@ -564,29 +564,40 @@ Roll this out in order; do not collapse the safety gates into one apply:
    both platforms. Commit that lock update. Do **not** use broad `terraform init -upgrade`;
    it can advance unrelated providers allowed by their `~>` constraints.
 2. Leave both `colton_games_workers_builds_enabled` and
-   `colton_games_worker_urls_enabled` false. Apply only backend versioning first:
+   `colton_games_worker_urls_enabled` false. Save and review a targeted backend-versioning
+   plan, then apply that exact plan:
 
    ```bash
-   terraform apply -target=aws_s3_bucket_versioning.terraform_state
+   terraform plan \
+     -target=aws_s3_bucket_versioning.terraform_state \
+     -out=/tmp/colton-games-backend-versioning.tfplan
+   terraform show -no-color /tmp/colton-games-backend-versioning.tfplan
+   terraform apply /tmp/colton-games-backend-versioning.tfplan
    aws s3api get-bucket-versioning --bucket ejc3-terraform-state \
      --region us-west-1 --query Status --output text
    ```
 
-   Require `Enabled`, then wait **at least 15 minutes** for S3 versioning to propagate.
+   Require the saved plan to contain only the versioning resource, require `Enabled` after
+   applying it, then wait **at least 15 minutes** for S3 versioning to propagate.
 3. After that wait, apply only the control-token container. This legitimate Terraform
-   state write is also the versioning probe:
+   state write is also the versioning probe. Again, save and review the targeted plan,
+   then apply that exact plan:
 
    ```bash
-   terraform apply \
-     -target=aws_secretsmanager_secret.cloudflare_workers_builds_control_token
+   terraform plan \
+     -target=aws_secretsmanager_secret.cloudflare_workers_builds_control_token \
+     -out=/tmp/colton-games-control-token-container.tfplan
+   terraform show -no-color /tmp/colton-games-control-token-container.tfplan
+   terraform apply /tmp/colton-games-control-token-container.tfplan
    aws s3api head-object --bucket ejc3-terraform-state \
      --key aws-infrastructure/terraform.tfstate --region us-west-1 \
      --query VersionId --output text
    ```
 
-   The backend object's `VersionId` must be non-empty and not `null` or `None`. Stop if it
-   is not: do not create a deployment token or repository connection without a verified
-   versioned state write.
+   Require the saved plan to contain only the empty secret container. The backend object's
+   `VersionId` must then be non-empty and not `null` or `None`. Stop if it is not: do not
+   create a deployment token or repository connection without a verified versioned state
+   write.
 4. Keep both gates false and return to a full saved plan:
 
    ```bash

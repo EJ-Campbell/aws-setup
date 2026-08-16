@@ -347,8 +347,8 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
 - Each server runs as `ndev@<user>.service`; agents run as `claude-rc@` and `codex-rc@`.
   All are enabled at boot -- a reboot restores every URL with nobody logged in
 - `cloudflare.tf` holds the tunnel, wildcard DNS, Access app and policies. A service token
-  (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access. It
-  also owns the account Workers subdomain and Colton Games Builds configuration
+  (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access.
+  Terraform also owns the account Workers subdomain and Colton Games Builds configuration
 - The kids have **full passwordless sudo**. The instance is the sandbox: no inbound web
   ports. Its IAM role reads one S3 object and two secrets, can describe instances for hop
   aliases, and has the scoped `DevEBS=true` temporary-volume policy. Don't re-narrow it
