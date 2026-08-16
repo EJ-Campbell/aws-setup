@@ -154,6 +154,75 @@ chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
 # Keep the old path working for anything that still references it.
 ln -sf /etc/cloudflared/creds-cc-games.dev.json /etc/cloudflared/credentials.json
 
+# ------------------------------------------------------------- cloudwatch agent
+# Memory is the constraint on this box and CloudWatch does not collect it by default. When
+# the box fell over we had to INFER memory pressure from VolumeReadBytes, because no memory
+# or swap metric existed. This publishes mem_used_percent and swap_used_percent so the
+# leading indicator is visible instead of the consequence.
+if ! systemctl is-active --quiet amazon-cloudwatch-agent 2>/dev/null; then
+  CWA_ARCH=arm64
+  case "$(uname -m)" in x86_64) CWA_ARCH=amd64 ;; esac
+  CWA_TMP=$(mktemp /tmp/cwagent.XXXXXX.deb)
+  if curl -fsSL --retry 3 \
+    "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/$CWA_ARCH/latest/amazon-cloudwatch-agent.deb" \
+    -o "$CWA_TMP" && [ -s "$CWA_TMP" ]; then
+    dpkg -i "$CWA_TMP" >/dev/null 2>&1 || apt-get install -y -f >/dev/null 2>&1
+    mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWACONF'
+{
+  "agent": { "metrics_collection_interval": 60 },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": { "InstanceId": "$${aws:InstanceId}" },
+    "aggregation_dimensions": [["InstanceId"]],
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent", "mem_available"], "metrics_collection_interval": 60 },
+      "swap": { "measurement": ["swap_used_percent"], "metrics_collection_interval": 60 }
+    }
+  }
+}
+CWACONF
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s >/dev/null 2>&1 \
+      || echo "WARNING: cloudwatch agent installed but did not start"
+  else
+    echo "WARNING: could not download the cloudwatch agent; memory stays invisible"
+  fi
+  rm -f "$CWA_TMP"
+fi
+
+# ---------------------------------------------------------------------- ssm agent
+# The out-of-band way in. sshd on this box once stopped completing its handshake under load,
+# and there was no second channel: no way to read the load average, name the runaway, or
+# even tell whether the machine was alive.
+#
+# The agent was NOT missing -- Ubuntu's AMI ships it as a SNAP, running as
+# snap.amazon-ssm-agent.amazon-ssm-agent.service. Two things hid that:
+#   * `systemctl is-active amazon-ssm-agent` reports inactive, because that unit name does
+#     not exist on a snap install.
+#   * installing the .deb does not "fix" it -- the package preinst refuses outright
+#     ("installed in this instance by snap, please use snap") and exits 1.
+# What was actually missing was AmazonSSMManagedInstanceCore on the instance role, so the
+# agent ran for weeks and could never register. That is in nextjs-dev.tf.
+if snap list amazon-ssm-agent >/dev/null 2>&1; then
+  systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service >/dev/null 2>&1 \
+    || echo "WARNING: snap ssm agent present but would not start"
+elif ! systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+  SSM_ARCH=arm64
+  case "$(uname -m)" in x86_64) SSM_ARCH=amd64 ;; esac
+  SSM_TMP=$(mktemp /tmp/ssm-agent.XXXXXX.deb)
+  if curl -fsSL --retry 3 \
+    "https://s3.us-east-1.amazonaws.com/amazon-ssm-us-east-1/latest/debian_$SSM_ARCH/amazon-ssm-agent.deb" \
+    -o "$SSM_TMP" && [ -s "$SSM_TMP" ]; then
+    dpkg -i "$SSM_TMP" || apt-get install -y -f
+    systemctl enable --now amazon-ssm-agent >/dev/null 2>&1 \
+      || echo "WARNING: amazon-ssm-agent installed but did not start"
+  else
+    echo "WARNING: could not download amazon-ssm-agent; this host stays ssh-only"
+  fi
+  rm -f "$SSM_TMP"
+fi
+
 # ------------------------------------------------------------ setup self-update
 # Terraform publishing this script to S3 does NOT reach a running box: the instance's
 # user_data has ignore_changes, so it is read exactly once, at first boot. Every change
@@ -244,6 +313,105 @@ systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
 # that is executing right now.
 mkdir -p /var/lib/nextjs-setup
 aws s3api head-object --bucket ejc3-dev-scripts --key user-data/nextjs.sh --region us-west-1   --query ETag --output text 2>/dev/null > /var/lib/nextjs-setup/applied-etag || true
+
+# --------------------------------------------------- remote control: ensure it took
+# Remote Control is bound to the CONVERSATION, not the process. Resuming one -- which an
+# unattended launcher must do, or the user loses their work -- replays the RC session id
+# recorded in that transcript. If the process that owned it is gone (a crash, an OOM, a
+# restart) the reconnect fails and the session runs with no remote control at all. Retrying
+# /remote-control cannot help: it only ever attempts the same doomed RECONNECT.
+#
+# The fix is what the TUI offers: disconnect the dead binding, then enable a fresh one --
+# which keeps the conversation AND gets a working connection.
+cat > /usr/local/bin/claude-rc-ensure <<'RCENSURE'
+#!/bin/bash
+# claude-rc-ensure <user> -- ensure this user's session really has Remote Control.
+# Safe to run repeatedly: it does nothing when /rc is already active.
+set -uo pipefail
+WHO="$${1:?usage: claude-rc-ensure <user>}"
+H="/home/$WHO"
+tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
+win=$(tm list-windows -a -F '#{window_id}' | head -1)
+[ -n "$win" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
+pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
+pane() { tm capture-pane -p -t "$win"; }
+
+for attempt in 1 2 3; do
+  case "$(pane)" in
+    *"/rc active"*) echo "claude-rc-ensure: $WHO active"; exit 0 ;;
+  esac
+  # An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
+  case "$(pane)" in
+    *"Session creation failed"*) echo "claude-rc-ensure: $WHO upstream 503, leaving alone"; exit 0 ;;
+  esac
+  echo "claude-rc-ensure: $WHO attempt $attempt -- dropping the stale binding"
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  # Menu: Disconnect this session / Show QR code / Continue (Continue preselected).
+  tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
+  # Re-enable. That menu is numbered: 1. Enable Remote Control / 2. Never mind.
+  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
+done
+case "$(pane)" in
+  *"/rc active"*) echo "claude-rc-ensure: $WHO active" ;;
+  *) echo "claude-rc-ensure: $WHO still unreachable after 3 attempts" >&2 ;;
+esac
+RCENSURE
+chmod 755 /usr/local/bin/claude-rc-ensure
+
+# ------------------------------------------------------- remote-control watchdog
+# Remote Control wedges without the session dying: the pane still works, the footer says
+# "/rc failed", and the phone can no longer drive it. This never restarts a unit and never
+# kills tmux -- it delegates to claude-rc-ensure, which repairs the binding in place.
+cat > /usr/local/bin/claude-rc-watchdog <<'RCWD'
+#!/bin/bash
+set -uo pipefail
+STATE=/var/lib/claude-rc-watchdog
+mkdir -p "$STATE"
+for u in ${join(" ", local.nextjs_users)}; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  pgrep -u "$u" -x claude >/dev/null 2>&1 || continue
+  win=$(sudo -u "$u" -H env HOME="/home/$u" tmux list-windows -a -F '#{window_id}' 2>/dev/null | head -1)
+  [ -n "$win" ] || continue
+  pane=$(sudo -u "$u" -H env HOME="/home/$u" tmux capture-pane -p -t "$win" 2>/dev/null)
+  case "$pane" in
+    *"/rc failed"*|*"Remote Control disconnected"*) ;;
+    *) rm -f "$STATE/$u.fails"; continue ;;
+  esac
+  fails=$(cat "$STATE/$u.fails" 2>/dev/null || echo 0)
+  fails=$((fails + 1))
+  echo "$fails" > "$STATE/$u.fails"
+  # Back off: every tick at first, then every 6th, so a long upstream outage does not mean
+  # typing into someone's prompt every ten minutes for hours.
+  if [ "$fails" -le 3 ] || [ $((fails % 6)) -eq 0 ]; then
+    /usr/local/bin/claude-rc-ensure "$u" || true
+  fi
+done
+RCWD
+chmod 755 /usr/local/bin/claude-rc-watchdog
+
+cat > /etc/systemd/system/claude-rc-watchdog.service <<'RCWDSVC'
+[Unit]
+Description=Repair Claude Remote Control when a session reports it failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/claude-rc-watchdog
+RCWDSVC
+
+cat > /etc/systemd/system/claude-rc-watchdog.timer <<'RCWDTIMER'
+[Unit]
+Description=Check for wedged Claude Remote Control sessions
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+RCWDTIMER
+systemctl daemon-reload
+systemctl enable --now claude-rc-watchdog.timer >/dev/null 2>&1 || true
 
 # --------------------------------------------------------- agent enable watcher
 # The units above are enabled only when a user's credentials already exist, and that check
@@ -646,9 +814,21 @@ WORKDIR="$(/usr/local/bin/agent-dir "$WHO")"
 zsh -c "
   source ~/.config/t-claude.zsh 2>/dev/null || { echo 'agents-start: t-claude.zsh missing' >&2; exit 1; }
   cd '$WORKDIR' || exit 1
-  t-claude --remote-control
+  # --auto is REQUIRED for an unattended launcher. Without it t-claude takes the interactive
+  # path, `claude --resume`, which renders the session PICKER as soon as the user has any
+  # transcript -- and a picker waits for a keypress systemd will never send. The window then
+  # sits there with no claude running, so remote control has nothing to attach to. --auto
+  # resolves to `claude --continue` when transcripts exist, plain `claude` when they do not.
+  t-claude --auto --remote-control
 "
 echo "agents-start: t-claude invoked for $WHO in $WORKDIR"
+
+# Durability at LAUNCH, not by later detection. --auto resumes the user's conversation, and a
+# resumed conversation carries a Remote Control binding that is dead whenever the process that
+# owned it is gone. Handing that over "started but unreachable" is how the user finds out on
+# their phone. Give claude a moment to render, then repair before reporting success.
+sleep 20
+/usr/local/bin/claude-rc-ensure "$WHO" || true
 AGENTS
 chmod 755 /usr/local/bin/agents-start
 
