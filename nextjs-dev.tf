@@ -29,9 +29,13 @@ variable "enable_nextjs_dev" {
 }
 
 variable "nextjs_instance_type" {
-  description = "t4g.medium: 2 vCPU / 4GB Graviton, burstable. Holds two `next dev` processes plus Claude and Codex per kid; the 4GB swapfile absorbs compile spikes."
+  description = "t4g.large: 2 vCPU / 8GB Graviton, burstable. Four accounts, each with a `next dev` plus Claude and Codex; the 4GB swapfile absorbs compile spikes rather than carrying steady state."
   type        = string
-  default     = "t4g.medium"
+  # 8GB, raised from t4g.medium (4GB) on 2026-08-16. At 4GB the kernel paged to /swapfile,
+  # swap-in reads pinned the root volume at its 125MB/s ceiling, and with the disk saturated
+  # sshd could not complete a handshake and BOTH cloudflared tunnels dropped to zero
+  # connections. A session then hit the OOM killer at a 6.7GB peak.
+  default = "t4g.large"
 }
 
 variable "nextjs_volume_size" {
@@ -57,6 +61,15 @@ resource "aws_iam_role" "nextjs_dev" {
     }]
   })
   tags = { Name = "nextjs-dev-role" }
+}
+
+# SSM on every host, without exception. When sshd stopped completing its handshake on this
+# box there was no second way in: no way to read load, kill a runaway, or even confirm what
+# was wrong. The agent was already running (Ubuntu ships it as a snap) -- this policy is the
+# piece that was missing, so it could never register.
+resource "aws_iam_role_policy_attachment" "nextjs_dev_ssm" {
+  role       = aws_iam_role.nextjs_dev.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "nextjs_dev" {

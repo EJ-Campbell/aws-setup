@@ -156,6 +156,12 @@ resource "aws_iam_role" "dev_ebs_only" {
   tags = { Name = "dev-ebs-only-role" }
 }
 
+# Same reason as nextjs-dev: no host should be reachable only over ssh.
+resource "aws_iam_role_policy_attachment" "dev_ebs_only_ssm" {
+  role       = aws_iam_role.dev_ebs_only.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 resource "aws_iam_role_policy" "dev_ebs_only" {
   name   = "dev-ebs-volume-access"
   role   = aws_iam_role.dev_ebs_only.id
