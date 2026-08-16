@@ -245,6 +245,12 @@ command -v atuin >/dev/null && eval "$(atuin init zsh)"
 [ -f ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source ~/.zsh/zsh-autosuggestions/zsh-autosuggestions.zsh
 [ -f ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source ~/.zsh/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 alias ll="ls -la" gs="git status" gd="git diff"
+# Remote control on EVERY session, not just the managed one. agents-start passes
+# --remote-control explicitly, so without this the first session a person starts -- the one
+# they log in with -- is the only one that is NOT reachable, and t-claude will not repair it
+# later: a live claude is selected, never relaunched. t-claude merges TCLAUDE_ARGS into each
+# launch and explicit arguments win, so agents-start does not end up passing it twice.
+export TCLAUDE_ARGS="--remote-control"
 [ -f ~/.config/t-claude.zsh ] && source ~/.config/t-claude.zsh
 ZSH
 cat > ~/.tmux.conf << 'TMUXCONF'
