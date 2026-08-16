@@ -253,11 +253,17 @@ cat > /usr/local/bin/agents-enable <<'AGENTSENABLE'
 set -uo pipefail
 for u in ${join(" ", local.nextjs_users)}; do
   id -u "$u" >/dev/null 2>&1 || continue
+  # Enable and start are checked SEPARATELY. `enable --now` can enable the unit and still
+  # fail to start it -- remote control not up yet, say -- and after that `is-enabled` is
+  # true forever, so a watcher keyed on it would never retry the start and the agent would
+  # stay down until someone noticed. Keyed on is-active, this converges on the next tick.
   if [ -s "/home/$u/.claude/.credentials.json" ]; then
-    systemctl is-enabled "claude-rc@$u.service" >/dev/null 2>&1       || systemctl enable --now "claude-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl enable "claude-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "claude-rc@$u.service"       || systemctl start "claude-rc@$u.service" >/dev/null 2>&1 || true
   fi
   if [ -s "/home/$u/.codex/auth.json" ]; then
-    systemctl is-enabled "codex-rc@$u.service" >/dev/null 2>&1       || systemctl enable --now "codex-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "codex-rc@$u.service"       || systemctl start "codex-rc@$u.service" >/dev/null 2>&1 || true
   fi
 done
 AGENTSENABLE
