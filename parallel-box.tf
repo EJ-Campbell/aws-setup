@@ -17,23 +17,15 @@
 # 512 vCPU of both spot and on-demand quota. EBS is AZ-locked, so the volume pins the
 # AZ -- deliberately, since AZ-roaming would require a slow snapshot restore on boot.
 #
-# LIFECYCLE: the VOLUME always exists (cheap: 100GB gp3 ~= $8/month). The INSTANCE only
-# exists while enable_parallel_box = true. Bring it up and down with:
-#     scripts/parallel-box.sh up | down | status | ssh
+# LIFECYCLE: this file holds only what is DURABLE -- the volume (cheap: 100GB gp3 ~=
+# $8/month), the security group and the key pair. The INSTANCE is not terraform's; it is
+# launched from the launch template in parallel-box-launch.tf by scripts/parallel-box.sh
+# and terminated either by that script or by the idle watchdog. Read the header of
+# parallel-box-launch.tf for why the launch moved out of terraform.
+#
+#     scripts/parallel-box.sh up | down | status | ssh      (or `pbox ...` on a dev box)
 #
 # COST: the instance is the expensive part (~$3.14/hr). Down means $0 compute.
-
-variable "enable_parallel_box" {
-  description = "Run the 192-core Graviton spot box. ~$3.14/hr while up. Use scripts/parallel-box.sh."
-  type        = bool
-  default     = false
-}
-
-variable "parallel_box_type" {
-  description = "Instance type. Must be arm64 and offered in the volume's AZ. scripts/parallel-box.sh overrides this per attempt, walking a list of pools until one has spot capacity."
-  type        = string
-  default     = "c8g.48xlarge" # 192 cores / 384GB
-}
 
 variable "parallel_box_az" {
   description = "AZ for the box AND its persistent volume. Changing this strands the volume."
@@ -121,133 +113,6 @@ resource "aws_security_group" "parallel_box" {
   lifecycle {
     create_before_destroy = true
   }
-}
-
-resource "aws_instance" "parallel_box" {
-  provider = aws.west2
-  count    = var.enable_parallel_box ? 1 : 0
-
-  ami           = var.parallel_box_ami # Ubuntu 24.04 arm64, us-west-2
-  instance_type = var.parallel_box_type
-  key_name      = aws_key_pair.parallel_box.key_name
-
-  availability_zone      = var.parallel_box_az
-  subnet_id              = "subnet-095349c0fcef8c47f" # default VPC, us-west-2d
-  vpc_security_group_ids = [aws_security_group.parallel_box.id]
-  iam_instance_profile   = aws_iam_instance_profile.dev_ebs_only.name
-
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      # Interruption is survivable: all work lives on the persistent volume, which is
-      # detached rather than destroyed. Terminate (not stop) keeps this simple -- there
-      # is no state on the root disk worth preserving.
-      spot_instance_type             = "one-time"
-      instance_interruption_behavior = "terminate"
-    }
-  }
-
-  # Root is DISPOSABLE and recreated on every launch. Anything you care about belongs
-  # on /mnt/work, which is the persistent volume.
-  root_block_device {
-    volume_size           = 30
-    volume_type           = "gp3"
-    delete_on_termination = true
-  }
-
-  user_data = <<-INIT
-    #!/bin/bash
-    set -uxo pipefail
-
-    # Authorize the dev-hop key (dev-hop-key.tf) for direct login. This box is launched
-    # and used from a dev box (fcvm-metal-arm/x86), which holds no key to the jumpbox and
-    # no fcvm-ec2 key at all (dev-hop-key.tf) -- dev_hop is the ONLY key those boxes carry
-    # that reaches another host, so it has to be what this box trusts too.
-    install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
-    touch /home/ubuntu/.ssh/authorized_keys
-    grep -qxF "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" /home/ubuntu/.ssh/authorized_keys || \
-      echo "${trimspace(tls_private_key.dev_hop.public_key_openssh)}" >> /home/ubuntu/.ssh/authorized_keys
-    chmod 600 /home/ubuntu/.ssh/authorized_keys
-    chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
-
-    # Mount the persistent work volume.
-    #
-    # SAFETY: this must never reformat a disk that already holds data, and must never
-    # touch the wrong disk. Two guards:
-    #   1. Find the device by matching the EBS volume ID against the NVMe serial, rather
-    #      than guessing /dev/nvme1n1 -- device order is not stable on Nitro.
-    #   2. Only mkfs when blkid reports NO filesystem at all. No -f, ever.
-    VOL_ID="${aws_ebs_volume.parallel_work.id}"
-    SERIAL=$(echo "$VOL_ID" | tr -d '-')
-
-    DEV=""
-    for _ in $(seq 1 30); do
-      DEV=$(lsblk -dn -o NAME,SERIAL 2>/dev/null | awk -v s="$SERIAL" '$2==s {print $1}' | head -1)
-      [ -n "$DEV" ] && break
-      sleep 2
-    done
-
-    if [ -z "$DEV" ]; then
-      echo "FATAL: could not find the EBS volume $VOL_ID by serial; refusing to format anything" >&2
-      exit 1
-    fi
-    DEV="/dev/$DEV"
-
-    if ! blkid "$DEV" >/dev/null 2>&1; then
-      echo "no filesystem on $DEV (first use) -- creating ext4"
-      mkfs.ext4 -L parallel-work "$DEV"
-    else
-      echo "$DEV already has a filesystem -- mounting as-is, NOT formatting"
-    fi
-
-    mkdir -p /mnt/work
-    mount "$DEV" /mnt/work
-    chown ubuntu:ubuntu /mnt/work
-    grep -q "$DEV" /etc/fstab || echo "$DEV /mnt/work ext4 defaults,nofail 0 2" >> /etc/fstab
-
-    # Parallel-work basics. GNU parallel is the usual driver for this shape of job.
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y parallel build-essential git htop
-
-    # Shared bulk scratch/cache on the separate i8ge I/O box. This is an automount, so
-    # the parallel box still boots cleanly when the I/O box is stopped.
-    ${local.io_box_client_setup}
-
-    # Raise the file-descriptor ceiling: 192-way fan-out hits the 1024 default fast.
-    echo "* soft nofile 1048576" >> /etc/security/limits.conf
-    echo "* hard nofile 1048576" >> /etc/security/limits.conf
-
-    echo "parallel-box ready: $(nproc) cores, /mnt/work mounted"
-  INIT
-
-  tags = {
-    Name    = "parallel-box"
-    Purpose = "on-demand embarrassingly-parallel compute"
-    DevEBS  = "true"
-  }
-
-  lifecycle {
-    # The root is disposable and a live run must never be stopped just because its
-    # next-launch bootstrap changed. count=0 -> 1 still uses the newest user_data.
-    ignore_changes = [user_data]
-  }
-}
-
-resource "aws_volume_attachment" "parallel_work" {
-  provider    = aws.west2
-  count       = var.enable_parallel_box ? 1 : 0
-  device_name = "/dev/sdf"
-  volume_id   = aws_ebs_volume.parallel_work.id
-  instance_id = aws_instance.parallel_box[0].id
-
-  # Detach cleanly when the box goes away; the VOLUME itself is untouched.
-  force_detach = true
-}
-
-output "parallel_box_ssh" {
-  description = "SSH command for the on-demand parallel box"
-  value       = var.enable_parallel_box ? "ssh -i ~/.ssh/fcvm-ec2 ubuntu@${aws_instance.parallel_box[0].public_ip}" : "down (scripts/parallel-box.sh up)"
 }
 
 output "parallel_box_work_volume" {

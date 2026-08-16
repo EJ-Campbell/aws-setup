@@ -178,77 +178,20 @@ systemctl start et-update.timer >/dev/null 2>&1 || true
   EOT
 
   # ---------------------------------------------------------------------------
-  # `pbox` -- "I want it" / "I don't" for the on-demand 192-core Graviton box.
+  # `pbox` -- "I want it" / "I don't" for the on-demand 192-core Graviton boxes.
   #
-  # Dev boxes deliberately hold a restricted IAM role with NO ec2:RunInstances, and
-  # terraform state lives on the jumpbox. So this does not launch anything itself: it
-  # delegates the terraform half to the jumpbox over SSH, then drops you onto the new
-  # machine. Keeps dev-box permissions unchanged.
+  # This installs scripts/parallel-box.sh ITSELF rather than a wrapper around it. There
+  # used to be two implementations: the repo script (run on the jumpbox) and a thin
+  # `pbox` that SSHed to the jumpbox to invoke it. Now that a dev box launches the boxes
+  # directly, a wrapper would just be a second copy of the same logic, drifting from the
+  # first. base64 is what keeps this honest -- the script is embedded verbatim, so
+  # terraform cannot interpolate or mangle the shell it contains.
   # ---------------------------------------------------------------------------
   pbox_setup = <<-EOT
-cat > /usr/local/bin/pbox <<'PBOX'
-#!/bin/bash
-# On-demand 192-core Graviton boxes (c8g.48xlarge, ~$3.14/hr spot). There are TWO
-# (parallel-box.tf, parallel-box2.tf), each with its own persistent work disk, so two
-# jobs can run at once.
-#
-#   pbox up [2]     launch box 1 (or 2) and ssh over    ("I want it")
-#   pbox up [2] kvm launch on METAL pools: /dev/kvm for hypervisor workloads
-#                   (fcvm/firecracker). Metal boots in many minutes -- be patient.
-#   pbox down [2]   terminate it                        ("I don't")
-#   pbox ssh [2]    reconnect to a running box
-#   pbox status     both boxes: running? cost? disk?
-#
-# Work lives on /mnt/work -- a persistent 100GB volume (per box) that survives every
-# up/down and every spot interruption. The root disk does not; treat it as scratch.
-#
-# An idle watchdog terminates either box automatically after 30 min below 5% CPU,
-# because each costs roughly 50x a dev box per hour. Losing one costs nothing: its
-# /mnt/work persists.
-#
-# Two different keys, deliberately: JUMPBOX_KEY is forced-command-only on the jumpbox
-# side (pbox-key.tf) and can do nothing there but run parallel-box.sh -- this box holds
-# no key capable of an admin shell on the jumpbox (see dev-hop-key.tf for why). KEY
-# (dev_hop) is what the parallel boxes' own authorized_keys trust for the direct hop
-# once one is up.
-set -euo pipefail
-JUMPBOX=10.0.1.72
-JUMPBOX_KEY="$HOME/.ssh/pbox"
-KEY="$HOME/.ssh/dev_hop"
-JB() { ssh -i "$JUMPBOX_KEY" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "ubuntu@$JUMPBOX" "$*"; }
-
-C="$${1:-status}"
-N="$${2:-}"
-M="$${3:-}"
-# "pbox up kvm" is shorthand for box 1 in kvm mode. N must become an explicit
-# "1": an empty N would send "up  kvm", which the forced command word-splits so
-# parallel-box.sh sees kvm as the BOX argument and rejects it.
-if [ "$N" = "kvm" ]; then M="kvm"; N=1; fi
-case "$N" in ""|1|2) ;; *) echo "unknown box '$N' (use 1 or 2)" >&2; exit 1;; esac
-case "$M" in ""|kvm) ;; *) echo "unknown mode '$M' (only 'kvm')" >&2; exit 1;; esac
-
-case "$C" in
-  up|want)
-    JB "up $N$${M:+ $M}"
-    IP="$(JB "ip $N")"
-    [ -n "$IP" ] || { echo "box did not come up; try: pbox status" >&2; exit 1; }
-    echo "Connecting to $IP (work disk at /mnt/work)..."
-    exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
-    ;;
-  down|dont|stop)
-    JB "down $N"
-    ;;
-  ssh)
-    IP="$(JB "ip $N")"
-    [ -n "$IP" ] || { echo "Box is down. Run: pbox up $N" >&2; exit 1; }
-    exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"
-    ;;
-  status|*)
-    JB "status $N"
-    ;;
-esac
-PBOX
-chmod +x /usr/local/bin/pbox
+base64 -d > /usr/local/bin/pbox <<'PBOXB64'
+${base64encode(file("${path.module}/scripts/parallel-box.sh"))}
+PBOXB64
+chmod 755 /usr/local/bin/pbox
   EOT
 
   # ---------------------------------------------------------------------------

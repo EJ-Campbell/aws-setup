@@ -1285,6 +1285,31 @@ command -v vercel >/dev/null 2>&1 || npm install -g vercel >/dev/null 2>&1 || ec
 # /home/ubuntu anyway since it is 0700.
 ${local.dev_hop_setup}
 
+# ---------------------------------------------------------------- pbox
+# The on-demand 192-core Graviton boxes, launched straight from here. No jumpbox is
+# involved: this box's instance role carries the tag-scoped parallel-box-control policy
+# (parallel-box-launch.tf), so `pbox up` calls ec2:RunInstances itself.
+#
+# BE HONEST ABOUT WHO THIS GIVES IT TO. An instance-role grant is a BOX-wide grant, and
+# every account here has full passwordless sudo, so colton, connor and skevh can launch
+# one exactly as ejc3 can -- no arrangement of key files changes that. What bounds it is
+# the policy (only these two tagged boxes, only the dev-ebs-only role, no other instance
+# reachable) and parallel-box-watchdog.tf, which terminates an idle box after 30 minutes.
+# The exposure is therefore cost, not access, and it is capped.
+${local.pbox_setup}
+
+# ejc3's copy of the hop key. dev_hop_setup above installs it for `ubuntu` only, and
+# /home/ubuntu is 0700 -- but `pbox up` ends by SSHing to the new box as the invoking
+# user, so without this ejc3 could launch a box and then not reach it.
+#
+# This is convenience, NOT isolation: with full sudo on this box any account can already
+# read the ubuntu copy. It is deliberately not installed for colton, connor or skevh
+# because nothing they do needs it, not because it would stop them.
+if [ -f /home/ubuntu/.ssh/dev_hop ] && id ejc3 >/dev/null 2>&1; then
+  install -d -m 700 -o ejc3 -g ejc3 /home/ejc3/.ssh
+  install -m 600 -o ejc3 -g ejc3 /home/ubuntu/.ssh/dev_hop /home/ejc3/.ssh/dev_hop
+fi
+
 # Private NFSv4 automount for the shared us-west-2 NVMe scratch box.
 ${local.io_box_client_setup}
 
