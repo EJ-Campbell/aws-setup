@@ -154,10 +154,12 @@ account-level authority (it can mint any token), so it belongs in Secrets Manage
 
 AWS infrastructure for a personal development fleet: two administration jumpboxes, two
 Firecracker metal servers, a Next.js box behind Cloudflare Access, ephemeral shared I/O
-and burst compute, autoscaled GitHub runners, and recovery/monitoring infrastructure.
+and burst compute, autoscaled GitHub runners, Workers Builds-backed previews, and
+recovery/monitoring infrastructure.
 
-- Terraform infrastructure-as-code, S3 backend (`ejc3-terraform-state`) + DynamoDB locks
-- Roughly 185 managed resources across `us-west-1`, `us-west-2`, `us-east-1`, the isolated
+- Terraform infrastructure-as-code, versioned S3 backend (`ejc3-terraform-state`) +
+  DynamoDB locks
+- Roughly 195 managed resources across `us-west-1`, `us-west-2`, `us-east-1`, the isolated
   staging account, and Cloudflare
 - No Aurora, and no database of any kind -- that was removed; ignore older references
 
@@ -185,6 +187,11 @@ not drift apart.
 Terraform runs directly on the jumpbox, against the S3 backend with DynamoDB locking. The
 instance role supplies credentials, so there is no login step and nothing to auto-refresh.
 Keep `.terraform.lock.hcl` tracked so both admin boxes resolve the same providers.
+`main.tf` enforces Terraform 1.10.3 because the Workers Builds control token uses an
+ephemeral resource. Bump that constraint, both jumpboxes, and the drift workflow together.
+When the exact Cloudflare fork pin advances, use targeted `terraform providers lock` for
+`registry.terraform.io/ejc3/cloudflare`, then `terraform init -lockfile=readonly`; never use
+broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 
 ### Cost notes
 
@@ -198,10 +205,10 @@ Keep `.terraform.lock.hcl` tracked so both admin boxes resolve the same provider
 
 ```
 .
-├── main.tf                         # Providers, backend, and primary network
+├── main.tf                         # Providers, protected backend, and primary network
 ├── variables.tf                    # Opinionated variables and defaults
 ├── firecracker-dev.tf/x86-dev.tf   # Persistent Spot metal boxes
-├── nextjs-dev.tf/cloudflare.tf      # Kids' environment and private ingress
+├── nextjs-dev.tf/cloudflare.tf      # Kids' environment, Access, and Workers Builds
 ├── io-box.tf/parallel-box.tf        # Ephemeral I/O and burst compute
 ├── runner-autoscale.tf              # Disposable GitHub runners
 ├── .terraform.lock.hcl              # Shared provider selections
@@ -239,6 +246,36 @@ working personal login with a bootstrap token.
 
 **Cold-bootstrap inputs**: Some secrets, backend resources, and device logins necessarily
 pre-exist Terraform. Keep the exact prerequisite list and login sequence in `README.md`.
+
+**Workers Builds credential boundary**: its control API requires a user-owned Cloudflare
+token; the existing account-owned `cloudflare-tunnel-token` cannot be reused. Terraform
+manages only the `cloudflare-workers-builds-control-token` container and reads its payload
+ephemerally, so the value is not stored in state. At
+[Create Additional Tokens](https://dash.cloudflare.com/profile/api-tokens), choose **Use
+template** because Custom Token cannot grant API Tokens Edit. Retain User → API Tokens →
+Edit (API name: API Tokens Write) and add Workers Builds Configuration Edit plus Workers
+Scripts Read for account `12ea67fb7ced068de03f35c22688e436`. Terraform then mints the
+narrower Workers Scripts Write deploy token. Start the GitHub connection in Cloudflare at
+Workers & Pages → target Worker → Settings → Builds → Connect → GitHub. The `CoderColton`
+repository owner must authorize only `CoderColton/colton-games`; `ejc3` has write, not
+admin, and cannot grant the App. When authorization returns to Cloudflare, stop before
+selecting/saving the repository or any build settings. Terraform owns the connection and
+triggers, and the connection cannot be imported.
+
+**Backend versioning gate**: apply only `aws_s3_bucket_versioning.terraform_state`, verify
+S3 reports `Enabled`, and wait at least 15 minutes. Only then apply the empty control-token
+secret container so that Terraform writes the backend state after propagation. The state
+object's read-only `head-object` result must contain a non-null `VersionId` before any
+deployment token or repository connection is created. With both gates still false, next
+run and apply a full saved plan that contains only the account Workers subdomain/base
+configuration and require an empty follow-up. Follow the exact commands and remaining
+gates in `README.md`; never substitute a manual S3 test-object write.
+
+**Write-only Cloudflare state**: the narrower build-deploy token is returned only once,
+and repository connections have no read/list endpoint or import path. Keep backend
+versioning and every related `prevent_destroy` guard. Never disable the Builds gate after
+these resources exist, and never apply a plan that replaces them without explicit recovery
+intent.
 
 **Drift CI is not currently healthy**: the scheduled workflow lacks Secrets Manager,
 Organizations, and CodeArtifact read access. Secrets Manager is the hardest of the three
@@ -310,10 +347,41 @@ phone -> Cloudflare edge -> Access (Google login, email allowlist) -> tunnel -> 
 - Each server runs as `ndev@<user>.service`; agents run as `claude-rc@` and `codex-rc@`.
   All are enabled at boot -- a reboot restores every URL with nobody logged in
 - `cloudflare.tf` holds the tunnel, wildcard DNS, Access app and policies. A service token
-  (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access
+  (`cc-games-access-service-token` in Secrets Manager) allows non-interactive access. It
+  also owns the account Workers subdomain and Colton Games Builds configuration
 - The kids have **full passwordless sudo**. The instance is the sandbox: no inbound web
   ports. Its IAM role reads one S3 object and two secrets, can describe instances for hop
   aliases, and has the scoped `DevEBS=true` temporary-volume policy. Don't re-narrow it
+
+### Colton Games Workers Builds
+
+The ordinary Cloudflare provider remains authenticated with the account-owned tunnel
+token. Only resources that call user-scoped Workers Builds or API-token endpoints use the
+`cloudflare.workers_builds` alias. Do not broaden that alias to existing tunnel, DNS, or
+Access resources.
+
+The checked-in `colton_games_workers_builds_enabled` gate exists solely for the cold
+bootstrap and must start false. Before changing it, verify signed fork release `5.24.0`,
+the 15-minute backend-versioning wait and non-null state-object `VersionId`, the raw
+dedicated control-token secret, and the repository-only Cloudflare GitHub App grant from
+the `CoderColton` owner. Once the protected repository connection and write-only build
+token exist, do not turn the gate off: the resulting destroys are intentionally blocked.
+
+The Worker and Access application must remain acyclic. Access targets the immutable Worker
+tag from `local.colton_games_worker_id`; it must not reference the Worker resource. The
+Worker explicitly depends on Access and the account subdomain so a later
+`colton_games_worker_urls_enabled = true` cannot expose workers.dev or preview URLs first.
+The repository's Wrangler config enables workers.dev and previews, so the two triggers and
+environment maps use a combined Builds-and-URLs gate. The Builds-only apply may create only
+the deploy token, its registration, and repository connection and must be followed by an
+empty plan. The URLs apply then performs the Worker update and creates both triggers and
+environment maps; their explicit Worker dependency prevents a push race. Require another
+fresh empty plan before testing anything, then test unauthenticated denial and service-token
+access. Cause a `synchronize` event on still-open Colton Games pull request #26 and verify
+its protected immutable preview and branch alias. Only after that succeeds may #26 merge
+to `main` to trigger and verify staging; a preview cannot be tested while previews are
+disabled or after its pull request is already merged. Never turn either gate back off:
+`prevent_destroy` intentionally blocks that rollback.
 
 ### Hopping between dev servers
 

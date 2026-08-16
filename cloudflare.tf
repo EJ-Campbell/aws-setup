@@ -31,6 +31,35 @@ provider "cloudflare" {
   api_token = data.aws_secretsmanager_secret_version.cloudflare_token.secret_string
 }
 
+# Workers Builds rejects account-owned tokens. Its control plane therefore uses a
+# dedicated user-owned token whose payload is populated once, outside Terraform, after
+# this Terraform-managed container exists. The ordinary account token remains the
+# credential for every pre-existing Cloudflare resource in this stack.
+resource "aws_secretsmanager_secret" "cloudflare_workers_builds_control_token" {
+  name                    = "cloudflare-workers-builds-control-token"
+  description             = "User-owned Cloudflare token for Terraform-managed Workers Builds configuration"
+  recovery_window_in_days = 30
+  tags                    = { Name = "cloudflare-workers-builds-control-token", Managed = "terraform" }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+ephemeral "aws_secretsmanager_secret_version" "cloudflare_workers_builds_control_token" {
+  count     = local.colton_games_workers_builds_enabled ? 1 : 0
+  secret_id = aws_secretsmanager_secret.cloudflare_workers_builds_control_token.id
+}
+
+provider "cloudflare" {
+  alias = "workers_builds"
+
+  # While the checked-in rollout gate is off, use the already-valid default credential
+  # so bootstrap plans do not require a not-yet-populated secret version. No resource
+  # talks to a Workers Builds or user-token endpoint until the gate is enabled.
+  api_token = local.colton_games_workers_builds_enabled ? ephemeral.aws_secretsmanager_secret_version.cloudflare_workers_builds_control_token[0].secret_string : data.aws_secretsmanager_secret_version.cloudflare_token.secret_string
+}
+
 variable "cloudflare_account_id" {
   description = "Cloudflare account (Ej.campbell@gmail.com's Account)"
   type        = string
@@ -324,8 +353,30 @@ output "cc_games_urls" {
 # verified; otherwise the first Terraform apply would expose both URL surfaces.
 # ---------------------------------------------------------------------------------
 locals {
-  colton_games_worker_name = "colton-games-stage"
-  colton_games_worker_id   = "72edf31f83e240448fce38bef56104e3"
+  colton_games_worker_name            = "colton-games-stage"
+  colton_games_worker_id              = "72edf31f83e240448fce38bef56104e3"
+  colton_games_github_owner_id        = "250920182"
+  colton_games_github_repository_id   = "1120877379"
+  colton_games_workers_builds_enabled = false
+  colton_games_worker_urls_enabled    = false
+
+  # The repository's Wrangler configuration enables workers.dev and preview URLs. Do not
+  # create an automatic trigger until Terraform has enabled those surfaces behind Access.
+  colton_games_workers_build_triggers_enabled = (
+    local.colton_games_workers_builds_enabled && local.colton_games_worker_urls_enabled
+  )
+}
+
+# The account-wide label is independent of each Worker's URL switches. Owning it here
+# lets the Access boundary exist before this Worker's workers.dev and preview URLs are
+# enabled. Deleting it would break every workers.dev hostname in the account.
+resource "cloudflare_workers_subdomain" "cc_games" {
+  account_id = var.cloudflare_account_id
+  subdomain  = "cc-games"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "cloudflare_worker" "colton_games_stage" {
@@ -333,9 +384,17 @@ resource "cloudflare_worker" "colton_games_stage" {
   name       = local.colton_games_worker_name
 
   subdomain = {
-    enabled          = false
-    previews_enabled = false
+    enabled          = local.colton_games_worker_urls_enabled
+    previews_enabled = local.colton_games_worker_urls_enabled
   }
+
+  # The destination uses the immutable Worker tag below, rather than this resource ID,
+  # to avoid an Access <-> Worker graph cycle. This ordering guarantees both protections
+  # exist before a later one-line rollout enables either public URL surface.
+  depends_on = [
+    cloudflare_workers_subdomain.cc_games,
+    cloudflare_zero_trust_access_application.colton_games_stage,
+  ]
 
   # The Worker already exists and carries an OpenNext deployment. It must be adopted by
   # the import block below; replacement or destruction would sever the staging service.
@@ -364,7 +423,7 @@ resource "cloudflare_zero_trust_access_application" "colton_games_stage" {
   # Worker. Unlike a hostname application, it intentionally has no domain.
   destinations = [{
     type      = "worker"
-    worker_id = cloudflare_worker.colton_games_stage.id
+    worker_id = local.colton_games_worker_id
   }]
 
   policies = [
@@ -382,4 +441,164 @@ resource "cloudflare_zero_trust_access_application" "colton_games_stage" {
 import {
   to = cloudflare_worker.colton_games_stage
   id = "${var.cloudflare_account_id}/${local.colton_games_worker_id}"
+}
+
+# ---------------------------------------------------------------------------------
+# Workers Builds. Cloudflare exposes these account endpoints only to a user-owned
+# control-plane token. That token creates a narrower user-owned deployment token; the
+# latter is registered with Builds and is the only credential available to build jobs.
+# ---------------------------------------------------------------------------------
+data "cloudflare_api_token_permission_groups_list" "workers_scripts_write" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_builds_enabled ? 1 : 0
+  name     = "Workers%20Scripts%20Write"
+}
+
+resource "cloudflare_api_token" "colton_games_build_deploy" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_builds_enabled ? 1 : 0
+  name     = "colton-games-workers-builds-deploy"
+
+  policies = [{
+    effect = "allow"
+    permission_groups = [{
+      id = one(data.cloudflare_api_token_permission_groups_list.workers_scripts_write[0].result).id
+    }]
+    resources = jsonencode({
+      "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*"
+    })
+  }]
+
+  # Cloudflare returns value only at creation. Do not create it until S3 can recover a
+  # prior state version, and never let an unrelated plan revoke the live build token.
+  depends_on = [aws_s3_bucket_versioning.terraform_state]
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_build_token" "colton_games" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_builds_enabled ? 1 : 0
+
+  account_id          = var.cloudflare_account_id
+  build_token_name    = "colton-games-workers-builds-deploy"
+  build_token_secret  = cloudflare_api_token.colton_games_build_deploy[0].value
+  cloudflare_token_id = cloudflare_api_token.colton_games_build_deploy[0].id
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Cloudflare has no read or list endpoint for repository connections, so the provider
+# deliberately preserves the last confirmed state and does not support import. Authorize
+# the GitHub App for only this repository before enabling the rollout gate.
+resource "cloudflare_workers_build_repository_connection" "colton_games" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_builds_enabled ? 1 : 0
+
+  account_id            = var.cloudflare_account_id
+  provider_type         = "github"
+  provider_account_id   = local.colton_games_github_owner_id
+  provider_account_name = "CoderColton"
+  repo_id               = local.colton_games_github_repository_id
+  repo_name             = "colton-games"
+
+  depends_on = [aws_s3_bucket_versioning.terraform_state]
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_build_trigger" "colton_games_staging" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_build_triggers_enabled ? 1 : 0
+
+  account_id                 = var.cloudflare_account_id
+  external_script_id         = local.colton_games_worker_id
+  repository_connection_uuid = cloudflare_workers_build_repository_connection.colton_games[0].id
+  build_token_uuid           = cloudflare_workers_build_token.colton_games[0].id
+  trigger_name               = "Staging from main"
+  build_command              = "npm run cf:build"
+  deploy_command             = "npm run cf:deploy:built"
+  root_directory             = "/"
+  branch_includes            = ["main"]
+  branch_excludes            = []
+  path_includes              = ["*"]
+  path_excludes              = []
+  build_caching_enabled      = true
+
+  depends_on = [cloudflare_worker.colton_games_stage]
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_build_trigger" "colton_games_preview" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_build_triggers_enabled ? 1 : 0
+
+  account_id                 = var.cloudflare_account_id
+  external_script_id         = local.colton_games_worker_id
+  repository_connection_uuid = cloudflare_workers_build_repository_connection.colton_games[0].id
+  build_token_uuid           = cloudflare_workers_build_token.colton_games[0].id
+  trigger_name               = "Pull request previews"
+  build_command              = "npm run cf:build"
+  deploy_command             = "npm run cf:upload:built"
+  root_directory             = "/"
+  branch_includes            = ["*"]
+  branch_excludes            = ["main"]
+  path_includes              = ["*"]
+  path_excludes              = []
+  build_caching_enabled      = true
+
+  depends_on = [cloudflare_worker.colton_games_stage]
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_build_trigger_environment_variables" "colton_games_staging" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_build_triggers_enabled ? 1 : 0
+
+  account_id   = var.cloudflare_account_id
+  trigger_uuid = cloudflare_workers_build_trigger.colton_games_staging[0].id
+  variables = {
+    CLOUDFLARE_ACCOUNT_ID = {
+      value     = var.cloudflare_account_id
+      is_secret = false
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "cloudflare_workers_build_trigger_environment_variables" "colton_games_preview" {
+  provider = cloudflare.workers_builds
+  count    = local.colton_games_workers_build_triggers_enabled ? 1 : 0
+
+  account_id   = var.cloudflare_account_id
+  trigger_uuid = cloudflare_workers_build_trigger.colton_games_preview[0].id
+  variables = {
+    CLOUDFLARE_ACCOUNT_ID = {
+      value     = var.cloudflare_account_id
+      is_secret = false
+    }
+    WRANGLER_CI_GENERATE_PREVIEW_ALIAS = {
+      value     = "true"
+      is_secret = false
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
