@@ -11,7 +11,7 @@ locals {
 # immutable copy for systemd so a failed refresh of the interactive copy cannot silently
 # turn `--remote-control` into an ordinary Claude session.
 install -d -m 755 /usr/local/lib/fcvm
-TCLAUDE_COMMIT=bf4259ed3c4b86ff580ee34f55199877c0adb0f3
+TCLAUDE_COMMIT=8ecd040fc2b6a85b52018cf1d42d681602985d46
 TCLAUDE_SHA256=5f32a138c50ffcc99609f30397c04963c6b538bfbf07a4cd9dc0f32fcdbb1b88
 TCLAUDE_PINNED=/usr/local/lib/fcvm/t-claude.zsh
 TCLAUDE_TMP=$(mktemp)
