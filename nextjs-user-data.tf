@@ -99,7 +99,11 @@ set -uxo pipefail
 # ---------------------------------------------------------------- base packages
 export DEBIAN_FRONTEND=noninteractive
 apt-get update || true
-apt-get install -y curl git build-essential zsh jq unzip || echo "WARNING: some packages failed"
+# python3-venv is here because Ubuntu ships `venv` without `ensurepip`, so `python3 -m venv`
+# fails on a stock image with an error that reads like a Python bug rather than a missing
+# package. dolphin-labs' data pipeline is the first thing a new person runs, and it starts
+# with exactly that command.
+apt-get install -y curl git build-essential zsh jq unzip python3-venv || echo "WARNING: some packages failed"
 # No awscli apt package on Ubuntu 24.04 -- use the official installer.
 if ! command -v aws >/dev/null 2>&1; then
   curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
@@ -146,6 +150,190 @@ chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
 
 # Keep the old path working for anything that still references it.
 ln -sf /etc/cloudflared/creds-cc-games.dev.json /etc/cloudflared/credentials.json
+
+# ------------------------------------------------------------ setup self-update
+# Terraform publishing this script to S3 does NOT reach a running box: the instance's
+# user_data has ignore_changes, so it is read exactly once, at first boot. Every change
+# therefore needed someone to SSH in and re-run it by hand -- and the times nobody did are
+# how a stale copy once recreated a deleted account.
+#
+# This closes that gap, with three guards, because a script that runs unattended on the box
+# that hosts everyone's work deserves them:
+#   1. Only acts when the object's ETag actually changes, so it is a no-op almost always.
+#   2. Refuses to run a script that fails `bash -n` -- a half-written publish cannot brick
+#      the box, it just leaves the previous version in place and says so.
+#   3. Checks the units that matter afterwards and logs loudly if any died, so a bad change
+#      surfaces in `journalctl -u setup-sync` instead of as a mystery outage tomorrow.
+cat > /usr/local/bin/setup-sync <<'SETUPSYNC'
+#!/bin/bash
+set -uo pipefail
+BUCKET=ejc3-dev-scripts
+KEY=user-data/nextjs.sh
+STATE=/var/lib/nextjs-setup
+mkdir -p "$STATE"
+
+ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region us-west-1          --query ETag --output text 2>/dev/null)
+[ -n "$ETAG" ] || { echo "setup-sync: cannot reach s3://$BUCKET/$KEY"; exit 0; }
+[ "$ETAG" = "$(cat "$STATE/applied-etag" 2>/dev/null)" ] && exit 0
+
+echo "setup-sync: new script published (etag $ETAG), fetching"
+NEXT=$(mktemp /tmp/nextjs-setup.XXXXXX.sh)
+trap 'rm -f "$NEXT"' EXIT
+aws s3 cp "s3://$BUCKET/$KEY" "$NEXT" --region us-west-1 >/dev/null 2>&1   || { echo "setup-sync: download failed, keeping current setup"; exit 0; }
+
+if ! bash -n "$NEXT" 2>/tmp/setup-syntax.err; then
+  echo "setup-sync: REFUSING to run -- published script has a syntax error:"
+  sed 's/^/  /' /tmp/setup-syntax.err
+  exit 0
+fi
+
+echo "setup-sync: running"
+bash "$NEXT" >/var/log/setup-sync.log 2>&1
+RC=$?
+echo "setup-sync: finished rc=$RC"
+
+FAILED=""
+for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
+  systemctl is-active --quiet "$unit" || FAILED="$FAILED $unit"
+done
+for u in ${join(" ", local.nextjs_users)}; do
+  systemctl is-enabled --quiet "ndev@$u" 2>/dev/null || continue
+  systemctl is-active --quiet "ndev@$u" || FAILED="$FAILED ndev@$u"
+done
+
+if [ -n "$FAILED" ]; then
+  echo "setup-sync: WARNING these units are not active after the run:$FAILED"
+  echo "setup-sync: NOT recording this etag, so the next run retries"
+  exit 1
+fi
+
+printf '%s' "$ETAG" > "$STATE/applied-etag"
+echo "setup-sync: healthy, recorded etag"
+SETUPSYNC
+chmod 755 /usr/local/bin/setup-sync
+
+cat > /etc/systemd/system/setup-sync.service <<'SSSVC'
+[Unit]
+Description=Apply the published nextjs-dev setup script when it changes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-sync
+SSSVC
+
+cat > /etc/systemd/system/setup-sync.timer <<'SSTIMER'
+[Unit]
+Description=Check for a newly published setup script
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+SSTIMER
+systemctl daemon-reload
+systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
+
+# Record the running script's etag so the very first timer tick does not re-run the setup
+# that is executing right now.
+mkdir -p /var/lib/nextjs-setup
+aws s3api head-object --bucket ejc3-dev-scripts --key user-data/nextjs.sh --region us-west-1   --query ETag --output text 2>/dev/null > /var/lib/nextjs-setup/applied-etag || true
+
+# --------------------------------------------------------- agent enable watcher
+# The units above are enabled only when a user's credentials already exist, and that check
+# ran at boot. Someone who logs in to Claude afterwards used to wait for "the next setup
+# run" -- an event they could not trigger -- or reach for sudo. This timer closes that gap:
+# it re-runs the same guarded enable every few minutes, so logging in is the only step.
+cat > /usr/local/bin/agents-enable <<'AGENTSENABLE'
+#!/bin/bash
+# Enable each user's agent units once their credentials exist. Idempotent and quiet.
+set -uo pipefail
+for u in ${join(" ", local.nextjs_users)}; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  # Enable and start are checked SEPARATELY. `enable --now` can enable the unit and still
+  # fail to start it -- remote control not up yet, say -- and after that `is-enabled` is
+  # true forever, so a watcher keyed on it would never retry the start and the agent would
+  # stay down until someone noticed. Keyed on is-active, this converges on the next tick.
+  if [ -s "/home/$u/.claude/.credentials.json" ]; then
+    systemctl enable "claude-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "claude-rc@$u.service"       || systemctl start "claude-rc@$u.service" >/dev/null 2>&1 || true
+  fi
+  if [ -s "/home/$u/.codex/auth.json" ]; then
+    systemctl enable "codex-rc@$u.service" >/dev/null 2>&1 || true
+    systemctl is-active --quiet "codex-rc@$u.service"       || systemctl start "codex-rc@$u.service" >/dev/null 2>&1 || true
+  fi
+done
+AGENTSENABLE
+chmod 755 /usr/local/bin/agents-enable
+
+cat > /etc/systemd/system/agents-enable.service <<'AESVC'
+[Unit]
+Description=Enable per-user agent units once their credentials exist
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agents-enable
+AESVC
+
+cat > /etc/systemd/system/agents-enable.timer <<'AETIMER'
+[Unit]
+Description=Check for newly logged-in agent users
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+AETIMER
+systemctl daemon-reload
+systemctl enable --now agents-enable.timer >/dev/null 2>&1 || true
+
+# ------------------------------------------------------- playwright system deps
+# Installed once, as root, at provision time so that nobody needs `--with-deps` (which
+# shells out to apt and therefore needs sudo) just to run the e2e suite. Playwright is
+# asked what it wants rather than us pinning a package list that rots with each Ubuntu
+# release -- the browser binaries themselves stay per-user and per-version.
+if command -v npx >/dev/null 2>&1; then
+  npx --yes playwright install-deps chromium >/dev/null 2>&1 \
+    || echo "WARNING: playwright system deps not installed; e2e will need --with-deps"
+fi
+
+# ------------------------------------------------------------- polkit: own units
+# systemctl talks to systemd over D-Bus, and D-Bus asks polkit, which by default demands
+# interactive auth for managing system units. That is why restarting your own dev server
+# needed `sudo systemctl restart ndev@$USER`. Everyone here has passwordless root anyway,
+# so the sudo was never a barrier -- just friction on the most common command on the box,
+# and friction that teaches people to reach for root by reflex.
+#
+# This grants each user start/stop/restart/reload on THEIR OWN instance of these templates
+# and nothing else: ndev@bob is bob's, and bob still cannot touch ndev@alice.
+mkdir -p /etc/polkit-1/rules.d
+cat > /etc/polkit-1/rules.d/50-ndev-own-units.rules <<'POLKIT'
+polkit.addRule(function(action, subject) {
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var verb = action.lookup("verb");
+  var allowed = ["start", "stop", "restart", "reload", "reload-or-restart", "try-restart"];
+  if (allowed.indexOf(verb) < 0) {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var unit = action.lookup("unit");
+  var templates = ["ndev@", "claude-rc@", "codex-rc@"];
+  for (var i = 0; i < templates.length; i++) {
+    if (unit === templates[i] + subject.user + ".service") {
+      return polkit.Result.YES;
+    }
+  }
+  return polkit.Result.NOT_HANDLED;
+});
+POLKIT
+chmod 644 /etc/polkit-1/rules.d/50-ndev-own-units.rules
+systemctl restart polkit 2>/dev/null || true
 
 # ---------------------------------------------------------------- ndev registry
 # hostname<TAB>port, one per line. ndev-register rewrites the cloudflared ingress from
@@ -660,6 +848,11 @@ for u in ${join(" ", local.nextjs_users)}; do
     echo "WARNING: sudoers for $u failed validation; leaving previous file in place"
   fi
 
+  # Read your own service's logs without sudo. These accounts already have full root, so
+  # this grants no new reach -- it removes a sudo from `journalctl -u ndev@$USER -f`, which
+  # people run twenty times a day while chasing a broken page.
+  usermod -aG systemd-journal "$u" 2>/dev/null || true
+
   # Let their user services and tmux survive logout / start without a login session.
   loginctl enable-linger "$u" 2>/dev/null || true
 
@@ -783,7 +976,7 @@ npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claud
 npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel update failed"
 echo "claude: $${BEFORE_CLAUDE:-none} -> $(claude --version 2>/dev/null | head -1)"
 
-for u in colton connor ej; do
+for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   # Codex ships its own installer and self-updates the standalone bundle; re-running it is
   # the supported refresh. Must run AS the user from a directory they can read -- from
@@ -798,7 +991,7 @@ for u in colton connor ej; do
   /usr/local/bin/kid-agents-refresh "$u" 2>&1 | sed "s/^/agents-md[$u]: /"
 done
 
-for u in colton connor ej; do
+for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
   for s in claude-rc codex-rc; do
     systemctl is-enabled "$s@$u" >/dev/null 2>&1 || continue
