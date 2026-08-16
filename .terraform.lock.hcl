@@ -2,13 +2,13 @@
 # Manual edits may be lost in future updates.
 
 provider "registry.terraform.io/ejc3/cloudflare" {
-  version     = "5.23.1"
-  constraints = "5.23.1"
+  version     = "5.24.0"
+  constraints = "5.24.0"
   hashes = [
-    "h1:YGEKLNO02zmBaitKiKXBqWULfKdfCh87pADzGXKLh8s=",
-    "h1:Zt1R1lNwlGHmbR2gCOvUBPxARB1UfCxIgPHuBZmG7GQ=",
-    "zh:589d13dc9dd88f456b28bec5d7af73f67e31e7d5aac94263e86fac03d21358aa",
-    "zh:b67c41a88ef39f7a090fd75303b3ad61ffdacbac9db205097758632cca566444",
+    "h1:/UQyPSbvtJf+u2Bg0MuDYW03GNosclOYMc2V7vRAgAw=",
+    "h1:RupB3XV+ernW3X1cnrKUJ/ApRCE7GLigSgAbq0N5paI=",
+    "zh:318545fb13add32c2b30b44458e4da841187a6e7df8653bb46ae1adc73d06dcf",
+    "zh:9ab6f5e542d5a49dc207fac96378b6454204771bd3ad45a7be9dc2fac65514ba",
     "zh:f809ab383cca0a5f83072981c64208cbd7fa67e986a86ee02dd2c82333221e32",
   ]
 }

@@ -3,7 +3,7 @@
 This is the live Terraform control plane for the `ejc3` development fleet. It is not a
 generic module or a tutorial environment: the defaults describe the deployed system.
 
-It manages roughly 185 resources across the main AWS account, an isolated staging account,
+It manages roughly 195 resources across the main AWS account, an isolated staging account,
 Cloudflare, and several regions. The platform provides:
 
 - persistent ARM64 and x86 bare-metal Firecracker development servers;
@@ -54,15 +54,20 @@ administrator instance role. There is no AWS login or credential-refresh step. T
 committed `.terraform.lock.hcl` keeps provider resolution identical across admin hosts;
 review and commit any intentional provider upgrade.
 
-Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.23.1`
-provider release. That fork adds typed Worker-native Access destinations while preserving
-ordinary `terraform init` on both ARM64 jumpboxes and amd64 CI; there is no local provider
-override or machine-specific installation step. Return to `cloudflare/cloudflare` only
-after an upstream release includes the same fields and regression coverage.
+`main.tf` enforces Terraform `1.10.3`, which is the version on both jumpboxes and supports
+the ephemeral Workers Builds control-token read. Any Terraform upgrade must update the
+constraint, both jumpboxes, and the drift workflow together.
 
-The fork has a different provider source address. On the first live-jumpbox update to
-`5.23.1`, stop after `terraform providers` if state still lists `cloudflare/cloudflare`.
-Under the exclusive state lock, migrate the eight existing Cloudflare resources before
+Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.24.0`
+provider release. That fork adds typed Worker-native Access destinations and the Workers
+Builds APIs used below while preserving ordinary `terraform init` on both ARM64 jumpboxes
+and amd64 CI; there is no local provider override or machine-specific installation step.
+Return to `cloudflare/cloudflare` only after an upstream release includes the same fields
+and regression coverage.
+
+The fork has a different provider source address. On the first live-jumpbox update to the
+fork, stop after `terraform providers` if state still lists `cloudflare/cloudflare`.
+Under the exclusive state lock, migrate all existing Cloudflare resources before
 planning:
 
 ```bash
@@ -107,6 +112,17 @@ needs:
   `cloudflare-tunnel-token` (including Workers Scripts Read/Write),
   `cloudflare-tunnel-credentials`, and
   `cloudflare-google-idp`;
+- the raw user-owned Cloudflare token in
+  `cloudflare-workers-builds-control-token` when the checked-in Workers Builds rollout
+  gate is enabled. From
+  [Create Additional Tokens](https://dash.cloudflare.com/profile/api-tokens), choose
+  **Use template**, retain User → API Tokens → Edit, and add Workers Builds Configuration
+  Edit plus Workers Scripts Read for account `12ea67fb7ced068de03f35c22688e436`;
+  an account-owned token is rejected;
+- the Cloudflare Workers and Pages GitHub App authorized for only
+  `CoderColton/colton-games` by that repository's owner, starting from the target Worker's
+  Settings → Builds → Connect → GitHub flow. `ejc3` has write, not admin, and cannot grant
+  the App;
 - the `github-pat-ejc3` Secrets Manager value, the runner-only GitHub PAT, and
   `github-webhook-admin-pat` in Secrets Manager -- a fine-grained PAT whose only
   repository permission is `Webhooks: Read and write` on `ejc3/fcvm`, used by the
@@ -147,6 +163,10 @@ Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` thro
 console or AWS CLI without printing their values. This is a one-time secret-payload
 bootstrap, not a parallel way to manage infrastructure. The alert sender address must also
 be verified in SES in `us-west-1`.
+
+Do not create the Workers Builds control-token container in this generic bootstrap. Its
+first creation is deliberately deferred until after the 15-minute S3 versioning wait in
+the staged rollout below; that Terraform write is the backend `VersionId` probe.
 
 Terraform owns the `ejc3/fcvm` `workflow_job` webhook and generates its HMAC secret, so
 there is nothing to mirror by hand. **Before the first full apply**, if the recovered
@@ -348,8 +368,9 @@ The two metal boxes are the main `fcvm` workstations:
 - Their 300 GB EBS roots survive a normal stop/start.
 - Instance-store NVMe is for VM images, build output, caches, and temporary Btrfs data.
   It is erased by a stop, Spot interruption, or host loss.
-- ARM nested virtualization requires the custom `-nested-dsb` kernel and the DSB/MMFR4
-  patches documented in `AGENTS.md`.
+- ARM nested virtualization requires the custom fcvm kernel and patch set documented in
+  `AGENTS.md`; `uname -r` reports `<version>-fcvm-<build-sha>` on a correctly installed
+  host.
 - An hourly Lambda queries a 12-hour range of five-minute peak CPU points. Any returned
   point at or above 5% keeps the instance running; otherwise it stops the instance and
   sends an SNS notification.
@@ -481,10 +502,39 @@ service-token policy. The URL switches intentionally remain off until the applic
 been applied and a second clean plan confirms the policy attachment. Do not use hostname
 wildcard applications or a generic REST/local-exec bridge as a substitute.
 
-Cloudflare's Terraform provider does not yet model Workers Builds repository connections,
-build tokens, or triggers. The Cloudflare GitHub App also requires a one-time browser grant
-limited to `CoderColton/colton-games`. Until those APIs are added to this stack, configure
-one repository build with separate production and non-production deploy commands:
+The pinned fork manages the account's `cc-games.workers.dev` label, a dedicated deployment
+API token, the GitHub repository connection, separate staging and preview triggers, and
+their complete build-time environment maps. The ordinary `cloudflare-tunnel-token` is
+account-owned and cannot call Workers Builds. The aliased provider instead reads the raw
+user-owned control token ephemerally from `cloudflare-workers-builds-control-token`, so
+its value is not persisted in Terraform state; do not reuse, copy, or replace the ordinary
+Cloudflare credential.
+
+Open [Create Additional Tokens](https://dash.cloudflare.com/profile/api-tokens) and choose
+**Use template** for that template, not the Custom Token builder: API Tokens Edit is
+unavailable in the Custom Token permission list. Keep the template's User → API Tokens →
+Edit permission (called API Tokens Write by the API), then add account-level Workers
+Builds Configuration Edit and Workers Scripts Read scoped only to account
+`12ea67fb7ced068de03f35c22688e436`. Those permissions let Terraform configure Builds and
+mint the narrower Workers Scripts Write token that build jobs receive. Store the raw
+control-token string in the existing Secrets Manager container without JSON wrapping.
+Terraform creates the deploy token; do not make or paste a second deploy credential.
+
+The other one-time prerequisite starts in Cloudflare: Workers & Pages →
+`colton-games-stage` → Settings → Builds → Connect → GitHub. The `CoderColton` repository
+owner must then authorize the Cloudflare Workers and Pages GitHub App for **only**
+`CoderColton/colton-games`; `ejc3` has write access, not administration access, and cannot
+make the grant. The
+[GitHub App page](https://github.com/apps/cloudflare-workers-and-pages) is a reference,
+not the primary setup entry point because a bare install can miss the Cloudflare account
+connection context. When authorization returns to Cloudflare, **stop**: do not select,
+save, or connect the repository and do not create build settings in the dashboard.
+Terraform owns those objects. It cannot perform the interactive GitHub grant, and the
+repository-connection API has no read/list endpoint or import path, so an out-of-band
+connection cannot be adopted safely. The managed resource is protected from destroy and
+its last confirmed UUID exists only in versioned, encrypted Terraform state.
+
+The managed builds are:
 
 | Deployment | Branches | Build command | Deploy command |
 |---|---|---|---|
@@ -495,6 +545,93 @@ Use `/` as the root directory and Node 24 from the application's `.nvmrc`. Previ
 must remain limited to trusted branches because they inherit the staging Worker's bindings
 and secrets. `stage.colton-games.com` and the production Vercel serving path remain outside
 this change until the domain is deliberately moved to Cloudflare.
+
+Roll this out in order; do not collapse the safety gates into one apply:
+
+1. After signed provider `5.24.0` is visible in the Terraform Registry, update only its
+   stale lock selection, then initialize without allowing any further lock changes:
+
+   ```bash
+   terraform providers lock \
+     -platform=linux_arm64 -platform=linux_amd64 \
+     registry.terraform.io/ejc3/cloudflare
+   git diff -- .terraform.lock.hcl
+   terraform init -lockfile=readonly
+   terraform validate
+   ```
+
+   The diff must change only the `ejc3/cloudflare` block to signed `5.24.0` hashes for
+   both platforms. Commit that lock update. Do **not** use broad `terraform init -upgrade`;
+   it can advance unrelated providers allowed by their `~>` constraints.
+2. Leave both `colton_games_workers_builds_enabled` and
+   `colton_games_worker_urls_enabled` false. Save and review a targeted backend-versioning
+   plan, then apply that exact plan:
+
+   ```bash
+   terraform plan \
+     -target=aws_s3_bucket_versioning.terraform_state \
+     -out=/tmp/colton-games-backend-versioning.tfplan
+   terraform show -no-color /tmp/colton-games-backend-versioning.tfplan
+   terraform apply /tmp/colton-games-backend-versioning.tfplan
+   aws s3api get-bucket-versioning --bucket ejc3-terraform-state \
+     --region us-west-1 --query Status --output text
+   ```
+
+   Require the saved plan to contain only the versioning resource, require `Enabled` after
+   applying it, then wait **at least 15 minutes** for S3 versioning to propagate.
+3. After that wait, apply only the control-token container. This legitimate Terraform
+   state write is also the versioning probe. Again, save and review the targeted plan,
+   then apply that exact plan:
+
+   ```bash
+   terraform plan \
+     -target=aws_secretsmanager_secret.cloudflare_workers_builds_control_token \
+     -out=/tmp/colton-games-control-token-container.tfplan
+   terraform show -no-color /tmp/colton-games-control-token-container.tfplan
+   terraform apply /tmp/colton-games-control-token-container.tfplan
+   aws s3api head-object --bucket ejc3-terraform-state \
+     --key aws-infrastructure/terraform.tfstate --region us-west-1 \
+     --query VersionId --output text
+   ```
+
+   Require the saved plan to contain only the empty secret container. The backend object's
+   `VersionId` must then be non-empty and not `null` or `None`. Stop if it is not: do not
+   create a deployment token or repository connection without a verified versioned state
+   write.
+4. Keep both gates false and return to a full saved plan:
+
+   ```bash
+   terraform plan -out=/tmp/colton-games-base.tfplan
+   terraform apply /tmp/colton-games-base.tfplan
+   terraform plan
+   ```
+
+   The saved plan should contain only the account Workers subdomain and any other already
+   reviewed base configuration from this change. It must not create Builds credentials,
+   connections, triggers, or environment maps; update the Worker; change Access; or
+   destroy anything. Apply the saved plan immediately and require the follow-up plan to
+   be empty.
+5. Create and store the raw control token, then have the `CoderColton` repository owner
+   complete the repository-only GitHub App authorization.
+6. Change only `colton_games_workers_builds_enabled` to true. Re-plan immediately. This
+   stage may create only the narrow deploy API token, its Builds registration, and the
+   repository connection. It must not create either trigger or environment map, update
+   the Worker, or change Access. Apply, then require an empty follow-up plan.
+7. Change only `colton_games_worker_urls_enabled` to true. The plan should contain one
+   in-place Worker update plus the two triggers and their two environment maps. The
+   trigger dependency guarantees the already-protected URL surfaces are enabled before a
+   GitHub event can deploy. Apply, immediately run a fresh plan, and require it to be
+   empty. Only then verify an unauthenticated request is denied and the existing Access
+   service token succeeds.
+8. While pull request `CoderColton/colton-games#26` is still open, cause a `synchronize`
+   event with a new commit and verify both its protected immutable preview and branch
+   alias. A preview cannot exist while `previews_enabled` is false, so do not perform this
+   check before step 7 or after merging the pull request.
+9. Only after that preview succeeds, merge pull request #26 to `main`. Verify the
+   resulting staging build and protected `workers.dev` deployment.
+
+Every gate change is a reviewed, committed Terraform change. Do not disable either gate
+after its protected resources exist; `prevent_destroy` is intended to stop that rollback.
 
 ## GitHub Actions and package infrastructure
 

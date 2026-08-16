@@ -1,4 +1,6 @@
 terraform {
+  required_version = "= 1.10.3"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,11 +11,11 @@ terraform {
       version = "~> 2.0"
     }
     cloudflare = {
-      # Exact fork pin adds Worker-native Access destinations. Return to the upstream
-      # namespace only after an upstream release carries the same schema and tests.
-      # v5.23.1: 29a5b527a32a7abc70d1224bc0327978bbff020d
+      # Exact fork pin adds Worker-native Access destinations and typed Workers Builds
+      # resources. Return to the upstream namespace only after an upstream release
+      # carries the same schemas and regression coverage.
       source  = "ejc3/cloudflare"
-      version = "= 5.23.1"
+      version = "= 5.24.0"
     }
     github = {
       source  = "integrations/github"
@@ -32,6 +34,22 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
+}
+
+# Workers Builds creates a deployment token whose value Cloudflare returns only once.
+# Version the backend before that token is created so an accidental state overwrite has
+# a recoverable predecessor. This resource safely enables versioning on the existing
+# backend bucket; it does not try to create or own the bucket itself.
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = "ejc3-terraform-state"
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # VPC Configuration - Use existing or create new
