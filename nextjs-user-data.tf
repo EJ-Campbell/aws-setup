@@ -151,6 +151,97 @@ chmod 600 /etc/cloudflared/creds-dolphin-labs.dev.json
 # Keep the old path working for anything that still references it.
 ln -sf /etc/cloudflared/creds-cc-games.dev.json /etc/cloudflared/credentials.json
 
+# ------------------------------------------------------------ setup self-update
+# Terraform publishing this script to S3 does NOT reach a running box: the instance's
+# user_data has ignore_changes, so it is read exactly once, at first boot. Every change
+# therefore needed someone to SSH in and re-run it by hand -- and the times nobody did are
+# how a stale copy once recreated a deleted account.
+#
+# This closes that gap, with three guards, because a script that runs unattended on the box
+# that hosts everyone's work deserves them:
+#   1. Only acts when the object's ETag actually changes, so it is a no-op almost always.
+#   2. Refuses to run a script that fails `bash -n` -- a half-written publish cannot brick
+#      the box, it just leaves the previous version in place and says so.
+#   3. Checks the units that matter afterwards and logs loudly if any died, so a bad change
+#      surfaces in `journalctl -u setup-sync` instead of as a mystery outage tomorrow.
+cat > /usr/local/bin/setup-sync <<'SETUPSYNC'
+#!/bin/bash
+set -uo pipefail
+BUCKET=ejc3-dev-scripts
+KEY=user-data/nextjs.sh
+STATE=/var/lib/nextjs-setup
+mkdir -p "$STATE"
+
+ETAG=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" --region us-west-1          --query ETag --output text 2>/dev/null)
+[ -n "$ETAG" ] || { echo "setup-sync: cannot reach s3://$BUCKET/$KEY"; exit 0; }
+[ "$ETAG" = "$(cat "$STATE/applied-etag" 2>/dev/null)" ] && exit 0
+
+echo "setup-sync: new script published (etag $ETAG), fetching"
+NEXT=$(mktemp /tmp/nextjs-setup.XXXXXX.sh)
+trap 'rm -f "$NEXT"' EXIT
+aws s3 cp "s3://$BUCKET/$KEY" "$NEXT" --region us-west-1 >/dev/null 2>&1   || { echo "setup-sync: download failed, keeping current setup"; exit 0; }
+
+if ! bash -n "$NEXT" 2>/tmp/setup-syntax.err; then
+  echo "setup-sync: REFUSING to run -- published script has a syntax error:"
+  sed 's/^/  /' /tmp/setup-syntax.err
+  exit 0
+fi
+
+echo "setup-sync: running"
+bash "$NEXT" >/var/log/setup-sync.log 2>&1
+RC=$?
+echo "setup-sync: finished rc=$RC"
+
+FAILED=""
+for unit in cloudflared@cc-games.dev cloudflared@dolphin-labs.dev; do
+  systemctl is-active --quiet "$unit" || FAILED="$FAILED $unit"
+done
+for u in ${join(" ", local.nextjs_users)}; do
+  systemctl is-enabled --quiet "ndev@$u" 2>/dev/null || continue
+  systemctl is-active --quiet "ndev@$u" || FAILED="$FAILED ndev@$u"
+done
+
+if [ -n "$FAILED" ]; then
+  echo "setup-sync: WARNING these units are not active after the run:$FAILED"
+  echo "setup-sync: NOT recording this etag, so the next run retries"
+  exit 1
+fi
+
+printf '%s' "$ETAG" > "$STATE/applied-etag"
+echo "setup-sync: healthy, recorded etag"
+SETUPSYNC
+chmod 755 /usr/local/bin/setup-sync
+
+cat > /etc/systemd/system/setup-sync.service <<'SSSVC'
+[Unit]
+Description=Apply the published nextjs-dev setup script when it changes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-sync
+SSSVC
+
+cat > /etc/systemd/system/setup-sync.timer <<'SSTIMER'
+[Unit]
+Description=Check for a newly published setup script
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+SSTIMER
+systemctl daemon-reload
+systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
+
+# Record the running script's etag so the very first timer tick does not re-run the setup
+# that is executing right now.
+mkdir -p /var/lib/nextjs-setup
+aws s3api head-object --bucket ejc3-dev-scripts --key user-data/nextjs.sh --region us-west-1   --query ETag --output text 2>/dev/null > /var/lib/nextjs-setup/applied-etag || true
+
 # --------------------------------------------------------- agent enable watcher
 # The units above are enabled only when a user's credentials already exist, and that check
 # ran at boot. Someone who logs in to Claude afterwards used to wait for "the next setup
