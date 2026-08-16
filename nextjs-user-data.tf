@@ -55,13 +55,16 @@ locals {
   # them together into "systemctl daemon-reloadsystemctl enable ..." -- a syntax error
   # rather than merely ugly, because statements need a separator and case arms do not.
   nextjs_zone_rebuild = join("\n", [
-    for z, t in local.nextjs_zone_tunnel : "/usr/local/bin/ndev-rebuild ${z}"
+    for z, t in local.nextjs_zone_tunnel :
+    "CHANGED=0\n/usr/local/bin/ndev-rebuild ${z} || CHANGED=$?\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\"\n[ \"$CHANGED\" = \"10\" ] && systemctl reload \"cloudflared@${z}\" 2>/dev/null\ntrue"
   ])
-  # enable --now does nothing to an already-running unit, so a re-provision would leave
-  # cloudflared serving the config it read at boot rather than the one just rebuilt.
+  # Enable for boot, and START only if it is down. Deliberately NOT reload-or-restart: the
+  # unit had no ExecReload, so that degraded to a full restart and took both zones offline
+  # for ~40s (cloudflared drains for 30) on every setup run -- users saw Cloudflare
+  # "Error 1033". Config changes are picked up by the reload in nextjs_zone_rebuild.
   nextjs_zone_enable = join("\n", [
     for z, t in local.nextjs_zone_tunnel :
-    "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl reload-or-restart \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
+    "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
   ])
 
   # Unix accounts. Each gets the fcvm key initially so you can get in as them and help;
@@ -374,6 +377,9 @@ set -euo pipefail
 ZONE="$1"
 TUNNEL_ID=$(/usr/local/bin/ndev-zone --tunnel "$ZONE")
 REGISTRY=/var/lib/ndev/registry-$ZONE
+# Written to a temp file and compared: an unchanged config must not touch the live one,
+# because every rewrite otherwise invites a reload of a tunnel that had nothing to learn.
+TMP=$(mktemp)
 {
   echo "tunnel: $TUNNEL_ID"
   echo "credentials-file: /etc/cloudflared/creds-$ZONE.json"
@@ -386,7 +392,14 @@ REGISTRY=/var/lib/ndev/registry-$ZONE
     done < "$REGISTRY"
   fi
   echo "  - service: http_status:404"
-} > /etc/cloudflared/config-$ZONE.yml
+} > "$TMP"
+
+if cmp -s "$TMP" "/etc/cloudflared/config-$ZONE.yml" 2>/dev/null; then
+  rm -f "$TMP"
+  exit 0            # unchanged: caller has nothing to reload
+fi
+mv "$TMP" "/etc/cloudflared/config-$ZONE.yml"
+exit 10             # changed: caller should reload
 REBUILD
 chmod 755 /usr/local/bin/ndev-rebuild
 
@@ -434,9 +447,14 @@ sort -u "$REGISTRY.new" > "$REGISTRY" && rm -f "$REGISTRY.new"
 # nobody logged in: the unit needs no argument beyond the username.
 printf 'HOST=%s\nPORT=%s\nDIR=%s\n' "$HOST" "$PORT" "$DIR" > "/var/lib/ndev/$WHO.env"
 
-/usr/local/bin/ndev-rebuild "$ZONE"
-
-systemctl reload-or-restart "cloudflared@$ZONE" 2>/dev/null || systemctl restart "cloudflared@$ZONE"
+# ndev-rebuild exits 10 when it changed the config, 0 when it did not. Capture it rather
+# than letting set -e abort, and reload ONLY on a real change -- a publish that changes
+# nothing must not disturb anyone else's hostname on this tunnel.
+CHANGED=0
+/usr/local/bin/ndev-rebuild "$ZONE" || CHANGED=$?
+systemctl is-active --quiet "cloudflared@$ZONE" || systemctl start "cloudflared@$ZONE"
+[ "$CHANGED" = "10" ] && systemctl reload "cloudflared@$ZONE" 2>/dev/null
+true
 systemctl enable --now "ndev@$WHO.service" >/dev/null 2>&1 || systemctl restart "ndev@$WHO.service"
 echo "registered $HOST -> 127.0.0.1:$PORT (ndev@$WHO, enabled at boot)"
 REG
@@ -735,6 +753,11 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config-%i.yml --no-autoupdate tunnel run
+# cloudflared re-reads its config on SIGHUP. Without an ExecReload, systemd's
+# reload-or-restart degrades to a full restart -- and cloudflared's graceful shutdown drains
+# for ~30s, so every setup run took BOTH zones down for ~40 seconds and users got
+# "Error 1033 Cloudflare Tunnel error". A reload keeps the connections up.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 User=root
