@@ -238,8 +238,9 @@ ssh io
 The aliases use Elastic IPs for the three long-lived `us-west-1` boxes and fixed private
 address `172.31.48.10` for `io-box`. Dev servers carry a dedicated dev-hop key, not the
 `fcvm-ec2` admin key, so ordinary dev-to-dev access does not grant an admin shell on a
-jumpbox. `pbox` has a separate forced-command-only key that can ask the jumpbox to run the
-parallel-box Terraform workflow and nothing else.
+jumpbox. Nothing on a dev server can reach a jumpbox at all -- there is no key, and no
+delegation of any kind. `pbox` launches the parallel boxes itself with a tag-scoped IAM
+grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gone.
 
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
@@ -421,7 +422,7 @@ Two independent boxes (`parallel-box`, `parallel-box-2`), each with its own pers
 
 ```bash
 pbox status      # both boxes
-pbox up          # launch box 1 through Terraform, then connect
+pbox up          # launch box 1 from its launch template, then connect
 pbox up 2        # launch box 2 (independent volume and lifecycle)
 pbox ssh [2]
 pbox down [2]    # terminate compute; keep that box's /mnt/work
@@ -431,10 +432,11 @@ The launcher tries several 96/192-vCPU Graviton Spot pools in the availability z
 contains the persistent work volumes. One shared watchdog checks every five minutes and
 terminates either box after 30 minutes below 5% CPU.
 
-Use only `pbox` (or `scripts/parallel-box.sh` on a jumpbox) for this lifecycle. The
-Terraform defaults are `enable_parallel_box=false` / `enable_parallel_box_2=false`; an
-unrelated full apply while a box is running can otherwise propose terminating it. Read
-the plan and never apply that change during a live job.
+Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
+lifecycle. Terraform owns the durable half -- work volumes, security group, key pair and
+the two launch templates -- while the instances themselves are deliberately not in state.
+That removes the old hazard entirely: an unrelated full apply can no longer propose
+terminating a box in the middle of a live job.
 
 ## Temporary EBS for agents
 
