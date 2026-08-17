@@ -83,8 +83,20 @@ locals {
   # the fcvm key is for US getting in to help, this is for THEM getting in at all.
   # Public keys only; nothing secret lives in this file.
   nextjs_user_keys = {
-    skevh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3GGQEbA+7pChjnXMBagHA1G26vH8BQJj9Bgva21eVH skevh@yahoo.com"
+    skevh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local"
   }
+
+  # Keys that were here and are NOT any more. The block below only ever APPENDS to
+  # authorized_keys (grep -qxF || echo >>), which is right -- it must never clobber a key
+  # someone added by hand -- but it means editing nextjs_user_keys adds the new key and
+  # leaves the old one authorized forever. Anything retired therefore has to be named here
+  # so it can be removed explicitly.
+  #
+  # skevh@yahoo.com: generated for Steve with a passphrase that was then lost, so nobody
+  # can use it. Retired 2026-08-17.
+  nextjs_retired_user_keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3GGQEbA+7pChjnXMBagHA1G26vH8BQJj9Bgva21eVH skevh@yahoo.com",
+  ]
 
   # Repositories to lay down for a user on first setup, so the box is useful the moment
   # they log in instead of starting at an empty home directory. Cloned only when that
@@ -1036,6 +1048,33 @@ for u in ${join(" ", local.nextjs_users)}; do
       ;;
 %{~endfor~}
   esac
+
+  # Retire superseded keys. Without this a rotated key stays authorized forever, because
+  # the append above has no way to know a line is obsolete. Matched with grep -vxF on the
+  # exact line, so a key someone added by hand is never touched -- only the specific
+  # strings listed in nextjs_retired_user_keys.
+  #
+  # Fed in as DATA through one join(), not with a terraform for-directive. A directive
+  # with the ~ trim markers strips the newline on both sides and welds the generated
+  # statement onto the previous line; that produced a broken setup script once already in
+  # this file. One interpolation of a newline-separated list cannot do that, and it
+  # degrades cleanly to a no-op when the list is empty.
+  #
+  # (Note for whoever edits this next: do not write a directive's literal syntax in a
+  # comment here either. This heredoc is a TEMPLATE, so terraform parses the directive
+  # inside the comment and fails with "Invalid 'for' directive". That happened writing
+  # this very block.)
+  while IFS= read -r rk; do
+    [ -n "$rk" ] || continue
+    grep -qxF "$rk" "/home/$u/.ssh/authorized_keys" 2>/dev/null || continue
+    grep -vxF "$rk" "/home/$u/.ssh/authorized_keys" > "/home/$u/.ssh/authorized_keys.tmp" && \
+      mv "/home/$u/.ssh/authorized_keys.tmp" "/home/$u/.ssh/authorized_keys"
+    chown "$u:$u" "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+    chmod 600 "/home/$u/.ssh/authorized_keys" 2>/dev/null || true
+    echo "removed retired key from $u"
+  done <<'RETIREDKEYS'
+${join("\n", local.nextjs_retired_user_keys)}
+RETIREDKEYS
 
   # FULL passwordless sudo, deliberately.
   #
