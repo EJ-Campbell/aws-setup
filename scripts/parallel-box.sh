@@ -155,9 +155,11 @@ case "$CMD" in
     for T in $TYPES; do
       CORES=$(aws ec2 describe-instance-types --region "$REGION" --instance-types "$T" \
         --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null)
+      # head -1: --max-items makes the CLI emit a pagination token on a SECOND line, which
+      # otherwise lands in the price and prints as "$2.219800\nNone/hr".
       PRICE=$(aws ec2 describe-spot-price-history --region "$REGION" --instance-types "$T" \
         --product-descriptions "Linux/UNIX" --availability-zone "$AZ" --max-items 1 \
-        --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null)
+        --query 'SpotPriceHistory[0].SpotPrice' --output text 2>/dev/null | head -1)
       say "--> trying $T (${CORES:-?} cores, \$${PRICE:-?}/hr) in $AZ ..."
 
       # Everything except the instance type comes from the launch template, so a typo

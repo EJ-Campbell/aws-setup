@@ -401,6 +401,30 @@ where the AWS admin session lives, and nothing on a dev box used it. The hop key
 half is authorized on dev servers only, so holding it gets you another dev box and nothing
 more. Verified: dev -> dev succeeds, dev -> jumpbox gives `Permission denied (publickey)`.
 
+**DEV BOX -> JUMPBOX CONNECTIONS ARE NOT PERMITTED**, by any mechanism: not SSH, not a
+forced-command key, not `ssm:SendCommand`, not a queue the jumpbox polls. That rule exists
+because it was broken once already -- `pbox-key.tf` reintroduced the path with a
+forced-command key shortly after `dev-hop-key.tf` closed it, and it survived because "it
+can only run one script" sounds safe. It is not the transport that matters: every
+delegation shape ends with "a compromised dev box makes the jumpbox run something as
+root", so they differ in audit trail, not capability. Do not offer one as a mitigation for
+another.
+
+When a dev box needs a privileged action, give it a **narrow, tag-scoped IAM grant** and
+let it call AWS directly. `parallel-box-launch.tf` is the worked example. Two traps that
+make such a policy fail closed rather than silently over-grant:
+
+- **A tag condition denies any resource the call creates without that tag.** `RunInstances`
+  creates an instance, a volume AND an ENI; gating all three on `aws:RequestTag/Name` means
+  the launch template must tag all three, with a value the condition actually allows. A
+  root volume tagged `parallel-box-root` fails a condition that lists `parallel-box`. Both
+  mistakes were made here and both failed identically for every instance type, which reads
+  exactly like a spot-capacity drought rather than a policy bug.
+- **`iam:PassRole` is the escalation.** Pin it to one role ARN with `iam:PassedToService`.
+
+`aws iam simulate-principal-policy` settles these in seconds without launching anything --
+check both the allow and a deliberate deny.
+
 ### Metal Claude startup
 
 `fcvm-claude-rc.service` starts `t-claude --remote-control` at boot for host-local active

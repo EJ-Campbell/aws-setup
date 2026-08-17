@@ -119,11 +119,32 @@ resource "aws_launch_template" "parallel_box" {
     }
   }
 
+  # The root volume carries the BOX's name, not "<name>-root". The IAM condition below
+  # tests aws:RequestTag/Name against exactly the two box names, so any other value --
+  # however sensible it reads -- is an unsatisfiable condition and a denied launch. It is
+  # distinguishable from the work volume by tag Role, which nothing gates on.
+  #
+  # Deliberately no DevEBS=true here: that tag is what local.dev_ebs_policy keys on for
+  # ec2:DeleteVolume, and there is no reason to hand out a delete grant for a disk that
+  # already dies with the instance.
   tag_specifications {
     resource_type = "volume"
     tags = {
-      Name   = "${each.value.name}-root"
-      DevEBS = "true"
+      Name = each.value.name
+      Role = "root"
+    }
+  }
+
+  # The ENI must be tagged too, and this is not cosmetic. RunInstances authorizes every
+  # resource it creates, the IAM policy below gates instance/volume/network-interface on
+  # aws:RequestTag/Name, and a condition on an untagged resource can never be satisfied.
+  # Without this the launch fails with UnauthorizedOperation on network-interface/* --
+  # observed live, and it fails for EVERY instance type, so it reads like a capacity
+  # drought rather than a policy bug.
+  tag_specifications {
+    resource_type = "network-interface"
+    tags = {
+      Name = each.value.name
     }
   }
 
