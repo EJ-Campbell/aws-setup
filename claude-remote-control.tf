@@ -334,7 +334,18 @@ Environment=HOME=/home/ubuntu
 Environment=TERM=xterm-256color
 Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/home/ubuntu
-ExecCondition=/bin/sh -c 'echo "5f32a138c50ffcc99609f30397c04963c6b538bfbf07a4cd9dc0f32fcdbb1b88  /usr/local/lib/fcvm/t-claude.zsh" | sha256sum -c - >/dev/null 2>&1'
+# Integrity, not identity. This used to be a sha256 of one revision, left behind when the
+# installer above dropped its pin to track main. The two then disagreed by construction:
+# every upstream t-claude commit changed the file, the hash stopped matching, ExecCondition
+# returned non-zero, and systemd SKIPPED the unit -- silently, because a skip is the
+# correct, quiet behaviour for a condition that says "nothing to do". The ARM box booted
+# with no Claude session twice before anyone asked why, and it would have recurred on every
+# t-claude commit forever.
+#
+# zsh -n is the same check the installer uses to decide the download is sound, so the guard
+# now asks the question that actually matters -- is this file valid t-claude -- rather than
+# is it one specific historical copy.
+ExecCondition=/bin/sh -c 'zsh -n /usr/local/lib/fcvm/t-claude.zsh >/dev/null 2>&1'
 ExecCondition=/bin/sh -c 'command -v claude >/dev/null 2>&1 && claude auth status >/dev/null 2>&1'
 ExecStart=/usr/local/bin/fcvm-claude-active-repos
 TimeoutStartSec=300
