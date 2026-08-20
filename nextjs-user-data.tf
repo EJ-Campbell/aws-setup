@@ -337,8 +337,28 @@ aws s3api head-object --bucket ejc3-dev-scripts --key user-data/nextjs.sh --regi
 # which keeps the conversation AND gets a working connection.
 cat > /usr/local/bin/claude-rc-ensure <<'RCENSURE'
 #!/bin/bash
-# claude-rc-ensure <user> -- ensure this user's session really has Remote Control.
-# Safe to run repeatedly: it does nothing when /rc is already active.
+# claude-rc-ensure <user> -- repair a DEAD Remote Control binding, and nothing else.
+#
+# THIS SCRIPT TYPES INTO A LIVE SESSION SOMEONE IS USING. Read the next paragraph before
+# changing it.
+#
+# The first version triggered on the ABSENCE of a success string ("/rc active") in the
+# pane. A Claude Code update changed that footer to render as just "/rc", so success became
+# undetectable and the script "repaired" a perfectly healthy connection every time it ran
+# -- 21 times in six hours per user. Each repair DISCONNECTED a working session, and the
+# blind "1" keystroke meant for the enable menu landed in the prompt instead and was SENT
+# AS A MESSAGE, so the kids' conversations filled with "1" / "Standing by." and burned
+# tokens toward the usage limit. The repair's own side effect ("Remote Control
+# disconnected.") then looked like the fault it was meant to fix, so it fed itself.
+#
+# Three rules keep that from recurring:
+#   1. Trigger on an EXPLICIT failure string, never on the absence of a success string.
+#      If upstream changes its wording again this does nothing, which is the safe way to
+#      be wrong.
+#   2. Never send a menu selection without first SEEING that menu on screen. Escape out
+#      instead -- a stray keystroke in this TUI is a message, not a no-op.
+#   3. Rate limit. A repair loop that can run every ten minutes must not be able to touch
+#      the same session more than once an hour.
 set -uo pipefail
 WHO="$${1:?usage: claude-rc-ensure <user>}"
 H="/home/$WHO"
@@ -346,58 +366,87 @@ tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
 win=$(tm list-windows -a -F '#{window_id}' | head -1)
 [ -n "$win" ] || { echo "claude-rc-ensure: $WHO has no tmux window"; exit 0; }
 pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
-pane() { tm capture-pane -p -t "$win"; }
 
-for attempt in 1 2 3; do
-  case "$(pane)" in
-    *"/rc active"*) echo "claude-rc-ensure: $WHO active"; exit 0 ;;
-  esac
-  # An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
-  case "$(pane)" in
-    *"Session creation failed"*) echo "claude-rc-ensure: $WHO upstream 503, leaving alone"; exit 0 ;;
-  esac
-  echo "claude-rc-ensure: $WHO attempt $attempt -- dropping the stale binding"
-  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-  # Menu: Disconnect this session / Show QR code / Continue (Continue preselected).
-  tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
-  # Re-enable. That menu is numbered: 1. Enable Remote Control / 2. Never mind.
-  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
-  tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
-done
+# Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
+# repair re-triggers the repair, forever.
+pane() { tm capture-pane -p -S -25 -t "$win"; }
+P="$(pane)"
+
+# The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
+# cannot succeed no matter how many times /remote-control retries it. Note this is NOT the
+# same as the bare "Remote Control disconnected." line, which is also what a deliberate
+# disconnect prints -- matching that would make the script chase its own tail.
+case "$P" in
+  *"Couldn't reconnect to your Remote Control session"*) ;;
+  *) echo "claude-rc-ensure: $WHO nothing to repair"; exit 0 ;;
+esac
+
+# An upstream 503 is not ours to fix; it recovers on its own and restarting costs the session.
+case "$P" in
+  *"Session creation failed"*) echo "claude-rc-ensure: $WHO upstream 503, leaving alone"; exit 0 ;;
+esac
+
+STATEDIR=/var/lib/claude-rc-ensure
+mkdir -p "$STATEDIR"
+STAMP="$STATEDIR/$WHO"
+now=$(date +%s)
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+if [ $((now - last)) -lt 3600 ]; then
+  echo "claude-rc-ensure: $WHO repaired within the last hour, backing off"
+  exit 0
+fi
+echo "$now" > "$STAMP"
+
+echo "claude-rc-ensure: $WHO reconnect is dead -- dropping the stale binding"
+tm send-keys -t "$win" '/remote-control' Enter; sleep 8
 case "$(pane)" in
-  *"/rc active"*) echo "claude-rc-ensure: $WHO active" ;;
-  *) echo "claude-rc-ensure: $WHO still unreachable after 3 attempts" >&2 ;;
+  *"Disconnect this session"*)
+    tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
+    ;;
+  *)
+    echo "claude-rc-ensure: $WHO disconnect menu never appeared; leaving the session alone" >&2
+    tm send-keys -t "$win" Escape
+    exit 0
+    ;;
+esac
+
+tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+case "$(pane)" in
+  *"Enable Remote Control"*)
+    tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
+    echo "claude-rc-ensure: $WHO re-enabled"
+    ;;
+  *)
+    echo "claude-rc-ensure: $WHO enable menu never appeared; leaving the session alone" >&2
+    tm send-keys -t "$win" Escape
+    exit 0
+    ;;
 esac
 RCENSURE
 chmod 755 /usr/local/bin/claude-rc-ensure
 
 # ------------------------------------------------------- remote-control watchdog
-# Remote Control wedges without the session dying: the pane still works, the footer says
-# "/rc failed", and the phone can no longer drive it. This never restarts a unit and never
-# kills tmux -- it delegates to claude-rc-ensure, which repairs the binding in place.
+# Remote Control wedges without the session dying: the pane still works and the phone can
+# no longer drive it. This never restarts a unit and never kills tmux -- it delegates to
+# claude-rc-ensure, which repairs the binding in place.
+#
+# ONE PLACE DECIDES WHETHER SOMETHING IS BROKEN, and it is claude-rc-ensure. This used to
+# have its own copy of that judgement, and the copy was wrong in the worst possible way: it
+# matched "Remote Control disconnected", which is precisely what ensure's own Disconnect
+# step prints. The watchdog therefore saw the repair's side effect, called it a fault, and
+# repaired again -- ten minutes apart, forever, tearing down healthy connections and
+# spraying stray keystrokes into the prompt as messages.
+#
+# So there is no detection here any more, and no fails counter either: ensure exits
+# immediately when there is nothing to fix, and rate-limits itself to one repair per user
+# per hour. Duplicated state was what let the two layers disagree.
 cat > /usr/local/bin/claude-rc-watchdog <<'RCWD'
 #!/bin/bash
 set -uo pipefail
-STATE=/var/lib/claude-rc-watchdog
-mkdir -p "$STATE"
 for u in ${join(" ", local.nextjs_users)}; do
   id -u "$u" >/dev/null 2>&1 || continue
   pgrep -u "$u" -x claude >/dev/null 2>&1 || continue
-  win=$(sudo -u "$u" -H env HOME="/home/$u" tmux list-windows -a -F '#{window_id}' 2>/dev/null | head -1)
-  [ -n "$win" ] || continue
-  pane=$(sudo -u "$u" -H env HOME="/home/$u" tmux capture-pane -p -t "$win" 2>/dev/null)
-  case "$pane" in
-    *"/rc failed"*|*"Remote Control disconnected"*) ;;
-    *) rm -f "$STATE/$u.fails"; continue ;;
-  esac
-  fails=$(cat "$STATE/$u.fails" 2>/dev/null || echo 0)
-  fails=$((fails + 1))
-  echo "$fails" > "$STATE/$u.fails"
-  # Back off: every tick at first, then every 6th, so a long upstream outage does not mean
-  # typing into someone's prompt every ten minutes for hours.
-  if [ "$fails" -le 3 ] || [ $((fails % 6)) -eq 0 ]; then
-    /usr/local/bin/claude-rc-ensure "$u" || true
-  fi
+  /usr/local/bin/claude-rc-ensure "$u" || true
 done
 RCWD
 chmod 755 /usr/local/bin/claude-rc-watchdog
