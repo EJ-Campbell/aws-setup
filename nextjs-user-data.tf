@@ -1272,10 +1272,18 @@ set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
 echo "=== agent-update $(date -u '+%F %T UTC') ==="
 
-BEFORE_CLAUDE=$(claude --version 2>/dev/null | head -1)
-npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude update failed"
+# claude updates itself now that it is a native per-user install, so there is nothing to
+# npm-install here. Re-run the installer per account: it is a no-op when current, and it
+# repairs an account whose copy went missing.
+for u in ${join(" ", local.nextjs_users)} ubuntu; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  BEFORE=$(sudo -u "$u" -H bash -lc 'claude --version 2>/dev/null | head -1')
+  sudo -u "$u" -H bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 || true
+  AFTER=$(sudo -u "$u" -H bash -lc 'claude --version 2>/dev/null | head -1')
+  echo "claude[$u]: $${BEFORE:-none} -> $${AFTER:-none}"
+done
 npm install -g vercel >/dev/null 2>&1 || echo "WARNING: vercel update failed"
-echo "claude: $${BEFORE_CLAUDE:-none} -> $(claude --version 2>/dev/null | head -1)"
+
 
 for u in ${join(" ", local.nextjs_users)}; do
   id "$u" >/dev/null 2>&1 || continue
@@ -1355,7 +1363,34 @@ if ! command -v tmux >/dev/null 2>&1 || ! /usr/local/bin/tmux -V 2>/dev/null | g
     apt-get install -y tmux || true
   fi
 fi
-command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "WARNING: claude install failed"
+# Claude Code -- the NATIVE installer, per user. See dev-user-data.tf for the full reasoning:
+# npm's "latest" lagged the native channel (2.1.241 vs 2.1.246), a root-owned global install
+# cannot be updated by a normal user so every start retried and failed, and having both
+# installs meant systemd sessions and interactive shells resolved DIFFERENT binaries.
+#
+# Native installs under each user's ~/.local, which suits this box better anyway: five
+# accounts, each with its own copy and its own updates, none needing sudo.
+#
+# Tested with [ -x ~/.local/bin/claude ], never `command -v claude` -- on a box that still
+# has the npm copy, command -v succeeds, the native install gets skipped, and the uninstall
+# below would then leave that account with NO claude.
+for u in ${join(" ", local.nextjs_users)} ubuntu; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  sudo -u "$u" -H bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
+    || echo "WARNING: claude native install failed for $u"
+  sudo -u "$u" -H bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+done
+# Drop the shared npm copy only once every account has its own native one.
+MISSING=0
+for u in ${join(" ", local.nextjs_users)} ubuntu; do
+  id -u "$u" >/dev/null 2>&1 || continue
+  sudo -u "$u" -H test -x "/home/$u/.local/bin/claude" || MISSING=1
+done
+if [ "$MISSING" = "0" ]; then
+  npm uninstall -g @anthropic-ai/claude-code >/dev/null 2>&1 || true
+else
+  echo "WARNING: some accounts lack a native claude -- keeping the npm copy"
+fi
 
 # Vercel CLI. The project deploys to Vercel (the git integration on CoderColton/colton-games
 # builds main automatically), and both kids are members of the Pro team that owns it, so
