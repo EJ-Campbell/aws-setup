@@ -375,10 +375,37 @@ ${local.podman_sysctl_setup}
 # Shell setup
 ${local.shell_setup}
 
-# Claude Code
-# Global npm installs write to /usr/lib/node_modules, which is root-owned -- running
-# this as the ubuntu user fails with EACCES. Install as root; ubuntu only needs to RUN it.
-npm install -g @anthropic-ai/claude-code
+# Claude Code -- the NATIVE installer, deliberately not npm.
+#
+# npm was the wrong channel. On 2026-08-26 the registry's "latest" was 2.1.241 while the
+# native channel was already on 2.1.246, so npm installs were shipping a STALE claude. And
+# because a global npm install lands in root-owned /usr/lib/node_modules, the ubuntu user
+# cannot update it: every session start retried an auto-update, failed with install_failed,
+# and put "Auto-update failed - Run claude doctor" in the TUI of all 12 sessions.
+#
+# Worse, the box ended up with BOTH installs and they disagreed about which claude you got:
+# systemd sessions resolved the native 2.1.246 (its unit PATH puts ~/.local/bin first) while
+# interactive shells resolved the npm 2.1.245, because ~/.local/bin was not on the login
+# PATH. Same command, two different binaries, depending on how you arrived.
+#
+# The native installer writes under ~/.local, so it runs AS ubuntu with no sudo and can
+# keep itself current afterwards.
+# Test for the NATIVE binary specifically, never `command -v claude`: on a box that still
+# has the npm copy, command -v succeeds, the native install is skipped, and the uninstall
+# below then leaves the box with NO claude at all.
+sudo -u ubuntu -H bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
+  || echo "WARNING: claude native install failed"
+
+# ~/.local/bin has to PRECEDE /usr/bin, or a leftover npm copy keeps winning interactively.
+sudo -u ubuntu -H bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+
+# Exactly one claude. Removing the root-owned npm copy is what stops the two installs from
+# disagreeing; the native one above is already in place before this runs.
+if sudo -u ubuntu -H test -x /home/ubuntu/.local/bin/claude; then
+  npm uninstall -g @anthropic-ai/claude-code >/dev/null 2>&1 || true
+else
+  echo "WARNING: native claude missing -- keeping the npm copy rather than leaving no claude"
+fi
 
 ${local.gh_and_claude_sync_script}
 
@@ -443,10 +470,37 @@ ${local.podman_sysctl_setup}
 # Shell setup
 ${local.shell_setup}
 
-# Claude Code
-# Global npm installs write to /usr/lib/node_modules, which is root-owned -- running
-# this as the ubuntu user fails with EACCES. Install as root; ubuntu only needs to RUN it.
-npm install -g @anthropic-ai/claude-code
+# Claude Code -- the NATIVE installer, deliberately not npm.
+#
+# npm was the wrong channel. On 2026-08-26 the registry's "latest" was 2.1.241 while the
+# native channel was already on 2.1.246, so npm installs were shipping a STALE claude. And
+# because a global npm install lands in root-owned /usr/lib/node_modules, the ubuntu user
+# cannot update it: every session start retried an auto-update, failed with install_failed,
+# and put "Auto-update failed - Run claude doctor" in the TUI of all 12 sessions.
+#
+# Worse, the box ended up with BOTH installs and they disagreed about which claude you got:
+# systemd sessions resolved the native 2.1.246 (its unit PATH puts ~/.local/bin first) while
+# interactive shells resolved the npm 2.1.245, because ~/.local/bin was not on the login
+# PATH. Same command, two different binaries, depending on how you arrived.
+#
+# The native installer writes under ~/.local, so it runs AS ubuntu with no sudo and can
+# keep itself current afterwards.
+# Test for the NATIVE binary specifically, never `command -v claude`: on a box that still
+# has the npm copy, command -v succeeds, the native install is skipped, and the uninstall
+# below then leaves the box with NO claude at all.
+sudo -u ubuntu -H bash -c '[ -x "$HOME/.local/bin/claude" ] || curl -fsSL https://claude.ai/install.sh | bash' >/dev/null 2>&1 \
+  || echo "WARNING: claude native install failed"
+
+# ~/.local/bin has to PRECEDE /usr/bin, or a leftover npm copy keeps winning interactively.
+sudo -u ubuntu -H bash -c 'grep -q "HOME/.local/bin" ~/.zshrc 2>/dev/null || printf "%s\n" "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.zshrc'
+
+# Exactly one claude. Removing the root-owned npm copy is what stops the two installs from
+# disagreeing; the native one above is already in place before this runs.
+if sudo -u ubuntu -H test -x /home/ubuntu/.local/bin/claude; then
+  npm uninstall -g @anthropic-ai/claude-code >/dev/null 2>&1 || true
+else
+  echo "WARNING: native claude missing -- keeping the npm copy rather than leaving no claude"
+fi
 
 ${local.gh_and_claude_sync_script}
 
