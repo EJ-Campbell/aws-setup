@@ -24,6 +24,24 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 SVC
 
+# Podman's system services use storage under /mnt/fcvm-btrfs. default.target can
+# start them in parallel with nvme-btrfs.service, so make the storage dependency
+# explicit on every unit that opens the store. A dependency on the mount path is
+# insufficient because the setup service performs the mount itself (there is no
+# corresponding systemd .mount unit).
+for UNIT in \
+    podman.service \
+    podman-clean-transient.service \
+    podman-restart.service \
+    podman-auto-update.service; do
+    install -d -m 0755 "/etc/systemd/system/$UNIT.d"
+    cat > "/etc/systemd/system/$UNIT.d/10-nvme-btrfs.conf" << 'PODMAN_ORDER'
+[Unit]
+Requires=nvme-btrfs.service
+After=nvme-btrfs.service
+PODMAN_ORDER
+done
+
 # Create the setup script
 cat > /usr/local/bin/nvme-btrfs-setup.sh << 'SCRIPT'
 #!/bin/bash
@@ -99,6 +117,19 @@ systemctl enable nvme-btrfs.service
 
 # Run it now too (for first boot)
 /usr/local/bin/nvme-btrfs-setup.sh || true
+
+# When this update first converges on an existing box, the old boot dependency
+# graph may already have let these units race and fail. Retry only failed units
+# now that the mount is ready; future boots are ordered by the drop-ins above.
+for UNIT in \
+    podman.service \
+    podman-clean-transient.service \
+    podman-restart.service \
+    podman-auto-update.service; do
+    if systemctl is-failed --quiet "$UNIT"; then
+        systemctl restart "$UNIT" || echo "WARNING: failed to restart $UNIT"
+    fi
+done
 NVME
 
   # Eternal Terminal (pinned tag, built from source = single source of truth).
