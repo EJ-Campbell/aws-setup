@@ -491,9 +491,10 @@ The home volume is backed up daily/weekly via AWS Backup.
 
 ### ARM Dev Server Storage (fcvm-metal-arm)
 
-The ARM dev server (c7gd.metal) has a persistent 300GB EBS root and two ephemeral local
-NVMe disks. `nvme-btrfs.service` positively identifies instance-store devices and creates
-a Btrfs RAID0 across all of them at `/mnt/fcvm-btrfs`.
+The ARM dev server (c7gd.metal) has a persistent 400GB EBS root and two ephemeral local
+NVMe disks. `/home/ubuntu`, including `~/.codex`, lives on that backed-up root; there is
+no separate ARM home volume. `nvme-btrfs.service` positively identifies instance-store
+devices and creates a Btrfs RAID0 across all of them at `/mnt/fcvm-btrfs`.
 
 **IMPORTANT**: The NVMe drives are ephemeral - data is lost on stop/start. Use for:
 - VM images and caches (`/mnt/fcvm-btrfs/image-cache`)

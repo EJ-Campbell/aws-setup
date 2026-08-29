@@ -196,7 +196,7 @@ historical and must not be reused. Terraform creates its VNC password.
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
-| `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 300 GB EBS root; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
+| `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 400 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
@@ -366,7 +366,7 @@ The two metal boxes are the main `fcvm` workstations:
 
 - ARM64 uses `c7gd.metal`; x86 uses `c5d.metal`.
 - Both are persistent Spot instances with `stop` interruption behavior and static EIPs.
-- Their 300 GB EBS roots survive a normal stop/start.
+- Their EBS roots survive a normal stop/start: 400 GB on ARM and 300 GB on x86.
 - Instance-store NVMe is for VM images, build output, caches, and temporary Btrfs data.
   It is erased by a stop, Spot interruption, or host loss.
 - ARM nested virtualization requires the custom fcvm kernel and patch set documented in
