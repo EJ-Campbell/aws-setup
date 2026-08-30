@@ -639,13 +639,17 @@ after its protected resources exist; `prevent_destroy` is intended to stop that 
 
 The `workflow_job` webhook launches one-time Spot runners from prebuilt ARM64 or x86 AMIs.
 Labels select the architecture; the launcher tries several metal families when capacity is
-scarce, moving a family that just failed for capacity to the back of that order. A runner
-receives a 60-minute lease, renews while GitHub reports it busy, and is terminated when
-idle/expired. Cleanup runs every five minutes: it reaps launches that never came up,
-terminates any runner whose current job has been running for more than three hours — a
-job that long is wedged, and "busy" alone would renew its lease forever — and counts
-GitHub's queued jobs — across in-progress runs too, and ignoring runs with no jobs — to
-launch what the queue actually needs.
+scarce, moving a family that just failed for capacity to the back of that order. Each new
+instance carries `RunnerRegistrationProtocol=ddb-v1`. After GitHub configuration, bootstrap
+validates the exact identity in `.runner`, conditionally records `State=registered` under its
+instance ARN in DynamoDB, and starts the service only after that identity is confirmed.
+
+Cleanup runs every five minutes. Registered protocol-v1 runners are checked by their exact
+GitHub runner id. A conditional DynamoDB `State=reaping` claim after a consistent no-item
+read lets cleanup reap a protocol-v1 instance that never registered. GitHub roster absence
+never supplies that proof. Instances launched before the protocol tag was introduced hold on
+roster absence until the hard ceiling. Cleanup also reaps stalled launches, terminates jobs
+running for more than three hours, and counts queued jobs to retry scale-up.
 
 A runner instance lives at most **13 hours 30 minutes**, checked on the five-minute poll,
 so the observed maximum is that plus one interval. Past 12 hours it drains:
@@ -655,6 +659,9 @@ runner is doing and whatever GitHub says, so a wedged host cannot outlive it. A 
 termination that never saw the runner idle logs `HARD-CEILING KILL`; that job will appear
 on GitHub as "the self-hosted runner lost communication with the server", which is
 otherwise indistinguishable from an AWS Spot reclaim.
+
+The EC2 hard-ceiling pass completes before cleanup reads the PAT or calls GitHub, so GitHub
+latency cannot defer the bound.
 
 Terraform owns both halves of that webhook: it generates the HMAC secret, sets it on the
 `ejc3/fcvm` hook through the `integrations/github` provider, and passes the same value to

@@ -28,6 +28,8 @@ from pathlib import Path
 
 TF_FILE = Path(__file__).resolve().parent.parent / "runner-autoscale.tf"
 NOW = datetime(2026, 8, 7, 20, 0, 0, tzinfo=timezone.utc)
+ACCOUNT_ID = "928413605543"
+REGION = "us-west-1"
 
 
 # --------------------------------------------------------------------------
@@ -59,7 +61,7 @@ class FakeEC2:
     """Just enough EC2 to drive the launcher and the reaper."""
 
     def __init__(self, instances=(), run_instances_errors=None, terminate_error=None,
-                 lookup_error=None, journal=None):
+                 lookup_error=None, create_tags_error=None, journal=None):
         self.instances = list(instances)
         self.run_instances_errors = run_instances_errors or {}
         # TerminateInstances rejected: an IAM change, DisableApiTermination, a
@@ -71,6 +73,7 @@ class FakeEC2:
         # instance": one is "could not ask", the other is "it is gone", and the
         # orphan phase deregisters on the second.
         self.lookup_error = lookup_error
+        self.create_tags_error = create_tags_error
         # Optional list shared with FakeGitHub, so the ORDER of AWS and GitHub work
         # within one invocation can be asserted. Phase order is a safety property
         # here: a Lambda timeout is not catchable, so anything unbounded that runs
@@ -117,6 +120,8 @@ class FakeEC2:
     def create_tags(self, **kw):
         self.calls.append(("create_tags", kw))
         self.journal.append(f"ec2:create_tags:{','.join(kw['Resources'])}")
+        if self.create_tags_error:
+            raise self.create_tags_error
         # An accepted CreateTags has to be visible to the NEXT describe_instances,
         # for the same reason an accepted terminate has to move the instance: a
         # case that spans two polls would otherwise assert against a world in
@@ -157,11 +162,60 @@ class FakeClientError(Exception):
         self.response = {"Error": {"Code": code, "Message": message}}
 
 
+class FakeDynamoDB:
+    """Strongly consistent registration rows with conditional-create semantics."""
+
+    def __init__(self, items=(), put_error=None, write_then_error=False,
+                 concurrent_item=None, get_error=None):
+        self.items = {}
+        for item in items:
+            self.items[item["InstanceArn"]["S"]] = item
+        self.put_error = put_error
+        self.write_then_error = write_then_error
+        self.concurrent_item = concurrent_item
+        self.get_error = get_error
+        self.calls = []
+
+    @staticmethod
+    def _arn_from_key(key):
+        return key["InstanceArn"]["S"]
+
+    def get_item(self, **kw):
+        self.calls.append(("get_item", kw))
+        assert kw.get("ConsistentRead") is True, kw
+        if self.get_error:
+            raise self.get_error
+        item = self.items.get(self._arn_from_key(kw["Key"]))
+        return {"Item": item} if item is not None else {}
+
+    def put_item(self, **kw):
+        self.calls.append(("put_item", kw))
+        arn = kw["Item"]["InstanceArn"]["S"]
+        if self.concurrent_item is not None:
+            concurrent = self.concurrent_item
+            self.concurrent_item = None
+            self.items[concurrent["InstanceArn"]["S"]] = concurrent
+        if kw.get("ConditionExpression") == "attribute_not_exists(InstanceArn)" and arn in self.items:
+            raise FakeClientError("ConditionalCheckFailedException")
+        if self.write_then_error:
+            self.items[arn] = kw["Item"]
+            raise self.put_error or OSError("PutItem outcome unknown")
+        if self.put_error:
+            raise self.put_error
+        self.items[arn] = kw["Item"]
+        return {}
+
+    def ops(self, name):
+        return [kw for op, kw in self.calls if op == name]
+
+
 class FakeSSM:
-    def __init__(self, pat="ghp_test"):
+    def __init__(self, pat="ghp_test", journal=None):
         self.pat = pat
+        self.journal = journal if journal is not None else []
 
     def get_parameter(self, **kw):
+        self.journal.append(f"ssm:get_parameter:{kw['Name']}")
         if kw["Name"].endswith("/pat"):
             return {"Parameter": {"Value": self.pat}}
         return {"Parameter": {"Value": "IyEvYmluL2Jhc2gK"}}
@@ -334,7 +388,8 @@ def capture_emf(emit, **kwargs):
     return json.loads(buf.getvalue().strip().splitlines()[-1])
 
 
-def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW):
+def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
+                dynamodb=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
@@ -344,7 +399,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     """
     os.environ.clear()
     os.environ.update(_BASE_ENV)
-    clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client}
+    clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client,
+               "dynamodb": dynamodb or FakeDynamoDB()}
     fake_boto3 = types.ModuleType("boto3")
     fake_boto3.client = lambda service, **kw: clients[service]
     sys.modules["boto3"] = fake_boto3
@@ -361,6 +417,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
         "MAX_RUNNERS": "4",
+        "REGISTRATION_TABLE": "github-runner-registration",
+        "RUNNER_ACCOUNT_ID": "928413605543",
         **(env or {}),
     })
 
@@ -403,6 +461,33 @@ def run(run_id, status):
 def job(status, arch, name="job"):
     labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
     return {"name": name, "status": status, "labels": labels}
+
+
+def instance_arn(instance_id):
+    return f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:instance/{instance_id}"
+
+
+def registered_item(instance_id="i-lease", runner_id=77, runner_name=None):
+    """One immutable registration claim as user data writes it."""
+    name = runner_name or f"runner-{instance_id}"
+    return {
+        "InstanceArn": {"S": instance_arn(instance_id)},
+        "State": {"S": "registered"},
+        "InstanceId": {"S": instance_id},
+        "RunnerName": {"S": name},
+        "RunnerId": {"N": str(runner_id)},
+        "RegisteredAt": {"S": NOW.isoformat()},
+    }
+
+
+def reaping_item(instance_id="i-lease"):
+    """One cleanup-owned claim proving bootstrap can no longer start service."""
+    return {
+        "InstanceArn": {"S": instance_arn(instance_id)},
+        "State": {"S": "reaping"},
+        "InstanceId": {"S": instance_id},
+        "ReapingAt": {"S": NOW.isoformat()},
+    }
 
 
 # --------------------------------------------------------------------------
@@ -496,6 +581,19 @@ def case_every_launchable_type_has_instance_storage():
                 f"{arch}: {t} has no instance storage; it would boot a runner "
                 f"that cannot build /mnt/fcvm-btrfs"
             )
+
+
+def case_every_new_runner_declares_the_atomic_registration_protocol():
+    """Only explicitly versioned launches may use the no-row cleanup claim."""
+    ec2 = FakeEC2()
+    webhook(ec2)["launch_runner"]("arm64")
+    calls = ec2.ops("run_instances")
+    assert len(calls) == 1, calls
+    tag_specs = calls[0]["TagSpecifications"]
+    instance_tags = next(spec["Tags"] for spec in tag_specs
+                         if spec["ResourceType"] == "instance")
+    tags = {tag["Key"]: tag["Value"] for tag in instance_tags}
+    assert tags["RunnerRegistrationProtocol"] == "ddb-v1", tags
 
 
 def case_arm_types_are_graviton3_or_newer():
@@ -688,9 +786,9 @@ def case_one_arch_failure_does_not_rotate_the_other():
 # Cases: the cleanup Lambda's reaper and queue scan
 # --------------------------------------------------------------------------
 
-def cleanup(ec2, github, lambda_client=None, env=None, ssm=None):
+def cleanup(ec2, github, lambda_client=None, env=None, ssm=None, dynamodb=None):
     return load_lambda(CLEANUP_SRC, ec2, ssm or FakeSSM(), lambda_client or FakeLambdaClient(),
-                       github, env)
+                       github, env, dynamodb=dynamodb)
 
 
 def case_stalled_launch_is_tagged_then_terminated():
@@ -1337,7 +1435,8 @@ def case_absolute_runner_lifetime_is_13h30m():
 
 def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                runners_error=False, runners_total=None, ssm=None,
-               instance_id="i-lease", runner_payloads=None):
+               instance_id="i-lease", runner_payloads=None, dynamodb=None,
+               recheck=None):
     """One cleanup poll over a single running runner UNDER the soft cap.
 
     The lease is what is under test, so the instance is deliberately young
@@ -1349,10 +1448,11 @@ def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
     ec2 = FakeEC2([instance(instance_id, "c7g.metal", "running", age_minutes,
                             arch="arm64", tags=all_tags)])
     github = FakeGitHub(runners=list(runners), runners_error=runners_error,
-                        runners_total=runners_total, runner_payloads=runner_payloads)
+                        runners_total=runners_total, runner_payloads=runner_payloads,
+                        recheck=recheck)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
+        result = cleanup(ec2, github, ssm=ssm, dynamodb=dynamodb)["handler"]({}, None)
     return result, ec2, github, buf.getvalue()
 
 
@@ -1393,19 +1493,32 @@ def case_an_idle_runner_past_its_lease_is_still_terminated():
     assert result["held"] == [], result
 
 
-def case_a_runner_that_never_registered_still_dies_at_its_lease():
-    """A box that booted and never joined must not be held to the ceiling.
+def case_lease_expiry_rechecks_the_exact_runner_before_termination():
+    """A job assigned after the roster snapshot must survive lease cleanup."""
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-lease", busy=False)],
+        recheck={77: runner_record("i-lease", busy=True)})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["expired"] == [], result
+    assert result["held"] == ["i-lease"], result
 
-    user_data registers only when the IPv6 gate passes AND the PAT reads back
-    from SSM, so an instance that stays `running` and never registers is a
-    designed-for outcome, not a hypothetical. Nothing else reaps it: phase 5
-    only walks `pending`, and the age phase would leave it running for 13h30m.
-    The lease is what kills it, and GitHub listing other runners while never
-    having listed this one is a real answer about it.
+
+def case_a_runner_that_never_registered_still_dies_at_its_lease():
+    """A versioned box that never claimed registration dies at its lease.
+
+    The launch-time protocol tag proves this instance uses the atomic claim
+    handshake. A successful conditional `reaping` claim then proves bootstrap
+    cannot later start the service. GitHub roster absence is not involved.
     """
-    result, ec2, _, _ = lease_poll(runners=[runner_record("i-other")])
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"},
+        runners=[runner_record("i-other")], dynamodb=dynamodb)
     assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
     assert result["expired"] == ["i-lease"], result
+    claims = dynamodb.ops("put_item")
+    assert len(claims) == 1, claims
+    assert claims[0]["Item"] == reaping_item(), claims[0]["Item"]
 
 
 def case_a_registered_runner_missing_from_a_readable_roster_holds_its_lease():
@@ -1448,6 +1561,16 @@ def case_a_missing_pat_is_not_evidence_that_a_runner_is_idle():
     result, ec2, _, _ = lease_poll(ssm=FakeSSM(pat="placeholder"))
     assert terminated_ids(ec2) == [], terminated_ids(ec2)
     assert result["held"] == ["i-lease"], result
+
+
+def case_the_pat_value_is_never_logged():
+    """Even a prefix of a credential does not belong in CloudWatch."""
+    secret = "ghp_super_secret_value"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cleanup(FakeEC2(), FakeGitHub(), ssm=FakeSSM(pat=secret))["handler"]({}, None)
+    assert secret not in buf.getvalue(), buf.getvalue()
+    assert secret[:10] not in buf.getvalue(), buf.getvalue()
 
 
 def case_a_record_with_no_busy_flag_is_not_read_as_idle():
@@ -1526,8 +1649,8 @@ def case_an_explicitly_offline_busy_runner_still_loses_its_lease():
     assert result["expired"] == ["i-lease"], result
 
 
-def case_explicit_renewal_provenance_proves_the_runner_once_registered():
-    """Registration is persisted explicitly, never inferred from lease timing."""
+def case_renewal_timestamp_does_not_promote_legacy_registration():
+    """Old renewal tags do not authorize action on roster absence."""
     result, ec2, _, _ = lease_poll(
         age_minutes=200, lease_minutes_ago=45, runners=[runner_record("i-other")],
         tags={"LeaseRenewedAt": (NOW - timedelta(minutes=46)).isoformat()})
@@ -1535,12 +1658,11 @@ def case_explicit_renewal_provenance_proves_the_runner_once_registered():
     assert result["held"] == ["i-lease"], result
 
 
-def case_lease_timestamp_microseconds_are_not_registration_provenance():
+def case_lease_timestamp_microseconds_never_authorize_legacy_reaping():
     """An initial lease can straddle EC2's launch-time precision by one microsecond.
 
-    None of the three values below says GitHub ever listed the instance. Inferring
-    registration from `LeaseExpires > LaunchTime + 60m` turns only the +1us value
-    into a registered runner and holds that unregistered husk to the hard ceiling.
+    None of the three values below says whether the deployed legacy instance
+    registered. All three therefore fail closed, independent of rounding.
     """
     age = timedelta(minutes=200)
     launch = NOW - age
@@ -1551,33 +1673,28 @@ def case_lease_timestamp_microseconds_are_not_registration_provenance():
         with contextlib.redirect_stdout(io.StringIO()):
             result = cleanup(ec2, FakeGitHub(
                 runners=[runner_record("i-other")]))["handler"]({}, None)
-        assert terminated_ids(ec2) == [f"i-husk-{offset}"], (offset, terminated_ids(ec2))
-        assert result["expired"] == [f"i-husk-{offset}"], (offset, result)
+        assert still_running(ec2) == [f"i-husk-{offset}"], (offset, still_running(ec2))
+        assert result["held"] == [f"i-husk-{offset}"], (offset, result)
 
 
-def case_an_initial_lease_does_not_turn_a_legacy_husk_into_a_registered_runner():
-    """Setting a missing initial lease must not persist renewal provenance.
+def case_unknown_legacy_instance_without_a_lease_is_held():
+    """No tag on an old deployment is proof that it never registered.
 
-    A legacy running instance with neither a lease nor a GitHub registration gets
-    one grace lease. The next answered poll must still reap it; using renew_lease
-    for the initial write makes the new deadline look like evidence of a job.
+    The rollout cannot distinguish a new husk from a live pre-schema runner by
+    looking at missing fields. It writes no lease and waits for positive evidence
+    or the hard ceiling.
     """
     inst = instance("i-husk", "c7g.metal", "running", 200, arch="arm64")
     ec2 = FakeEC2([inst])
     github = FakeGitHub(runners=[runner_record("i-other")])
     with contextlib.redirect_stdout(io.StringIO()):
-        first = cleanup(ec2, github)["handler"]({}, None)
+        result = cleanup(ec2, github)["handler"]({}, None)
     assert terminated_ids(ec2) == [], terminated_ids(ec2)
-    assert first["renewed"] == [], first
+    assert result["renewed"] == [], result
+    assert result["held"] == ["i-husk"], result
     tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
+    assert "LeaseExpires" not in tags, tags
     assert "LeaseRenewedAt" not in tags, tags
-
-    tags["LeaseExpires"] = (NOW - timedelta(microseconds=1)).isoformat()
-    inst["Tags"] = [{"Key": key, "Value": value} for key, value in tags.items()]
-    with contextlib.redirect_stdout(io.StringIO()):
-        second = cleanup(ec2, github)["handler"]({}, None)
-    assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
-    assert second["expired"] == ["i-husk"], second
 
 
 def case_busy_renewal_persists_explicit_provenance_with_the_lease():
@@ -1590,6 +1707,168 @@ def case_busy_renewal_persists_explicit_provenance_with_the_lease():
     assert len(lease_writes) == 1, lease_writes
     written = {tag["Key"]: tag["Value"] for tag in lease_writes[0]["Tags"]}
     assert written["LeaseRenewedAt"] == NOW.isoformat(), written
+
+
+def case_failed_busy_renewal_is_not_reported_and_leaves_the_runner_safe():
+    """A rejected tag write is not a renewal and must not seed a later kill.
+
+    The lease and renewal timestamp are in one CreateTags call. If AWS rejects
+    that call, reporting the instance in `renewed` lies about the extension. The
+    next poll also cannot turn missing legacy evidence into permission to act on
+    roster absence.
+    """
+    inst = instance(
+        "i-lease", "c7g.metal", "running", 60, arch="arm64",
+        tags={"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat()},
+    )
+    ec2 = FakeEC2([inst], create_tags_error=OSError("CreateTags unavailable"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = cleanup(ec2, FakeGitHub(
+            runners=[runner_record("i-lease", busy=True)]))["handler"]({}, None)
+    assert first["renewed"] == [], first
+    tags = {tag["Key"]: tag["Value"] for tag in inst["Tags"]}
+    assert "LeaseRenewedAt" not in tags, tags
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        second = cleanup(ec2, FakeGitHub(runners=[]))["handler"]({}, None)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert second["held"] == ["i-lease"], second
+
+
+def case_legacy_registered_runner_without_new_tags_fails_closed():
+    """Deployment cannot reinterpret every existing runner as a new husk.
+
+    The live fleet predates the explicit registration tags. Its leases have been
+    renewed by successful busy polls, but a new Lambda's first response may omit
+    one runner. Unknown schema is legacy and must hold. Only the launch-time
+    protocol plus an atomic reaping claim may authorize the no-row path.
+    """
+    result, ec2, _, _ = lease_poll(
+        age_minutes=300, lease_minutes_ago=45,
+        runners=[runner_record("i-other")],
+    )
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_protocol_instance_is_held_until_its_lease_expires():
+    """Cleanup must not race bootstrap before the launch lease expires."""
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(
+        age_minutes=30, lease_minutes_ago=-5,
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb,
+    )
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert dynamodb.ops("put_item") == [], dynamodb.ops("put_item")
+
+
+def case_cleanup_claim_makes_a_protocol_husk_reapable():
+    """The conditional claim, not roster absence, excludes a later service start."""
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(
+        age_minutes=70, lease_minutes_ago=5,
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb,
+    )
+    assert still_running(ec2) == [], still_running(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
+
+
+def case_registered_identity_uses_an_exact_lookup_when_the_roster_omits_it():
+    """The immutable runner ID outranks absence from an offset roster walk."""
+    exact = runner_record("i-lease", busy=True, runner_id=77)
+    result, ec2, _, _ = lease_poll(
+        age_minutes=70, lease_minutes_ago=5,
+        tags={"RunnerRegistrationProtocol": "ddb-v1"},
+        runners=[],
+        dynamodb=FakeDynamoDB([registered_item()]),
+        recheck={77: exact},
+    )
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["renewed"] == ["i-lease"], result
+    assert result["held"] == [], result
+
+
+def case_registered_identity_lookup_failure_holds():
+    """A direct 404 or transport error is absence of evidence."""
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"},
+        runners=[], dynamodb=FakeDynamoDB([registered_item()]),
+        recheck={77: None})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_registered_identity_mismatch_holds():
+    """A reused or malformed runner ID is not evidence about this instance."""
+    mismatches = [
+        {"id": 78, "name": "runner-i-lease", "busy": False, "status": "online"},
+        {"id": 77, "name": "runner-i-other", "busy": False, "status": "online"},
+        {"id": True, "name": "runner-i-lease", "busy": False, "status": "online"},
+    ]
+    for exact in mismatches:
+        result, ec2, _, _ = lease_poll(
+            tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+            dynamodb=FakeDynamoDB([registered_item()]), recheck={77: exact})
+        assert still_running(ec2) == ["i-lease"], (exact, still_running(ec2))
+        assert result["held"] == ["i-lease"], (exact, result)
+
+
+def case_invalid_registration_row_holds():
+    """Malformed provenance cannot become a destructive verdict."""
+    malformed = registered_item()
+    malformed["RunnerId"] = {"N": "not-an-integer"}
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=FakeDynamoDB([malformed]))
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_unreadable_registration_table_holds():
+    """A throttled or unauthorized strong read cannot authorize termination."""
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=FakeDynamoDB(get_error=OSError("GetItem unavailable")))
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_cleanup_claim_unknown_outcome_is_resolved_by_consistent_read():
+    """A timed-out PutItem may have won; only the strong read decides."""
+    dynamodb = FakeDynamoDB(put_error=OSError("response lost"), write_then_error=True)
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
+
+
+def case_existing_reaping_claim_retries_a_failed_terminate():
+    """A prior cleanup win remains actionable on the next poll."""
+    dynamodb = FakeDynamoDB([reaping_item()])
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert dynamodb.ops("put_item") == [], dynamodb.ops("put_item")
+
+
+def case_existing_registration_claim_blocks_cleanup_reaping():
+    """Bootstrap winning between cleanup's read and write leaves it alive."""
+    dynamodb = FakeDynamoDB(concurrent_item=registered_item())
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb, recheck={77: None})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert len(dynamodb.ops("put_item")) == 1, dynamodb.ops("put_item")
+    assert dynamodb.items[instance_arn("i-lease")] == registered_item()
 
 
 def case_unusable_runner_identity_makes_the_roster_unread():
@@ -1641,14 +1920,37 @@ def case_a_duplicate_across_pages_cannot_prove_absence():
             runner_payloads=[
                 {"total_count": 101, "runners": first},
                 {"total_count": 101, "runners": [repeated]},
+                {"total_count": 101, "runners": first},
+                {"total_count": 101, "runners": [repeated]},
             ])
-        inst = instance("i-lease", "c7g.metal", "running", 60, arch="arm64",
-                        tags={"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat()})
-        ec2 = FakeEC2([inst])
+        module = cleanup(FakeEC2(), github)
         with contextlib.redirect_stdout(io.StringIO()):
-            result = cleanup(ec2, github)["handler"]({}, None)
-        assert still_running(ec2) == ["i-lease"], (repeated, still_running(ec2))
-        assert result["held"] == ["i-lease"], (repeated, result)
+            roster = module["get_runners"]("ghp_test")
+        assert roster is None, (repeated, roster)
+
+
+def case_two_equal_offset_walks_still_cannot_prove_absence():
+    """The same page-boundary shift can repeat across both traversals.
+
+    Runner i-lease (id 101) remains registered throughout. Between pages an
+    earlier record is removed, moving it backward across the offset, while a new
+    record is added after it. Restoring and repeating that churn produces two
+    equal, count-complete, duplicate-free walks that both omit i-lease.
+    """
+    first = [runner_record(f"i-other-{number}", busy=False, runner_id=number)
+             for number in range(1, 101)]
+    target = runner_record("i-lease", busy=True, runner_id=101)
+    shifted = runner_record("i-new-after-boundary", busy=False, runner_id=102)
+    pages = [
+        {"total_count": 101, "runners": first},
+        {"total_count": 101, "runners": [shifted]},
+    ] * 2
+    result, ec2, github, _ = lease_poll(
+        runners=[*first, target], runner_payloads=pages,
+    )
+    assert len([url for url in github.requests if "/actions/runners?" in url]) == 4
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
 
 
 def case_a_listed_runner_with_no_id_holds_its_lease():
@@ -1684,9 +1986,12 @@ def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
     """
     roster = [{"id": n, "name": f"runner-i-other{n}", "busy": False, "status": "online"}
               for n in range(1, 1001)]
-    result, ec2, _, _ = lease_poll(runners=roster)
-    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
-    assert result["expired"] == ["i-lease"], result
+    github = FakeGitHub(runners=roster)
+    module = cleanup(FakeEC2(), github)
+    result = module["get_runners"]("ghp_test")
+    assert len(result) == 1000, len(result)
+    reads = [url for url in github.requests if "/actions/runners?" in url]
+    assert len(reads) == 20, reads
 
 
 def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
@@ -1728,13 +2033,37 @@ def case_every_ceiling_terminate_precedes_every_optional_tag_write():
     assert all(index > kill for index in tag_writes), journal
 
 
+def case_every_ceiling_terminate_precedes_pat_and_roster_work():
+    """SSM and GitHub are optional to a launch-time-only lifetime bound."""
+    journal = []
+    ec2 = FakeEC2([
+        instance("i-aged-a", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+        instance("i-aged-b", "c7g.metal", "running", HARD_CEILING_MINUTES + 10,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+    ], journal=journal)
+    github = FakeGitHub(runners=[runner_record("i-aged-a", runner_id=1),
+                                 runner_record("i-aged-b", runner_id=2)], journal=journal)
+    ssm = FakeSSM(journal=journal)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
+    kills = [index for index, event in enumerate(journal)
+             if event.startswith("ec2:terminate:i-aged-")]
+    assert len(kills) == 2, journal
+    optional_reads = [index for index, event in enumerate(journal)
+                      if event.startswith("ssm:") or event.startswith("github:GET:")]
+    assert optional_reads, journal
+    assert all(kill < index for kill in kills for index in optional_reads), journal
+
+
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
     """The verdict is per instance, and one poll can hold one and reap another.
 
-    This is the mixed answer the RunnerSeenAt tag exists for: a roster that
-    lists neither box, one of which was registered a moment ago and one of
-    which never registered at all. Holding both would leave a husk running to
-    the 13h30m ceiling; reaping both is ejc3/aws#45.
+    The legacy box has no schema that can distinguish a live omitted runner
+    from a husk, so it holds. The protocol-v1 box has no registration row, so
+    cleanup can win the atomic reaping claim and terminate only that instance.
     """
     expired = (NOW - timedelta(minutes=45)).isoformat()
     ec2 = FakeEC2([
@@ -1742,14 +2071,18 @@ def case_a_held_lease_does_not_shield_the_instance_beside_it():
                  tags={"LeaseExpires": expired,
                        "RunnerSeenAt": (NOW - timedelta(minutes=6)).isoformat()}),
         instance("i-husk", "c7g.metal", "running", 60, arch="arm64",
-                 tags={"LeaseExpires": expired}),
+                 tags={"LeaseExpires": expired,
+                       "RunnerRegistrationProtocol": "ddb-v1"}),
     ])
+    dynamodb = FakeDynamoDB()
     with contextlib.redirect_stdout(io.StringIO()):
-        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]))["handler"]({}, None)
+        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]),
+                         dynamodb=dynamodb)["handler"]({}, None)
     assert still_running(ec2) == ["i-live"], still_running(ec2)
     assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
     assert result["held"] == ["i-live"], result
     assert result["expired"] == ["i-husk"], result
+    assert dynamodb.items[instance_arn("i-husk")] == reaping_item("i-husk")
 
 
 def case_a_held_runner_is_still_terminated_at_the_ceiling():

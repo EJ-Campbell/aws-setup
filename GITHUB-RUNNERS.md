@@ -63,7 +63,8 @@ self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to *
 per architecture** (`local.runner_max_per_arch`, shared with the cleanup Lambda). ARM tries
 `c7gd`/`m7gd`/`r7gd.metal`; x86 tries `c5d`/`m5d`/`r5d`/`m6id.metal`, with any type
 that recently failed for capacity moved to the back of that order. Each instance is tagged
-with a `LeaseExpires` 60 minutes out.
+with a `LeaseExpires` 60 minutes out and `RunnerRegistrationProtocol=ddb-v1`. The protocol
+tag selects the registration handshake. It is not evidence that registration succeeded.
 
 ARM types must additionally be **Graviton3 or newer** (family digit >= 7): fcvm's nested
 virtualisation tests need FEAT_NV2, which Graviton2 lacks, so a job landing on `c6gd.metal`
@@ -132,15 +133,27 @@ indistinguishable from one that never launched. `runner-zero-online` fires after
 it is suppressed while GitHub is unreachable, where `online` is 0 by construction and
 `runner-pat-unusable` covers the gap.
 
-**Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
-Advanced tier, base64 — too big for Lambda's 4 KB env limit). On boot it sets up the box
-(btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads the PAT from SSM
-(`/github-runner/pat`, decrypted), exchanges it for a short-lived **registration token** via
-`POST /repos/ejc3/fcvm/actions/runners/registration-token`, and runs
-`config.sh --url https://github.com/ejc3/fcvm --token <reg> --name runner-<instance-id>
---labels self-hosted,Linux,<ARM64|X64> --unattended --replace`, then installs the runner as
-a service. The PAT itself never leaves AWS; what touches `config.sh` is the ephemeral
-registration token derived from it.
+**Registration.** The instance user data lives in SSM at `/github-runner/user-data`. On boot
+it prepares storage, KVM, and IPv6, reads the runner PAT, creates a short-lived GitHub
+registration token, and runs `config.sh` with the name `runner-<instance-id>`.
+
+After `config.sh` succeeds, bootstrap reads `/opt/actions-runner/.runner` and requires its
+`AgentName` to equal `runner-<instance-id>` and its `AgentId` to be a positive integer. It
+then conditionally creates an item in `github-runner-registration`, keyed by the EC2 instance
+ARN, with `State=registered`, `InstanceId`, `RunnerName`, `RunnerId`, and `RegisteredAt`. The
+condition is `attribute_not_exists(InstanceArn)`.
+
+The runner service starts only after that write succeeds, or after a consistent read following
+an uncertain write result returns the same complete registered identity. If cleanup already
+created `State=reaping`, bootstrap removes the GitHub registration on a best-effort basis and
+does not start the service. Registration and reaping compete on one conditional create, so
+only one can win. The PAT is used only to authenticate GitHub API calls and is not passed to
+`config.sh`; `config.sh` receives the short-lived token. Xtrace is disabled before either
+token is read so neither appears in cloud-init or serial-console logs.
+
+The protocol tag is never backfilled onto existing instances. Terraform updates the table,
+cleanup Lambda, both IAM policies, and the user-data parameter before it updates the webhook
+Lambda that can launch tagged instances. Instances without the tag remain on legacy rules.
 
 Two of those setup steps are **gates, and they run before `config.sh`**: a runner that
 cannot host a job must not join the pool, because from CI's side a broken runner is
@@ -160,22 +173,17 @@ indistinguishable from a code defect.
   fcvm suite failed with `No global IPv6 address found on host` — on a PR that had touched
   only `bench/chromium/*.py`.
 
-`scripts/test-runner-userdata.sh` extracts the real heredoc from the `.tf` and checks that
-both gates refuse the shapes they exist for, and that each precedes registration.
+`scripts/test-runner-userdata.sh` extracts the real heredoc and checks that the storage and
+IPv6 gates precede `config.sh`, the `.runner` identity is validated after `config.sh`, and the
+registered claim precedes service installation and startup. It executes the registration tail
+against bootstrap-wins, cleanup-wins, uncertain-write, and unread-result fakes.
 
-**Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
-(`rate(5 minutes)`) and does seven things, five of them using the PAT: deregisters GitHub
-runners whose instance is gone; renews the lease on busy runners (+60m), lets the lease of
-runners GitHub reports idle expire, then terminates and deregisters anything past its lease
-(instances younger than 10 minutes are skipped so setup isn't interrupted); **holds** the
-lease of runners GitHub said nothing usable about; drains runners past the 12h soft cap and
-terminates them at the 13h30m hard ceiling; **terminates any runner whose current job
-has been `in_progress` longer than `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray
-`ami-builder-temp` instances older than 2 hours (pure EC2, no PAT); reaps launches still
-`pending` after 15 minutes; and counts GitHub's queued jobs to launch what the queue
-actually needs — GitHub doesn't redeliver webhooks, so this poll is the retry, and it
-passes the per-architecture queued count along so the decision record has the demand side
-too.
+**Reaping.** `github-runner-cleanup` runs every five minutes. Its first fleet pass is EC2-only
+and attempts every hard-ceiling termination before reading the PAT or calling GitHub. Later
+phases renew proven busy runners, expire runners on fresh positive state, reap protocol-v1
+launches whose absent registration row was atomically claimed as `State=reaping`, drain old
+runners, remove stuck jobs and orphaned registrations, reap stalled Spot launches, and retry
+queued demand.
 
 **Why job duration is the health signal.** A wedged host keeps its assigned job, so
 `busy` stays true and the lease renews forever; the host is still online, so a liveness check
@@ -192,46 +200,38 @@ purpose — the runner AMI publishes no CloudWatch metrics, and an on-box guard 
 `ejc3/fcvm` uses for disk in `runner-disk-guard.timer`) cannot be trusted to run on a host
 whose scheduler is the thing that failed.
 
-**A lease moves only on an answer.** The lease phase reads GitHub's runner roster and takes
-one of three verdicts per instance. `RENEW` when GitHub reports the runner online and busy.
-`EXPIRE` when GitHub answered with something that cannot mean "working" — `busy=false`, or
-`busy=true` with the runner offline (that is the wedged host below), or no record at all for
-an instance no poll has ever seen registered. `HOLD` for everything else: the roster could
-not be read, or it could be read and omits a runner that some earlier poll did see. A held
-lease is not renewed and not allowed to expire into a termination, so the instance keeps
-whatever expiry it already had and the age ceiling remains the bound on it.
+**A lease moves only on positive, current evidence.** `RENEW` requires a runner with the exact
+expected identity reporting `status=online` and `busy=true`. `EXPIRE` requires the same
+identity explicitly reporting `busy=false`, or `busy=true` with `status=offline`. Errors,
+malformed fields, identity mismatches, unknown statuses, and missing records produce `HOLD`.
 
-The distinction is the whole point (`ejc3/aws#45`). A missing runner record used to read as
-`busy=false`, which is survivable for one blip — the lease gives 60 minutes of grace — and
-fatal for an outage: once GitHub had been unreachable, or answering without the runner, for
-longer than the remaining lease, every runner took the idle path and was terminated up to 60
-minutes in, mid-job, while still under the soft cap. On GitHub that renders as "The
-self-hosted runner lost communication with the server", indistinguishable from a spot
-reclaim, which is the same misattributed failure `ejc3/fcvm#884` cost a night of reruns to.
+A roster traversal supplies positive evidence only for records it returned. An omission never
+proves that an instance did not register. Offset pagination can shift between page requests
+while retaining the same `total_count` and no duplicate identities, and two traversals can
+omit the same record. No number of agreeing offset traversals authorizes lease expiry,
+termination, or deregistration from absence.
 
-A read counts as unread unless two complete roster traversals agree. Every page must carry a
-`runners` array and one unchanged non-negative integer `total_count`; the records collected
-must reach that count without a duplicate name or id. Runner names must contain non-whitespace
-text and ids must be positive integers (Python booleans are rejected even though they are
-integer subclasses). The two duplicate-free traversals must then produce the same records.
-A short or shifting pagination reads exactly like "that runner is not registered", so it
-cannot authorize lease expiry or orphan deletion.
+For an instance tagged `RunnerRegistrationProtocol=ddb-v1`, cleanup reads its DynamoDB item
+consistently. A valid `State=registered` item contains the exact instance id, runner name, and
+positive runner id captured from `.runner`. Cleanup queries
+`GET /repos/ejc3/fcvm/actions/runners/<RunnerId>` and requires the response id and name to
+match before using its status. A 404, GitHub error, malformed response, mismatched identity,
+or unreadable registration item holds the instance.
 
-`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner.
-`LeaseRenewedAt` is written atomically with `LeaseExpires` when GitHub reports the runner
-online and busy, so it preserves the same fact if the separate seen write fails. Those are the
-only persisted registration signals. Lease timing is not one: EC2's launch timestamp and the
-launcher's initial expiry can differ at microsecond precision, so comparing `LeaseExpires` to
-launch time plus 60 minutes misclassified an initial lease as a renewal. An initial lease
-written for a legacy instance deliberately carries no renewal tag.
+A consistent no-item result has one narrow meaning for protocol v1: bootstrap has not claimed
+registration. Once the initial lease expires, cleanup conditionally creates `State=reaping`
+under the same instance ARN. It terminates only after its write succeeds or a consistent read
+after an uncertain result confirms the exact reaping item. A concurrently created registered
+item wins instead and is not treated as absent.
 
-The explicit signals separate "GitHub answered and does not list this runner" (ambiguous: a
-real deregistration and an answer that dropped records look identical) from "this runner has
-never registered at all", a box that booted and never joined because the IPv6 gate refused or
-the PAT did not read back from SSM. An unregistered legacy box gets one initial lease but is
-still reaped when it expires. Nothing else would reap it: the instance sits in `running`, where
-the stalled-launch phase (which walks `pending`) cannot see it. `RunnerSeenAt` also dates an
-outage, so a blip and a three-hour outage produce different log lines.
+Instances without the protocol tag predate this handshake. A returned roster identity may
+still supply positive lease evidence, but roster absence always holds a legacy instance until
+the hard ceiling. `RunnerSeenAt` and `LeaseRenewedAt` remain operational timestamps, not
+registration provenance, and they never promote a legacy instance into protocol v1.
+
+A renewal is reported only after EC2 accepts the atomic `LeaseExpires` and `LeaseRenewedAt`
+tag write. A rejected tag write does not append the instance to `renewed`; it is reported as
+held so the response never claims an extension that was not persisted.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal requires GitHub to
 explicitly report `busy=true, status=online`; `busy=true, status=offline` lets the lease
@@ -253,8 +253,8 @@ regardless of a held lease, regardless of anything else, because it is computed 
 instance's launch time alone.
 The poll runs every 5 minutes, so the observed maximum is 13h30m plus at most one poll
 interval. A ceiling termination that never observed the runner idle logs `HARD-CEILING KILL`
-with the GitHub state it saw, and reports it in the poll result as `hard_killed`; that line
-is the only record distinguishing our termination from an AWS spot reclaim.
+and reports it in the poll result as `hard_killed`. The pass runs before GitHub access, so the
+termination itself never depends on a GitHub observation.
 
 The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
@@ -273,13 +273,13 @@ covers the longest job that can be in flight when a runner crosses the soft cap 
 that notices it finished: the longest legitimate self-hosted job measured here is 43.5
 minutes and a full matrix is about 35.
 
-**A bound is only real if the sweep reaches every instance before optional writes.** The first
-pass across the fleet reads only instance id and launch time and attempts every required
-hard-ceiling termination. The ordinary pass stamps registration and renews leases only after
-that fleet-wide pass finishes. A per-instance ordering is insufficient: a tag write for a
-younger instance can consume the Lambda's remaining budget and prevent an older instance later
-in the response from ever reaching its ceiling check. Five other safeguards hold the bound
-open.
+**A bound is only real if it precedes optional control-plane work.** After describing the EC2
+runner fleet, the handler immediately walks every instance using only its id and launch time
+and attempts each required hard-ceiling termination. It reads neither the SSM PAT nor GitHub
+before that fleet-wide pass completes. Registration reads, roster work, tag writes, orphan
+cleanup, and stuck-job scans all follow it. This ordering prevents a slow PAT read, paginated
+roster, or GitHub timeout from consuming the invocation before an older instance reaches its
+ceiling check. Five other safeguards hold the bound open.
 
 *Order.* The sweep is **Phase 1**, ahead of the orphan cleanup and the stuck-job scan. Both of
 those are unbounded GitHub work (one EC2 describe per registered runner plus deregistrations
@@ -304,21 +304,18 @@ call, so it never claims a job is dead on a poll where the instance survived.
 naive one, and comparing it raised `TypeError` out of the whole invocation.
 
 *The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else.
-`get_runners` makes the whole roster unread if any record lacks a nonempty `name` or a positive
-non-boolean integer `id`, if an identity is duplicated, or if two complete reads differ.
-The orphan phase calls `.startswith()` on every key and formats the id into a DELETE URL,
-and the idle path keys its fresh re-read on the id. Dropping only the malformed record would
-turn evidence that GitHub listed it into false evidence that it was absent, which can expire
-a lease. Marking the roster unread holds leases and keeps malformed fields out of every
-action URL.
+Every roster traversal used for positive actions is rejected if a page is malformed,
+`total_count` changes, an identity is invalid or duplicated, or the collected count is
+incomplete. Returned valid identities can drive positive actions. Missing identities cannot.
+Repeating offset pagination does not convert an omission into evidence of absence.
 
 *Each instance's turn through the loop is wrapped individually.* An instance whose age cannot
 be computed has no safe verdict, so it is named with an `UNREADABLE INSTANCE RECORD` line —
 which says outright that this instance is not covered by the bound until its record reads
 cleanly — and every other instance is still swept.
 
-**Three places that read absence as evidence, all fixed.** Terminating or deregistering a
-runner is destructive, so it may only happen on evidence that is both fresh and positive.
+**Destructive actions require fresh positive evidence.** Terminating or deregistering a runner
+may only happen on evidence that is both fresh and positive.
 
 `get_instance_state` distinguishes "EC2 says there is no such instance" from "EC2 could not be
 asked": the orphan phase deregisters on the first and leaves the second alone, because one
@@ -328,6 +325,10 @@ Even `InvalidInstanceID.NotFound` is not taken as proof on its own — AWS docum
 transient after `RunInstances` — so the orphan phase first checks the instance against the set
 of running runners the sweep listed moments earlier. An id in that set is demonstrably alive
 whatever a per-id lookup says.
+
+The never-registered path uses the same rule. A successful consistent DynamoDB no-item read
+followed by a conditional `State=reaping` create is positive ownership of that instance's
+registration boundary. A GitHub roster omission is not.
 
 And an idle verdict past the soft cap is confirmed against a fresh single-runner read before
 the instance is terminated, because the flags the poll is acting on were captured before the
@@ -408,12 +409,15 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 - **`github-runner-instance-role`** (on the runner): `AmazonSSMManagedInstanceCore` for
   Session Manager, `ssm:GetParameter` scoped to **the PAT parameter only**, and
   `ec2:AssignIpv6Addresses` + `ec2:DescribeNetworkInterfaces` (`Resource: *`, for the
-  boot-time IPv6 self-assign). A runner cannot read the `dev_to_runner` key or any other
-  parameter.
+  boot-time IPv6 self-assign). It also has `dynamodb:GetItem` and `dynamodb:PutItem` on
+  `github-runner-registration`, restricted by `dynamodb:LeadingKeys` to
+  `${ec2:SourceInstanceARN}`. It receives no `Scan`, `Query`, `UpdateItem`, or `DeleteItem`.
+  A runner cannot read the `dev_to_runner` key or any other parameter.
 - **`github-runner-lambda-role`** (both Lambdas): logs; EC2
   `Describe`/`Run`/`Stop`/`Terminate`/`CreateTags`; `iam:PassRole`;
   `cloudwatch:GetMetricStatistics`; `ssm:GetParameter` on `/github-runner/*`; and
-  `lambda:InvokeFunction` on the webhook function (for the cleanup retry).
+  `lambda:InvokeFunction` on the webhook function (for the cleanup retry). It has
+  `dynamodb:GetItem` and `dynamodb:PutItem` on the registration table for cleanup claims.
 - **`github-actions-terraform`** (Pattern A): the read-only + state + AMI-builder set above.
   Its only write into IAM is `PassRole` on `jumpbox-admin-role`.
 
