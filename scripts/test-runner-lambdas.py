@@ -116,6 +116,16 @@ class FakeEC2:
 
     def create_tags(self, **kw):
         self.calls.append(("create_tags", kw))
+        # An accepted CreateTags has to be visible to the NEXT describe_instances,
+        # for the same reason an accepted terminate has to move the instance: a
+        # case that spans two polls would otherwise assert against a world in
+        # which nothing the Lambda wrote ever happened. Both LeaseExpires and
+        # RunnerSeenAt are written on one poll and read back on a later one.
+        for inst in self.instances:
+            if inst.get("InstanceId") in kw["Resources"]:
+                tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                tags.update({t["Key"]: t["Value"] for t in kw["Tags"]})
+                inst["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
 
     def terminate_instances(self, **kw):
         self.calls.append(("terminate_instances", kw))
@@ -192,7 +202,7 @@ class FakeGitHub:
     """Routes GitHub REST URLs to canned JSON, honouring status and page."""
 
     def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
-                 delete_error=False, recheck=None, journal=None):
+                 delete_error=False, recheck=None, journal=None, runners_total=None):
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.runners = list(runners)
@@ -205,6 +215,11 @@ class FakeGitHub:
         # What GET /actions/runners/{id} answers, when that must differ from the
         # list this poll already read: {runner_id: record or None-to-fail}.
         self.recheck = recheck or {}
+        # What the roster CLAIMS is registered, when that must differ from what it
+        # hands back: a page shorter than total_count is a truncated read, and it
+        # is indistinguishable from "that runner is not registered" to anything
+        # that does not compare the two.
+        self.runners_total = runners_total
         self.journal = journal if journal is not None else []
         self.requests = []
         self.deletes = []
@@ -243,7 +258,9 @@ class FakeGitHub:
         if "/actions/runners" in url:
             if self.runners_error:
                 raise OSError("GitHub is unreachable")
-            return {"runners": self.runners}
+            window = self.runners[(page - 1) * per_page: page * per_page]
+            total = len(self.runners) if self.runners_total is None else self.runners_total
+            return {"total_count": total, "runners": window}
         jobs_match = re.search(r"/actions/runs/(\d+)/jobs", url)
         if jobs_match:
             jobs = self.jobs.get(int(jobs_match.group(1)), [])
@@ -656,8 +673,8 @@ def case_one_arch_failure_does_not_rotate_the_other():
 # Cases: the cleanup Lambda's reaper and queue scan
 # --------------------------------------------------------------------------
 
-def cleanup(ec2, github, lambda_client=None, env=None):
-    return load_lambda(CLEANUP_SRC, ec2, FakeSSM(), lambda_client or FakeLambdaClient(),
+def cleanup(ec2, github, lambda_client=None, env=None, ssm=None):
+    return load_lambda(CLEANUP_SRC, ec2, ssm or FakeSSM(), lambda_client or FakeLambdaClient(),
                        github, env)
 
 
@@ -720,6 +737,17 @@ def age_poll(age_minutes, runners=(), runners_error=False, delete_error=False,
 
 def terminated_ids(ec2):
     return [i for kw in ec2.ops("terminate_instances") for i in kw["InstanceIds"]]
+
+
+def still_running(ec2):
+    """Instances the poll left running, read off the fake's state.
+
+    Call counts answer "was terminate_instances invoked". This answers "is the
+    instance still there", which is the question a case about not killing a
+    runner is actually asking.
+    """
+    return sorted(i["InstanceId"] for i in ec2.instances
+                  if i["State"]["Name"] == "running")
 
 
 def case_busy_runner_past_the_soft_cap_is_drained_not_killed():
@@ -1286,6 +1314,234 @@ def case_absolute_runner_lifetime_is_13h30m():
     module = cleanup(FakeEC2(), FakeGitHub())
     total = module["MAX_INSTANCE_AGE_HOURS"] * 60 + module["DRAIN_GRACE_MINUTES"]
     assert total == HARD_CEILING_MINUTES == 13 * 60 + 30, total
+
+
+# --------------------------------------------------------------------------
+# Cases: the lease phase - what GitHub's answer is allowed to decide
+# --------------------------------------------------------------------------
+
+def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
+               runners_error=False, runners_total=None, ssm=None,
+               instance_id="i-lease"):
+    """One cleanup poll over a single running runner UNDER the soft cap.
+
+    The lease is what is under test, so the instance is deliberately young
+    enough that age_policy() answers KEEP and every verdict below comes from
+    the lease phase. `lease_minutes_ago` is how long ago the lease expired.
+    """
+    all_tags = {"LeaseExpires": (NOW - timedelta(minutes=lease_minutes_ago)).isoformat()}
+    all_tags.update(tags or {})
+    ec2 = FakeEC2([instance(instance_id, "c7g.metal", "running", age_minutes,
+                            arch="arm64", tags=all_tags)])
+    github = FakeGitHub(runners=list(runners), runners_error=runners_error,
+                        runners_total=runners_total)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
+    return result, ec2, github, buf.getvalue()
+
+
+def case_a_busy_runner_survives_a_github_outage_past_its_lease():
+    """ejc3/aws#45: an unread roster is not evidence that a runner is idle.
+
+    The lease made a single blip survivable and an OUTAGE fatal: once GitHub
+    had been unreadable for longer than the remaining lease, every runner took
+    the idle path, its lease was allowed to expire, and it was terminated
+    mid-job while still under the soft cap. On GitHub that reads as "The
+    self-hosted runner lost communication with the server", which is
+    indistinguishable from a spot reclaim (ejc3/fcvm#884).
+    """
+    result, ec2, _, _ = lease_poll(
+        lease_minutes_ago=45, runners_error=True,
+        tags={"RunnerSeenAt": (NOW - timedelta(minutes=50)).isoformat()})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["expired"] == [], result
+    assert result["held"] == ["i-lease"], result
+    # HELD, not renewed. Renewing on an unread roster would make a wedged host
+    # immortal, which is the bound ejc3/fcvm#871 needs; the lease stays where it
+    # is and the age ceiling remains the thing that ends this instance.
+    lease_writes = [kw for kw in ec2.ops("create_tags")
+                    if any(t["Key"] == "LeaseExpires" for t in kw["Tags"])]
+    assert lease_writes == [], lease_writes
+
+
+def case_an_idle_runner_past_its_lease_is_still_terminated():
+    """Scale-down itself, which the fix above must not disable.
+
+    GitHub answered and reported busy=false. That is a verdict about this
+    runner, so the lease is allowed to lapse and the instance goes.
+    """
+    result, ec2, _, _ = lease_poll(runners=[runner_record("i-lease", busy=False)])
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert result["held"] == [], result
+
+
+def case_a_runner_that_never_registered_still_dies_at_its_lease():
+    """A box that booted and never joined must not be held to the ceiling.
+
+    user_data registers only when the IPv6 gate passes AND the PAT reads back
+    from SSM, so an instance that stays `running` and never registers is a
+    designed-for outcome, not a hypothetical. Nothing else reaps it: phase 5
+    only walks `pending`, and the age phase would leave it running for 13h30m.
+    The lease is what kills it, and GitHub listing other runners while never
+    having listed this one is a real answer about it.
+    """
+    result, ec2, _, _ = lease_poll(runners=[runner_record("i-other")])
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+
+
+def case_a_registered_runner_missing_from_a_readable_roster_holds_its_lease():
+    """Seen before, absent now: one of the two explanations is a live job.
+
+    A roster we could read is authoritative about REGISTRATION. It is not
+    authoritative about a box that was registered on the previous poll: a real
+    deregistration and an answer that dropped records look identical from here.
+    Hold the lease and let the ceiling bound it.
+    """
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-other")],
+        tags={"RunnerSeenAt": (NOW - timedelta(minutes=6)).isoformat()})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_truncated_roster_cannot_expire_a_lease():
+    """A short page reads exactly like "this runner is not registered".
+
+    GitHub reports total_count beside the page, so a read that came back short
+    is detectable rather than silently partial. Detect it and the whole roster
+    is unread; miss it and truncation terminates whichever runners fell off the
+    end - the fail-open of ejc3/aws#45 arriving through pagination instead of
+    through an exception.
+    """
+    result, ec2, _, _ = lease_poll(runners=[runner_record("i-other")], runners_total=7)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_missing_pat_is_not_evidence_that_a_runner_is_idle():
+    """No PAT means no answer, not "nothing is registered".
+
+    get_github_pat() returns None for a missing or placeholder parameter, and
+    the roster was then skipped entirely and treated as empty - so an SSM
+    problem, or a rotated-out PAT, reaped the whole fleet an hour later.
+    """
+    result, ec2, _, _ = lease_poll(ssm=FakeSSM(pat="placeholder"))
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_record_with_no_busy_flag_is_not_read_as_idle():
+    """`.get('busy', False)` read a missing key as "holds no job"."""
+    result, ec2, _, _ = lease_poll(
+        runners=[{"id": 5, "name": "runner-i-lease", "status": "online"}])
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_sustained_outage_says_how_long_the_runner_has_been_unobserved():
+    """A poll that decides nothing must still say that, and for how long.
+
+    Holding leases silently turns an outage into an absence of log lines, which
+    is the same state as a healthy quiet poll. The line carries the duration so
+    a blip and a three-hour outage are distinguishable in CloudWatch.
+    """
+    result, _, _, out = lease_poll(
+        runners_error=True,
+        tags={"RunnerSeenAt": (NOW - timedelta(hours=3)).isoformat()})
+    assert "180m" in out, out
+    assert result["held"] == ["i-lease"], result
+
+
+def case_the_roster_answer_is_recorded_on_the_instance():
+    """Two polls: the second has to remember what the first was told.
+
+    The whole distinction between "never joined" and "was here and vanished"
+    rests on this tag reaching the instance, so this drives two real polls
+    against one EC2 rather than hand-placing the tag and asserting on it.
+    """
+    inst = instance("i-lease", "c7g.metal", "running", 60, arch="arm64",
+                    tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})
+    ec2 = FakeEC2([inst])
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = cleanup(ec2, FakeGitHub(
+            runners=[runner_record("i-lease", busy=False)]))["handler"]({}, None)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
+    assert tags.get("RunnerSeenAt") == NOW.isoformat(), tags
+    assert first["held"] == [], first
+
+    # The clock is frozen, so the hour that would pass between the two polls is
+    # applied to the lease instead: this is the same instance, one lease later.
+    tags["LeaseExpires"] = (NOW - timedelta(minutes=45)).isoformat()
+    inst["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        second = cleanup(ec2, FakeGitHub(
+            runners=[runner_record("i-other")]))["handler"]({}, None)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert second["held"] == ["i-lease"], second
+
+
+def case_a_held_runner_is_still_terminated_at_the_ceiling():
+    """Holding a lease must not become a way to outlive the ceiling.
+
+    The lease phase never sees an instance this old - the age policy answers
+    first and its ceiling is derived from launch_time alone - but that ordering
+    is the only thing making a held lease safe, so it is pinned here as well as
+    at the age policy.
+    """
+    result, ec2, _, out = lease_poll(age_minutes=HARD_CEILING_MINUTES + 5,
+                                     runners_error=True)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-lease"], result
+    assert result["held"] == [], result
+    assert "HARD-CEILING KILL" in out, out
+
+
+def case_a_truncated_runner_list_degrades_to_the_instance_count():
+    """The webhook Lambda, same defect class: a short page is not four dead runners.
+
+    get_online_runner_names() read one page and treated it as the whole roster,
+    so online runners past the page boundary counted as absent, `counted` fell
+    below the cap and the launcher added metal to a pool that was already full.
+    Unknown health already has a defined answer here - degrade to the instance
+    count - and a truncated read is unknown health.
+    """
+    ec2 = FakeEC2([instance(f"i-live{n}", "c5d.metal", "running", 60) for n in range(4)])
+    roster = [{"id": n, "name": f"runner-i-live{n}", "status": "online", "busy": True}
+              for n in range(4)]
+    github = FakeGitHub(runners=roster[:1], runners_total=4)
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
+    })}
+    result = webhook(ec2, github=github)["handler"](event, None)
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_a_nameless_runner_record_cannot_stop_a_launch():
+    """One malformed record must not take scale-up down with it.
+
+    The set comprehension that reads r['name'] sits outside the try in
+    get_online_runner_names, so a record without a name raised KeyError out of
+    get_capacity and out of the handler. GitHub delivers a workflow_job event
+    once and never redelivers it, so the queued job waits for the next poll.
+    """
+    ec2 = FakeEC2([instance("i-live", "c5d.metal", "running", 60)])
+    github = FakeGitHub(runners=[{"id": 1, "status": "online", "busy": False}])
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
+    })}
+    result = webhook(ec2, github=github)["handler"](event, None)
+    assert len(launched_types(ec2)) == 1, launched_types(ec2)
+    assert result["body"].startswith("Launched 1 x86_64 runner"), result
 
 
 def poll(github, env=None):

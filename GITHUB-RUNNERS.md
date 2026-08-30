@@ -165,9 +165,10 @@ both gates refuse the shapes they exist for, and that each precedes registration
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`) and does seven things, five of them using the PAT: deregisters GitHub
-runners whose instance is gone; renews the lease on busy runners (+60m) and lets idle ones
-expire, then terminates and deregisters anything past its lease (instances younger than 10
-minutes are skipped so setup isn't interrupted); drains runners past the 12h soft cap and
+runners whose instance is gone; renews the lease on busy runners (+60m), lets the lease of
+runners GitHub reports idle expire, then terminates and deregisters anything past its lease
+(instances younger than 10 minutes are skipped so setup isn't interrupted); **holds** the
+lease of runners GitHub said nothing usable about; drains runners past the 12h soft cap and
 terminates them at the 13h30m hard ceiling; **terminates any runner whose current job
 has been `in_progress` longer than `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray
 `ami-builder-temp` instances older than 2 hours (pure EC2, no PAT); reaps launches still
@@ -191,6 +192,38 @@ purpose — the runner AMI publishes no CloudWatch metrics, and an on-box guard 
 `ejc3/fcvm` uses for disk in `runner-disk-guard.timer`) cannot be trusted to run on a host
 whose scheduler is the thing that failed.
 
+**A lease moves only on an answer.** The lease phase reads GitHub's runner roster and takes
+one of three verdicts per instance. `RENEW` when GitHub reports the runner online and busy.
+`EXPIRE` when GitHub answered with something that cannot mean "working" — `busy=false`, or
+`busy=true` with the runner offline (that is the wedged host below), or no record at all for
+an instance no poll has ever seen registered. `HOLD` for everything else: the roster could
+not be read, or it could be read and omits a runner that some earlier poll did see. A held
+lease is not renewed and not allowed to expire into a termination, so the instance keeps
+whatever expiry it already had and the age ceiling remains the bound on it.
+
+The distinction is the whole point (`ejc3/aws#45`). A missing runner record used to read as
+`busy=false`, which is survivable for one blip — the lease gives 60 minutes of grace — and
+fatal for an outage: once GitHub had been unreachable, or answering without the runner, for
+longer than the remaining lease, every runner took the idle path and was terminated up to 60
+minutes in, mid-job, while still under the soft cap. On GitHub that renders as "The
+self-hosted runner lost communication with the server", indistinguishable from a spot
+reclaim, which is the same misattributed failure `ejc3/fcvm#884` cost a night of reruns to.
+
+A read counts as unread unless it is **complete**: the call has to succeed, the payload has
+to carry a `runners` array, and the pages collected have to reach the `total_count` GitHub
+reports beside them. A short page reads exactly like "that runner is not registered", so
+truncation is the same fail-open arriving through pagination.
+
+`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner. It
+separates "GitHub answered and does not list this runner" (ambiguous: a real deregistration
+and an answer that dropped records look identical) from "this runner has never registered at
+all" — a box that booted and never joined, because the IPv6 gate refused or the PAT did not
+read back from SSM. The second is still reaped by the lease at ~60 minutes, and nothing else
+would reap it: it sits in `running`, where the stalled-launch phase (which walks `pending`)
+cannot see it. The tag also dates an outage: a held lease logs how long the runner has gone
+unobserved, so a blip and a three-hour outage are different lines rather than the same one
+repeated.
+
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
 only while GitHub explicitly reports it `online` (a missing `status` fails closed to
 not-busy), and no instance outlives the hard ceiling below. Both exist because `busy` means
@@ -206,7 +239,8 @@ a soft cap. Past it the instance drains: it is terminated on the first poll that
 report it idle, and a job already in flight is left to finish. `DRAIN_GRACE_MINUTES` (90) on
 top of that is the hard ceiling, **13h30m, the absolute maximum lifetime of a runner
 instance** — enforced regardless of busy state, regardless of whether GitHub answered,
-regardless of anything else, because it is computed from the instance's launch time alone.
+regardless of a held lease, regardless of anything else, because it is computed from the
+instance's launch time alone.
 The poll runs every 5 minutes, so the observed maximum is 13h30m plus at most one poll
 interval. A ceiling termination that never observed the runner idle logs `HARD-CEILING KILL`
 with the GitHub state it saw, and reports it in the poll result as `hard_killed`; that line
