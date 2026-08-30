@@ -1508,6 +1508,34 @@ def case_the_roster_answer_is_recorded_on_the_instance():
     assert second["held"] == ["i-lease"], second
 
 
+def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
+    """Ten full pages that add up to GitHub's own total_count are a complete read.
+
+    The reader ended on a short page or on the page limit, and only the first
+    counted as finishing. A roster of exactly ROSTER_PAGE_LIMIT full pages fell
+    into the for/else and was reported unread, which held every lease in the
+    fleet on an answer that was complete. Reaching total_count ends the read.
+    """
+    roster = [{"id": n, "name": f"runner-i-other{n}", "busy": False, "status": "online"}
+              for n in range(1, 1001)]
+    result, ec2, github, _ = lease_poll(runners=roster)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    reads = [url for url in github.requests if "/actions/runners?" in url]
+    assert len(reads) == 10, reads
+
+
+def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
+    """The launch-side reader finishes on the same count proof at its page limit."""
+    roster = [{"id": n, "name": f"runner-i-live{n}", "busy": False,
+               "status": "online"} for n in range(1, 1001)]
+    github = FakeGitHub(runners=roster)
+    names = webhook(FakeEC2(), github=github)["get_online_runner_names"]()
+    assert names == {r["name"] for r in roster}, names
+    reads = [url for url in github.requests if "/actions/runners?" in url]
+    assert len(reads) == 10, reads
+
+
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
     """The verdict is per instance, and one poll can hold one and reap another.
 

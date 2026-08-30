@@ -162,6 +162,12 @@ data "archive_file" "runner_webhook" {
                           return None
                       if r['status'] == 'online':
                           names.add(r['name'])
+                  # Reaching total_count ends the read. A roster of exactly
+                  # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
+                  # into the else below and was reported as unknown, on a read
+                  # that had come back complete.
+                  if collected == total:
+                      break
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:
@@ -1350,6 +1356,12 @@ data "archive_file" "runner_cleanup" {
                           return None
                       roster[r['name']] = {'id': r['id'], 'busy': r.get('busy'),
                                            'status': r.get('status')}
+                  # Reaching total_count ends the read. A roster of exactly
+                  # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
+                  # into the else below and was reported unread, on a read that
+                  # had come back complete.
+                  if collected == total:
+                      break
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:

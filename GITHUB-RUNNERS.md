@@ -221,6 +221,8 @@ reports beside them, that `total_count` has to be present and an integer the che
 compare (without it a page-size heuristic accepts any short array as the whole roster), and
 every record has to carry a usable `name` and `id`. A short page reads exactly like "that
 runner is not registered", so truncation is the same fail-open arriving through pagination.
+Reaching `total_count` is what ends a read: a roster of exactly ten full pages is complete,
+not a list that ran past the page limit.
 A record that cannot be represented is not dropped, for the same reason: dropped, it still
 counted toward `total_count`, so the read passed as complete and simply did not list that
 runner, which is the never-registered `EXPIRE` for any instance without `RunnerSeenAt` (every
