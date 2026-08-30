@@ -214,19 +214,23 @@ to carry a `runners` array, and the pages collected have to reach the `total_cou
 reports beside them. A short page reads exactly like "that runner is not registered", so
 truncation is the same fail-open arriving through pagination.
 
-`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner. It
-separates "GitHub answered and does not list this runner" (ambiguous: a real deregistration
-and an answer that dropped records look identical) from "this runner has never registered at
-all" — a box that booted and never joined, because the IPv6 gate refused or the PAT did not
-read back from SSM. The second is still reaped by the lease at ~60 minutes, and nothing else
-would reap it: it sits in `running`, where the stalled-launch phase (which walks `pending`)
-cannot see it. The tag also dates an outage: a held lease logs how long the runner has gone
-unobserved, so a blip and a three-hour outage are different lines rather than the same one
-repeated.
+`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner. A
+`LeaseExpires` value later than launch time plus the initial 60 minutes is equivalent
+registration evidence: only a poll that found the runner online and busy can renew it. The
+two signals separate "GitHub answered and does not list this runner" (ambiguous: a real
+deregistration and an answer that dropped records look identical) from "this runner has
+never registered at all" — a box that booted and never joined, because the IPv6 gate refused
+or the PAT did not read back from SSM. This also covers instances that predate the
+`RunnerSeenAt` tag and a poll whose separate tag write failed. A lease that never moved is
+still reaped at ~60 minutes, and nothing else would reap it: the instance sits in `running`,
+where the stalled-launch phase (which walks `pending`) cannot see it. The tag also dates an
+outage: a held lease logs how long the runner has gone unobserved, so a blip and a three-hour
+outage are different lines rather than the same one repeated.
 
-**Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
-only while GitHub explicitly reports it `online` (a missing `status` fails closed to
-not-busy), and no instance outlives the hard ceiling below. Both exist because `busy` means
+**Two bounds keep a broken runner from becoming immortal.** Renewal requires GitHub to
+explicitly report `busy=true, status=online`; `busy=true, status=offline` lets the lease
+expire, while a missing or unrecognised status holds it. No instance outlives the hard
+ceiling below. Both bounds exist because `busy` means
 "holds a job", not "makes progress": on 2026-08-07 two ARM runners wedged with ~490 leaked
 `firecracker` processes and load averages of 389 and 523 (disk was fine at 46%/67%). They
 kept their assigned jobs, so GitHub kept reporting `busy=true`, so the lease was renewed
@@ -291,11 +295,13 @@ call, so it never claims a job is dead on a poll where the instance survived.
 *`parse_ts` returns UTC-aware datetimes.* A GitHub timestamp with no offset used to produce a
 naive one, and comparing it raised `TypeError` out of the whole invocation.
 
-*The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else, and
-*`get_runners` drops records without a usable `name` or `id`*: the orphan phase calls
-`.startswith()` on every key and formats the id straight into a DELETE URL, and the idle
-path keys its fresh re-read on the id. A dropped record makes the instance simply unknown,
-which drains and dies at the ceiling.
+*The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else.
+`get_runners` makes the whole roster unread if any record lacks a usable `name` or `id`.
+The orphan phase calls `.startswith()` on every key and formats the id into a DELETE URL,
+and the idle path keys its fresh re-read on the id. Dropping only the malformed record would
+turn evidence that GitHub listed it into false evidence that it was absent, which can expire
+a lease. Marking the roster unread holds leases and keeps malformed fields out of every
+action URL.
 
 *Each instance's turn through the loop is wrapped individually.* An instance whose age cannot
 be computed has no safe verdict, so it is named with an `UNREADABLE INSTANCE RECORD` line —

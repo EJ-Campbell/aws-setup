@@ -116,6 +116,7 @@ class FakeEC2:
 
     def create_tags(self, **kw):
         self.calls.append(("create_tags", kw))
+        self.journal.append(f"ec2:create_tags:{','.join(kw['Resources'])}")
         # An accepted CreateTags has to be visible to the NEXT describe_instances,
         # for the same reason an accepted terminate has to move the instance: a
         # case that spans two polls would otherwise assert against a world in
@@ -207,8 +208,9 @@ class FakeGitHub:
         self.jobs = jobs or {}
         self.runners = list(runners)
         # Every /actions/runners call raises: a PAT that lost its scope, a 5xx, a
-        # rate limit. get_runners() swallows it and returns {}, so the reaper sees
-        # no record for any instance - the state a decision must survive.
+        # rate limit. get_runners() turns it into an unread roster, so the reaper
+        # has no actionable record for any instance - the state a decision must
+        # survive.
         self.runners_error = runners_error
         # A deregistration that fails must never stop a termination.
         self.delete_error = delete_error
@@ -833,8 +835,8 @@ def case_unreachable_github_drains_inside_the_grace():
 def case_unreachable_github_is_still_terminated_at_the_ceiling():
     """The ceiling cannot be deferred by a GitHub error.
 
-    get_runners() swallows the exception and returns {}, so the reaper has no
-    record at all for this instance - exactly the state in which a bound that
+    get_runners() turns the exception into an unread roster, so the reaper has
+    no record at all for this instance - exactly the state in which a bound that
     needed one would leak the instance forever.
     """
     result, ec2, _, out = age_poll(HARD_CEILING_MINUTES + 5, runners_error=True)
@@ -1485,6 +1487,131 @@ def case_the_roster_answer_is_recorded_on_the_instance():
             runners=[runner_record("i-other")]))["handler"]({}, None)
     assert terminated_ids(ec2) == [], terminated_ids(ec2)
     assert second["held"] == ["i-lease"], second
+
+
+def case_a_busy_record_with_no_status_holds_its_lease():
+    """`busy=true` with no status is absent evidence, not an offline host.
+
+    The offline qualifier exists for the wedged host of ejc3/fcvm#871, which
+    reports busy=true and status=offline. A record carrying no status at all is
+    a different thing: GitHub said the runner holds a job and said nothing about
+    whether it can be reached. Reading that as the wedge terminates a working
+    runner on a field GitHub did not send.
+    """
+    result, ec2, _, _ = lease_poll(
+        runners=[{"id": 7, "name": "runner-i-lease", "busy": True}])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_an_explicitly_offline_busy_runner_still_loses_its_lease():
+    """The wedge itself is unchanged: busy=true, status=offline, lease lapses."""
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-lease", busy=True, status="offline")])
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+
+
+def case_a_renewed_lease_is_proof_the_runner_once_registered():
+    """RunnerSeenAt is not the only record of a registration, and must not be.
+
+    Every instance already running when this shipped carries no tag, and a
+    CreateTags that fails leaves none either. The lease is an independent
+    record: it only moves past its launch-time value on a poll that found the
+    runner BUSY, which cannot happen unless GitHub listed it.
+    """
+    result, ec2, _, _ = lease_poll(
+        age_minutes=200, lease_minutes_ago=45, runners=[runner_record("i-other")])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_an_old_husk_whose_lease_never_moved_is_still_reaped():
+    """The same instance age, with a lease that was never renewed, still goes.
+
+    Pins the discriminator itself rather than the age: launch+60m is the lease
+    the launcher stamps and nothing has touched it since.
+    """
+    launched_minutes_ago = 200
+    ec2 = FakeEC2([instance("i-husk", "c7g.metal", "running", launched_minutes_ago,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW - timedelta(
+                                minutes=launched_minutes_ago - 60)).isoformat()})])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]))["handler"]({}, None)
+    assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
+    assert result["expired"] == ["i-husk"], result
+
+
+def case_a_listed_runner_with_no_id_holds_its_lease():
+    """A record we cannot act on is still a record that GitHub listed.
+
+    An id-less record is dropped from the actionable roster, because every
+    action on a runner needs the id. Dropping it from the ANSWER as well made
+    the instance read as never-registered, which lets its lease lapse and
+    terminates it - a live runner killed over a missing field.
+    """
+    result, ec2, github, _ = lease_poll(
+        runners=[{"name": "runner-i-lease", "busy": True, "status": "online"}])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert not any("None" in url for url in github.requests), github.requests
+
+
+def case_a_runner_record_with_no_name_makes_the_roster_unread():
+    """A nameless record cannot be discarded into evidence of absence."""
+    result, ec2, _, _ = lease_poll(
+        runners=[{"id": 7, "busy": True, "status": "online"}])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
+    """Ten full pages that add up to GitHub's own total_count are not truncated.
+
+    Page-limit and short-page are two different ways to finish, and only the
+    first was treated as a failure. A roster that ends exactly on the limit is
+    complete if the count matches, and calling it unread holds every lease in
+    the fleet on a read that was fine.
+    """
+    roster = [{"id": n, "name": f"runner-i-other{n}", "busy": False, "status": "online"}
+              for n in range(1000)]
+    result, ec2, _, _ = lease_poll(runners=roster)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+
+
+def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
+    """The launch-side reader uses the same count proof at its page limit."""
+    roster = [{"id": n, "name": f"runner-i-live{n}", "busy": False,
+               "status": "online"} for n in range(1000)]
+    github = FakeGitHub(runners=roster)
+    names = webhook(FakeEC2(), github=github)["get_online_runner_names"]()
+    assert names == {r["name"] for r in roster}, names
+    roster_reads = [url for url in github.requests if "/actions/runners?" in url]
+    assert len(roster_reads) == 10, roster_reads
+
+
+def case_the_ceiling_terminate_precedes_any_tag_written_to_that_instance():
+    """A doomed instance must not pay for a write before the bound is applied.
+
+    Nothing in the sweep may spend EC2 calls on an instance ahead of deciding
+    whether it is over the ceiling: a stalled CreateTags inside the Lambda's
+    240-second budget would defer the one bound that has to hold.
+    """
+    journal = []
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  journal=journal)
+    github = FakeGitHub(runners=[runner_record("i-aged")], journal=journal)
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["hard_killed"] == ["i-aged"], result
+    kill = journal.index("ec2:terminate:i-aged")
+    tag_writes = [i for i, e in enumerate(journal) if e == "ec2:create_tags:i-aged"]
+    assert all(i > kill for i in tag_writes), journal
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
