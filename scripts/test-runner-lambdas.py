@@ -120,8 +120,9 @@ class FakeEC2:
         # An accepted CreateTags has to be visible to the NEXT describe_instances,
         # for the same reason an accepted terminate has to move the instance: a
         # case that spans two polls would otherwise assert against a world in
-        # which nothing the Lambda wrote ever happened. Both LeaseExpires and
-        # RunnerSeenAt are written on one poll and read back on a later one.
+        # which nothing the Lambda wrote ever happened. LeaseExpires,
+        # RunnerSeenAt and LeaseRenewedAt are written on one poll and read back
+        # on a later one.
         for inst in self.instances:
             if inst.get("InstanceId") in kw["Resources"]:
                 tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
@@ -203,7 +204,8 @@ class FakeGitHub:
     """Routes GitHub REST URLs to canned JSON, honouring status and page."""
 
     def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
-                 delete_error=False, recheck=None, journal=None, runners_total=None):
+                 delete_error=False, recheck=None, journal=None, runners_total=None,
+                 runner_payloads=None):
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.runners = list(runners)
@@ -222,6 +224,13 @@ class FakeGitHub:
         # is indistinguishable from "that runner is not registered" to anything
         # that does not compare the two.
         self.runners_total = runners_total
+        # Exact successive list payloads, when pagination itself is the input
+        # under test. This can model a roster changing between complete reads or
+        # a page boundary shifting under concurrent registration/deregistration.
+        # Once exhausted, the last payload remains the answer so later phases do
+        # not get an unrelated fake failure.
+        self.runner_payloads = list(runner_payloads) if runner_payloads is not None else None
+        self.runner_payload_index = 0
         self.journal = journal if journal is not None else []
         self.requests = []
         self.deletes = []
@@ -260,6 +269,10 @@ class FakeGitHub:
         if "/actions/runners" in url:
             if self.runners_error:
                 raise OSError("GitHub is unreachable")
+            if self.runner_payloads:
+                index = min(self.runner_payload_index, len(self.runner_payloads) - 1)
+                self.runner_payload_index += 1
+                return self.runner_payloads[index]
             window = self.runners[(page - 1) * per_page: page * per_page]
             total = len(self.runners) if self.runners_total is None else self.runners_total
             return {"total_count": total, "runners": window}
@@ -1324,7 +1337,7 @@ def case_absolute_runner_lifetime_is_13h30m():
 
 def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                runners_error=False, runners_total=None, ssm=None,
-               instance_id="i-lease"):
+               instance_id="i-lease", runner_payloads=None):
     """One cleanup poll over a single running runner UNDER the soft cap.
 
     The lease is what is under test, so the instance is deliberately young
@@ -1336,7 +1349,7 @@ def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
     ec2 = FakeEC2([instance(instance_id, "c7g.metal", "running", age_minutes,
                             arch="arm64", tags=all_tags)])
     github = FakeGitHub(runners=list(runners), runners_error=runners_error,
-                        runners_total=runners_total)
+                        runners_total=runners_total, runner_payloads=runner_payloads)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
@@ -1513,35 +1526,129 @@ def case_an_explicitly_offline_busy_runner_still_loses_its_lease():
     assert result["expired"] == ["i-lease"], result
 
 
-def case_a_renewed_lease_is_proof_the_runner_once_registered():
-    """RunnerSeenAt is not the only record of a registration, and must not be.
-
-    Every instance already running when this shipped carries no tag, and a
-    CreateTags that fails leaves none either. The lease is an independent
-    record: it only moves past its launch-time value on a poll that found the
-    runner BUSY, which cannot happen unless GitHub listed it.
-    """
+def case_explicit_renewal_provenance_proves_the_runner_once_registered():
+    """Registration is persisted explicitly, never inferred from lease timing."""
     result, ec2, _, _ = lease_poll(
-        age_minutes=200, lease_minutes_ago=45, runners=[runner_record("i-other")])
+        age_minutes=200, lease_minutes_ago=45, runners=[runner_record("i-other")],
+        tags={"LeaseRenewedAt": (NOW - timedelta(minutes=46)).isoformat()})
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
     assert result["held"] == ["i-lease"], result
 
 
-def case_an_old_husk_whose_lease_never_moved_is_still_reaped():
-    """The same instance age, with a lease that was never renewed, still goes.
+def case_lease_timestamp_microseconds_are_not_registration_provenance():
+    """An initial lease can straddle EC2's launch-time precision by one microsecond.
 
-    Pins the discriminator itself rather than the age: launch+60m is the lease
-    the launcher stamps and nothing has touched it since.
+    None of the three values below says GitHub ever listed the instance. Inferring
+    registration from `LeaseExpires > LaunchTime + 60m` turns only the +1us value
+    into a registered runner and holds that unregistered husk to the hard ceiling.
     """
-    launched_minutes_ago = 200
-    ec2 = FakeEC2([instance("i-husk", "c7g.metal", "running", launched_minutes_ago,
-                            arch="arm64",
-                            tags={"LeaseExpires": (NOW - timedelta(
-                                minutes=launched_minutes_ago - 60)).isoformat()})])
+    age = timedelta(minutes=200)
+    launch = NOW - age
+    for offset in (-1, 0, 1):
+        expiry = launch + timedelta(minutes=60, microseconds=offset)
+        ec2 = FakeEC2([instance(f"i-husk-{offset}", "c7g.metal", "running", 200,
+                                arch="arm64", tags={"LeaseExpires": expiry.isoformat()})])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = cleanup(ec2, FakeGitHub(
+                runners=[runner_record("i-other")]))["handler"]({}, None)
+        assert terminated_ids(ec2) == [f"i-husk-{offset}"], (offset, terminated_ids(ec2))
+        assert result["expired"] == [f"i-husk-{offset}"], (offset, result)
+
+
+def case_an_initial_lease_does_not_turn_a_legacy_husk_into_a_registered_runner():
+    """Setting a missing initial lease must not persist renewal provenance.
+
+    A legacy running instance with neither a lease nor a GitHub registration gets
+    one grace lease. The next answered poll must still reap it; using renew_lease
+    for the initial write makes the new deadline look like evidence of a job.
+    """
+    inst = instance("i-husk", "c7g.metal", "running", 200, arch="arm64")
+    ec2 = FakeEC2([inst])
+    github = FakeGitHub(runners=[runner_record("i-other")])
     with contextlib.redirect_stdout(io.StringIO()):
-        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]))["handler"]({}, None)
+        first = cleanup(ec2, github)["handler"]({}, None)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert first["renewed"] == [], first
+    tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
+    assert "LeaseRenewedAt" not in tags, tags
+
+    tags["LeaseExpires"] = (NOW - timedelta(microseconds=1)).isoformat()
+    inst["Tags"] = [{"Key": key, "Value": value} for key, value in tags.items()]
+    with contextlib.redirect_stdout(io.StringIO()):
+        second = cleanup(ec2, github)["handler"]({}, None)
     assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
-    assert result["expired"] == ["i-husk"], result
+    assert second["expired"] == ["i-husk"], second
+
+
+def case_busy_renewal_persists_explicit_provenance_with_the_lease():
+    """The successful renewal write itself must leave durable provenance."""
+    result, ec2, _, _ = lease_poll(
+        lease_minutes_ago=-5, runners=[runner_record("i-lease", busy=True)])
+    assert result["renewed"] == ["i-lease"], result
+    lease_writes = [kw for kw in ec2.ops("create_tags")
+                    if any(tag["Key"] == "LeaseExpires" for tag in kw["Tags"])]
+    assert len(lease_writes) == 1, lease_writes
+    written = {tag["Key"]: tag["Value"] for tag in lease_writes[0]["Tags"]}
+    assert written["LeaseRenewedAt"] == NOW.isoformat(), written
+
+
+def case_unusable_runner_identity_makes_the_roster_unread():
+    """Names must contain text and ids must be positive, non-bool integers."""
+    invalid = [
+        {"id": 7, "name": ""},
+        {"id": 7, "name": "   "},
+        {"id": True, "name": "runner-i-lease"},
+        {"id": False, "name": "runner-i-lease"},
+        {"id": 0, "name": "runner-i-lease"},
+        {"id": -1, "name": "runner-i-lease"},
+        {"id": 7.0, "name": "runner-i-lease"},
+        {"id": "7", "name": "runner-i-lease"},
+    ]
+    for identity in invalid:
+        record = {**identity, "busy": False, "status": "online"}
+        result, ec2, github, _ = lease_poll(runners=[record])
+        assert still_running(ec2) == ["i-lease"], (identity, still_running(ec2))
+        assert result["held"] == ["i-lease"], (identity, result)
+        assert github.deletes == [], (identity, github.deletes)
+
+
+def case_a_roster_that_changes_between_reads_cannot_prove_absence():
+    """A concurrent registration makes a one-pass absence destructive and stale."""
+    other = runner_record("i-other", runner_id=1)
+    target = runner_record("i-lease", runner_id=2)
+    payloads = [
+        {"total_count": 1, "runners": [other]},
+        {"total_count": 2, "runners": [other, target]},
+    ]
+    result, ec2, _, _ = lease_poll(
+        runners=[other, target], runner_payloads=payloads)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_duplicate_across_pages_cannot_prove_absence():
+    """Pagination churn can repeat a name or id and silently skip another."""
+    first = [runner_record(f"i-other-{number}", runner_id=number + 1)
+             for number in range(100)]
+    repeats = [
+        first[-1],
+        {**first[-1], "name": "runner-i-different-name"},
+        {**first[-1], "id": 1001},
+    ]
+    for repeated in repeats:
+        github = FakeGitHub(
+            runners=first,
+            runner_payloads=[
+                {"total_count": 101, "runners": first},
+                {"total_count": 101, "runners": [repeated]},
+            ])
+        inst = instance("i-lease", "c7g.metal", "running", 60, arch="arm64",
+                        tags={"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat()})
+        ec2 = FakeEC2([inst])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = cleanup(ec2, github)["handler"]({}, None)
+        assert still_running(ec2) == ["i-lease"], (repeated, still_running(ec2))
+        assert result["held"] == ["i-lease"], (repeated, result)
 
 
 def case_a_listed_runner_with_no_id_holds_its_lease():
@@ -1576,7 +1683,7 @@ def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
     the fleet on a read that was fine.
     """
     roster = [{"id": n, "name": f"runner-i-other{n}", "busy": False, "status": "online"}
-              for n in range(1000)]
+              for n in range(1, 1001)]
     result, ec2, _, _ = lease_poll(runners=roster)
     assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
     assert result["expired"] == ["i-lease"], result
@@ -1585,7 +1692,7 @@ def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
 def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
     """The launch-side reader uses the same count proof at its page limit."""
     roster = [{"id": n, "name": f"runner-i-live{n}", "busy": False,
-               "status": "online"} for n in range(1000)]
+               "status": "online"} for n in range(1, 1001)]
     github = FakeGitHub(runners=roster)
     names = webhook(FakeEC2(), github=github)["get_online_runner_names"]()
     assert names == {r["name"] for r in roster}, names
@@ -1593,25 +1700,32 @@ def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
     assert len(roster_reads) == 10, roster_reads
 
 
-def case_the_ceiling_terminate_precedes_any_tag_written_to_that_instance():
-    """A doomed instance must not pay for a write before the bound is applied.
+def case_every_ceiling_terminate_precedes_every_optional_tag_write():
+    """No fleet member may pay for a write before every ceiling is applied.
 
-    Nothing in the sweep may spend EC2 calls on an instance ahead of deciding
-    whether it is over the ceiling: a stalled CreateTags inside the Lambda's
-    240-second budget would defer the one bound that has to hold.
+    A younger instance is deliberately listed first and needs both the seen tag
+    and a lease renewal. Either write can consume the Lambda's remaining budget;
+    the older instance later in the response must already have been terminated.
     """
     journal = []
-    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
-                            arch="arm64",
-                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+    ec2 = FakeEC2([
+        instance("i-young", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+        instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+    ],
                   journal=journal)
-    github = FakeGitHub(runners=[runner_record("i-aged")], journal=journal)
+    github = FakeGitHub(runners=[runner_record("i-young", runner_id=1),
+                                 runner_record("i-aged", runner_id=2)], journal=journal)
     with contextlib.redirect_stdout(io.StringIO()):
         result = cleanup(ec2, github)["handler"]({}, None)
     assert result["hard_killed"] == ["i-aged"], result
     kill = journal.index("ec2:terminate:i-aged")
-    tag_writes = [i for i, e in enumerate(journal) if e == "ec2:create_tags:i-aged"]
-    assert all(i > kill for i in tag_writes), journal
+    tag_writes = [index for index, event in enumerate(journal)
+                  if event.startswith("ec2:create_tags:")]
+    assert tag_writes, journal
+    assert all(index > kill for index in tag_writes), journal
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():

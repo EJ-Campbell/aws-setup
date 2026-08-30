@@ -209,23 +209,29 @@ minutes in, mid-job, while still under the soft cap. On GitHub that renders as "
 self-hosted runner lost communication with the server", indistinguishable from a spot
 reclaim, which is the same misattributed failure `ejc3/fcvm#884` cost a night of reruns to.
 
-A read counts as unread unless it is **complete**: the call has to succeed, the payload has
-to carry a `runners` array, and the pages collected have to reach the `total_count` GitHub
-reports beside them. A short page reads exactly like "that runner is not registered", so
-truncation is the same fail-open arriving through pagination.
+A read counts as unread unless two complete roster traversals agree. Every page must carry a
+`runners` array and one unchanged non-negative integer `total_count`; the records collected
+must reach that count without a duplicate name or id. Runner names must contain non-whitespace
+text and ids must be positive integers (Python booleans are rejected even though they are
+integer subclasses). The two duplicate-free traversals must then produce the same records.
+A short or shifting pagination reads exactly like "that runner is not registered", so it
+cannot authorize lease expiry or orphan deletion.
 
-`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner. A
-`LeaseExpires` value later than launch time plus the initial 60 minutes is equivalent
-registration evidence: only a poll that found the runner online and busy can renew it. The
-two signals separate "GitHub answered and does not list this runner" (ambiguous: a real
-deregistration and an answer that dropped records look identical) from "this runner has
-never registered at all" — a box that booted and never joined, because the IPv6 gate refused
-or the PAT did not read back from SSM. This also covers instances that predate the
-`RunnerSeenAt` tag and a poll whose separate tag write failed. A lease that never moved is
-still reaped at ~60 minutes, and nothing else would reap it: the instance sits in `running`,
-where the stalled-launch phase (which walks `pending`) cannot see it. The tag also dates an
-outage: a held lease logs how long the runner has gone unobserved, so a blip and a three-hour
-outage are different lines rather than the same one repeated.
+`RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner.
+`LeaseRenewedAt` is written atomically with `LeaseExpires` when GitHub reports the runner
+online and busy, so it preserves the same fact if the separate seen write fails. Those are the
+only persisted registration signals. Lease timing is not one: EC2's launch timestamp and the
+launcher's initial expiry can differ at microsecond precision, so comparing `LeaseExpires` to
+launch time plus 60 minutes misclassified an initial lease as a renewal. An initial lease
+written for a legacy instance deliberately carries no renewal tag.
+
+The explicit signals separate "GitHub answered and does not list this runner" (ambiguous: a
+real deregistration and an answer that dropped records look identical) from "this runner has
+never registered at all", a box that booted and never joined because the IPv6 gate refused or
+the PAT did not read back from SSM. An unregistered legacy box gets one initial lease but is
+still reaped when it expires. Nothing else would reap it: the instance sits in `running`, where
+the stalled-launch phase (which walks `pending`) cannot see it. `RunnerSeenAt` also dates an
+outage, so a blip and a three-hour outage produce different log lines.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal requires GitHub to
 explicitly report `busy=true, status=online`; `busy=true, status=offline` lets the lease
@@ -267,11 +273,13 @@ covers the longest job that can be in flight when a runner crosses the soft cap 
 that notices it finished: the longest legitimate self-hosted job measured here is 43.5
 minutes and a full matrix is about 35.
 
-**A bound is only real if the sweep runs and reaches every instance.** The ceiling lives in
-one loop. Anything that raises before or during that loop, or simply spends the Lambda's
-240-second budget before reaching it, disables it for every instance the poll had not got to
-— and nothing in this account alarms on Lambda errors, so it would be invisible. Five things
-hold it open.
+**A bound is only real if the sweep reaches every instance before optional writes.** The first
+pass across the fleet reads only instance id and launch time and attempts every required
+hard-ceiling termination. The ordinary pass stamps registration and renews leases only after
+that fleet-wide pass finishes. A per-instance ordering is insufficient: a tag write for a
+younger instance can consume the Lambda's remaining budget and prevent an older instance later
+in the response from ever reaching its ceiling check. Five other safeguards hold the bound
+open.
 
 *Order.* The sweep is **Phase 1**, ahead of the orphan cleanup and the stuck-job scan. Both of
 those are unbounded GitHub work (one EC2 describe per registered runner plus deregistrations
@@ -296,7 +304,8 @@ call, so it never claims a job is dead on a poll where the instance survived.
 naive one, and comparing it raised `TypeError` out of the whole invocation.
 
 *The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else.
-`get_runners` makes the whole roster unread if any record lacks a usable `name` or `id`.
+`get_runners` makes the whole roster unread if any record lacks a nonempty `name` or a positive
+non-boolean integer `id`, if an identity is duplicated, or if two complete reads differ.
 The orphan phase calls `.startswith()` on every key and formats the id into a DELETE URL,
 and the idle path keys its fresh re-read on the id. Dropping only the malformed record would
 turn evidence that GitHub listed it into false evidence that it was absent, which can expire
