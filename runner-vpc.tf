@@ -140,6 +140,20 @@ resource "aws_iam_role_policy" "runner" {
           "ec2:DescribeNetworkInterfaces"
         ]
         Resource = "*"
+      },
+      {
+        Sid    = "ClaimOwnRunnerRegistration"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = aws_dynamodb_table.runner_registration[0].arn
+        Condition = {
+          "ForAllValues:StringEquals" = {
+            "dynamodb:LeadingKeys" = ["$${ec2:SourceInstanceARN}"]
+          }
+        }
       }
     ]
   })

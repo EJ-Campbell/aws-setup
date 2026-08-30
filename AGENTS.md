@@ -161,7 +161,8 @@ recovery/monitoring infrastructure.
   DynamoDB locks
 - Roughly 195 managed resources across `us-west-1`, `us-west-2`, `us-east-1`, the isolated
   staging account, and Cloudflare
-- No Aurora, and no database of any kind -- that was removed; ignore older references
+- No application database or Aurora. DynamoDB is used for Terraform locking and the runner
+  registration handshake
 
 ## User Workflow
 
@@ -199,7 +200,8 @@ broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
 - `dev-auto-stop-lambda.tf` applies intended 12h idle policies to the metal boxes and I/O
   box. `parallel-box-watchdog.tf` terminates burst compute after 30m CPU idle
 - `nextjs-dev` and both jumpboxes are deliberately excluded from idle stop
-- There is no database. Older notes about Aurora Serverless auto-pause no longer apply
+- There is no application database. DynamoDB is limited to Terraform locking and runner
+  registration claims. Older notes about Aurora Serverless auto-pause no longer apply
 
 ### File Structure
 
@@ -727,7 +729,8 @@ Do not add a speculative option. Region placement is intentional: the main fleet
 copies use `us-east-1`.
 
 **Add deployment options**:
-Prefer the deployed opinionated path. There is no database and no Aurora auto-pause.
+Prefer the deployed opinionated path. There is no application database and no Aurora
+auto-pause; DynamoDB is limited to locking and runner registration claims.
 
 ## Philosophy in Action
 

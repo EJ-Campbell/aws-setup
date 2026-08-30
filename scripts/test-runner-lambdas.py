@@ -28,6 +28,8 @@ from pathlib import Path
 
 TF_FILE = Path(__file__).resolve().parent.parent / "runner-autoscale.tf"
 NOW = datetime(2026, 8, 7, 20, 0, 0, tzinfo=timezone.utc)
+ACCOUNT_ID = "928413605543"
+REGION = "us-west-1"
 
 
 # --------------------------------------------------------------------------
@@ -165,6 +167,58 @@ class FakeClientError(Exception):
     def __init__(self, code, message="fake"):
         super().__init__(f"An error occurred ({code}): {message}")
         self.response = {"Error": {"Code": code, "Message": message}}
+
+
+class FakeDynamoDB:
+    """Registration rows with conditional-create semantics.
+
+    Every accepted write changes `items`, and every read answers from it, so a
+    case asserts the row that exists after the poll rather than the calls the
+    Lambda made. `put_error` rejects the write without landing it (a throttle,
+    a permissions change); `write_then_error` lands it and then raises, which
+    is a PutItem whose answer was lost on the wire; `concurrent_item` is a row
+    another writer creates in the instant before this PutItem, so the
+    conditional create fails the way it does when bootstrap wins the race.
+    """
+
+    def __init__(self, items=(), put_error=None, write_then_error=False,
+                 concurrent_item=None, get_error=None):
+        self.items = {}
+        for item in items:
+            self.items[item["InstanceArn"]["S"]] = item
+        self.put_error = put_error
+        self.write_then_error = write_then_error
+        self.concurrent_item = concurrent_item
+        self.get_error = get_error
+        self.calls = []
+
+    def get_item(self, **kw):
+        self.calls.append(("get_item", kw))
+        assert kw.get("ConsistentRead") is True, kw
+        if self.get_error:
+            raise self.get_error
+        item = self.items.get(kw["Key"]["InstanceArn"]["S"])
+        return {"Item": item} if item is not None else {}
+
+    def put_item(self, **kw):
+        self.calls.append(("put_item", kw))
+        arn = kw["Item"]["InstanceArn"]["S"]
+        if self.concurrent_item is not None:
+            concurrent = self.concurrent_item
+            self.concurrent_item = None
+            self.items[concurrent["InstanceArn"]["S"]] = concurrent
+        if kw.get("ConditionExpression") == "attribute_not_exists(InstanceArn)" and arn in self.items:
+            raise FakeClientError("ConditionalCheckFailedException")
+        if self.write_then_error:
+            self.items[arn] = kw["Item"]
+            raise self.put_error or OSError("PutItem outcome unknown")
+        if self.put_error:
+            raise self.put_error
+        self.items[arn] = kw["Item"]
+        return {}
+
+    def ops(self, name):
+        return [kw for op, kw in self.calls if op == name]
 
 
 class FakeSSM:
@@ -350,7 +404,8 @@ def capture_emf(emit, **kwargs):
     return json.loads(buf.getvalue().strip().splitlines()[-1])
 
 
-def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW):
+def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
+                dynamodb=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
@@ -360,7 +415,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     """
     os.environ.clear()
     os.environ.update(_BASE_ENV)
-    clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client}
+    clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client,
+               "dynamodb": dynamodb or FakeDynamoDB()}
     fake_boto3 = types.ModuleType("boto3")
     fake_boto3.client = lambda service, **kw: clients[service]
     sys.modules["boto3"] = fake_boto3
@@ -377,6 +433,8 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
         "USER_DATA_PARAM": "/github-runner/user-data",
         "WEBHOOK_FUNCTION": "github-runner-webhook",
         "MAX_RUNNERS": "4",
+        "REGISTRATION_TABLE": "github-runner-registration",
+        "RUNNER_ACCOUNT_ID": ACCOUNT_ID,
         **(env or {}),
     })
 
@@ -419,6 +477,33 @@ def run(run_id, status):
 def job(status, arch, name="job"):
     labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
     return {"name": name, "status": status, "labels": labels}
+
+
+def instance_arn(instance_id):
+    return f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:instance/{instance_id}"
+
+
+def registered_item(instance_id="i-lease", runner_id=77, runner_name=None):
+    """One registration claim as user data writes it."""
+    name = runner_name or f"runner-{instance_id}"
+    return {
+        "InstanceArn": {"S": instance_arn(instance_id)},
+        "State": {"S": "registered"},
+        "InstanceId": {"S": instance_id},
+        "RunnerName": {"S": name},
+        "RunnerId": {"N": str(runner_id)},
+        "RegisteredAt": {"S": NOW.isoformat()},
+    }
+
+
+def reaping_item(instance_id="i-lease"):
+    """One cleanup-owned claim, after which bootstrap can no longer start the service."""
+    return {
+        "InstanceArn": {"S": instance_arn(instance_id)},
+        "State": {"S": "reaping"},
+        "InstanceId": {"S": instance_id},
+        "ReapingAt": {"S": NOW.isoformat()},
+    }
 
 
 # --------------------------------------------------------------------------
@@ -512,6 +597,18 @@ def case_every_launchable_type_has_instance_storage():
                 f"{arch}: {t} has no instance storage; it would boot a runner "
                 f"that cannot build /mnt/fcvm-btrfs"
             )
+
+
+def case_every_new_runner_declares_the_registration_protocol():
+    """Only a launch tagged with the handshake may be reaped through its row."""
+    ec2 = FakeEC2()
+    webhook(ec2)["launch_runner"]("arm64")
+    calls = ec2.ops("run_instances")
+    assert len(calls) == 1, calls
+    instance_tags = next(spec["Tags"] for spec in calls[0]["TagSpecifications"]
+                         if spec["ResourceType"] == "instance")
+    tags = {tag["Key"]: tag["Value"] for tag in instance_tags}
+    assert tags["RunnerRegistrationProtocol"] == "ddb-v1", tags
 
 
 def case_arm_types_are_graviton3_or_newer():
@@ -704,9 +801,9 @@ def case_one_arch_failure_does_not_rotate_the_other():
 # Cases: the cleanup Lambda's reaper and queue scan
 # --------------------------------------------------------------------------
 
-def cleanup(ec2, github, lambda_client=None, env=None, ssm=None):
+def cleanup(ec2, github, lambda_client=None, env=None, ssm=None, dynamodb=None):
     return load_lambda(CLEANUP_SRC, ec2, ssm or FakeSSM(), lambda_client or FakeLambdaClient(),
-                       github, env)
+                       github, env, dynamodb=dynamodb)
 
 
 def case_stalled_launch_is_tagged_then_terminated():
@@ -1354,7 +1451,8 @@ def case_absolute_runner_lifetime_is_13h30m():
 def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                runners_error=False, runners_total=None, ssm=None,
                instance_id="i-lease", omit_runners_total=False, create_tags_error=None,
-               create_tags_reject_keys=None, runner_payloads=None):
+               create_tags_reject_keys=None, runner_payloads=None, dynamodb=None,
+               recheck=None):
     """One cleanup poll over a single running runner UNDER the soft cap.
 
     The lease is what is under test, so the instance is deliberately young
@@ -1369,10 +1467,10 @@ def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                   create_tags_reject_keys=create_tags_reject_keys)
     github = FakeGitHub(runners=list(runners), runners_error=runners_error,
                         runners_total=runners_total, omit_runners_total=omit_runners_total,
-                        runner_payloads=runner_payloads)
+                        runner_payloads=runner_payloads, recheck=recheck)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
+        result = cleanup(ec2, github, ssm=ssm, dynamodb=dynamodb)["handler"]({}, None)
     return result, ec2, github, buf.getvalue()
 
 
@@ -1711,6 +1809,249 @@ def case_every_ceiling_terminate_precedes_the_pat_read_and_the_roster():
                 if e.startswith("ssm:") or e.startswith("github:GET:")]
     assert optional, journal
     assert all(kill < i for kill in kills for i in optional), journal
+
+
+def case_the_pat_value_is_never_logged():
+    """Not even a prefix of the credential belongs in CloudWatch."""
+    secret = "ghp_super_secret_value"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cleanup(FakeEC2(), FakeGitHub(), ssm=FakeSSM(pat=secret))["handler"]({}, None)
+    assert secret not in buf.getvalue(), buf.getvalue()
+    assert secret[:10] not in buf.getvalue(), buf.getvalue()
+
+
+def case_a_rejected_renewal_write_is_not_reported_as_a_renewal():
+    """`renewed` names leases EC2 accepted, not leases the poll meant to extend."""
+    result, ec2, _, _ = lease_poll(runners=[runner_record("i-lease", busy=True)],
+                                   create_tags_error=OSError("CreateTags unavailable"))
+    assert result["renewed"] == [], result
+    assert result["held"] == ["i-lease"], result
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    tags = {t["Key"]: t["Value"] for t in ec2.instances[0]["Tags"]}
+    assert tags["LeaseExpires"] == (NOW - timedelta(minutes=45)).isoformat(), tags
+
+
+def case_lease_expiry_rechecks_the_runner_before_termination():
+    """A job handed out after the roster snapshot survives the lease.
+
+    The roster read at the top of the poll says idle; the runner picked up a
+    job in the seconds since. The expired lease terminated on the snapshot.
+    """
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-lease", busy=False)],
+        recheck={77: runner_record("i-lease", busy=True)})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["expired"] == [], result
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_lease_expiry_recheck_that_answers_for_another_runner_holds():
+    """GET /runners/{id} answering with a different name is not this runner."""
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-lease", busy=False)],
+        recheck={77: {"id": 77, "name": "runner-i-other", "busy": False, "status": "online"}})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_protocol_box_that_never_claimed_registration_dies_at_its_lease():
+    """The ddb-v1 form of the never-registered case, reaped through the claim.
+
+    No row means bootstrap never got as far as registering. Cleanup creates
+    the `reaping` row first, so a bootstrap that is about to register finds
+    the row taken and refuses to start the service, and only then terminates.
+    """
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"},
+        runners=[runner_record("i-other")], dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    claims = dynamodb.ops("put_item")
+    assert len(claims) == 1, claims
+    assert claims[0]["ConditionExpression"] == "attribute_not_exists(InstanceArn)", claims
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
+
+
+def case_a_protocol_box_is_held_until_its_lease_expires():
+    """Cleanup does not race a bootstrap that is still inside its lease."""
+    dynamodb = FakeDynamoDB()
+    result, ec2, _, _ = lease_poll(
+        age_minutes=30, lease_minutes_ago=-5,
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert dynamodb.ops("put_item") == [], dynamodb.ops("put_item")
+
+
+def case_a_registered_row_is_read_by_id_when_the_roster_omits_it():
+    """The row's runner id outranks absence from the roster.
+
+    Under the legacy rule this instance holds (its lease was renewed). With a
+    row, cleanup asks GitHub about that exact id instead and renews on the
+    answer.
+    """
+    exact = runner_record("i-lease", busy=True, runner_id=77)
+    result, ec2, _, _ = lease_poll(
+        age_minutes=70, lease_minutes_ago=5,
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=FakeDynamoDB([registered_item()]), recheck={77: exact})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["renewed"] == ["i-lease"], result
+    assert result["held"] == [], result
+
+
+def case_a_registered_row_whose_runner_reads_idle_expires_the_lease():
+    """Positive evidence from the exact read is acted on: idle and expired goes."""
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=FakeDynamoDB([registered_item()]),
+        recheck={77: runner_record("i-lease", busy=False)})
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+
+
+def case_a_registered_row_whose_lookup_fails_holds():
+    """A 404 or a transport error on the exact read is absence of evidence."""
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=FakeDynamoDB([registered_item()]), recheck={77: None})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_registered_row_whose_lookup_names_another_runner_holds():
+    """A reused or malformed runner id is not evidence about this instance."""
+    mismatches = [
+        {"id": 78, "name": "runner-i-lease", "busy": False, "status": "online"},
+        {"id": 77, "name": "runner-i-other", "busy": False, "status": "online"},
+        {"id": True, "name": "runner-i-lease", "busy": False, "status": "online"},
+    ]
+    for exact in mismatches:
+        result, ec2, _, _ = lease_poll(
+            tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+            dynamodb=FakeDynamoDB([registered_item()]), recheck={77: exact})
+        assert still_running(ec2) == ["i-lease"], (exact, still_running(ec2))
+        assert result["held"] == ["i-lease"], (exact, result)
+
+
+def case_a_malformed_registration_row_holds():
+    """A row that does not describe this instance decides nothing."""
+    rows = []
+    bad_id = registered_item(); bad_id["RunnerId"] = {"N": "not-an-integer"}; rows.append(bad_id)
+    bad_name = registered_item(runner_name="runner-i-other"); rows.append(bad_name)
+    bad_state = registered_item(); bad_state["State"] = {"S": "pending"}; rows.append(bad_state)
+    other = registered_item("i-other"); other["InstanceArn"] = {"S": instance_arn("i-lease")}
+    rows.append(other)
+    for row in rows:
+        dynamodb = FakeDynamoDB([row])
+        result, ec2, _, _ = lease_poll(
+            tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+        assert still_running(ec2) == ["i-lease"], (row, still_running(ec2))
+        assert result["held"] == ["i-lease"], (row, result)
+        assert dynamodb.ops("put_item") == [], (row, dynamodb.ops("put_item"))
+
+
+def case_an_unreadable_registration_table_holds():
+    """A throttled or unauthorised consistent read is not a missing row."""
+    dynamodb = FakeDynamoDB(get_error=OSError("GetItem unavailable"))
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert dynamodb.ops("put_item") == [], dynamodb.ops("put_item")
+
+
+def case_a_missing_account_id_makes_every_registration_unread():
+    """Without the account id no row can be addressed, and unread holds."""
+    dynamodb = FakeDynamoDB()
+    all_tags = {"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat(),
+                "RunnerRegistrationProtocol": "ddb-v1"}
+    ec2 = FakeEC2([instance("i-lease", "c7g.metal", "running", 60, arch="arm64", tags=all_tags)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[]), dynamodb=dynamodb,
+                         env={"RUNNER_ACCOUNT_ID": ""})["handler"]({}, None)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert dynamodb.calls == [], dynamodb.calls
+
+
+def case_a_reaping_claim_that_did_not_land_holds():
+    """A rejected PutItem with no row behind it is a claim not made."""
+    dynamodb = FakeDynamoDB(put_error=OSError("PutItem throttled"))
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert dynamodb.items == {}, dynamodb.items
+
+
+def case_a_reaping_claim_whose_answer_was_lost_is_resolved_by_a_consistent_read():
+    """A PutItem that landed and then timed out is found by reading the row."""
+    dynamodb = FakeDynamoDB(put_error=OSError("response lost"), write_then_error=True)
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
+
+
+def case_an_existing_reaping_row_retries_a_failed_terminate():
+    """A claim won on an earlier poll is still the claim; no second write."""
+    dynamodb = FakeDynamoDB([reaping_item()])
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[], dynamodb=dynamodb)
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert dynamodb.ops("put_item") == [], dynamodb.ops("put_item")
+
+
+def case_a_bootstrap_that_registers_between_the_read_and_the_claim_wins():
+    """ConditionalCheckFailedException is bootstrap winning, not an error to retry."""
+    dynamodb = FakeDynamoDB(concurrent_item=registered_item())
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+        dynamodb=dynamodb, recheck={77: None})
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert len(dynamodb.ops("put_item")) == 1, dynamodb.ops("put_item")
+    assert dynamodb.items[instance_arn("i-lease")] == registered_item()
+
+
+def case_a_protocol_husk_beside_a_held_legacy_runner():
+    """One poll, one held legacy box and one ddb-v1 husk reaped through its claim."""
+    expired = (NOW - timedelta(minutes=45)).isoformat()
+    ec2 = FakeEC2([
+        instance("i-live", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": expired,
+                       "RunnerSeenAt": (NOW - timedelta(minutes=6)).isoformat()}),
+        instance("i-husk", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": expired, "RunnerRegistrationProtocol": "ddb-v1"}),
+    ])
+    dynamodb = FakeDynamoDB()
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]),
+                         dynamodb=dynamodb)["handler"]({}, None)
+    assert still_running(ec2) == ["i-live"], still_running(ec2)
+    assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
+    assert result["held"] == ["i-live"], result
+    assert result["expired"] == ["i-husk"], result
+    assert dynamodb.items[instance_arn("i-husk")] == reaping_item("i-husk")
+
+
+def case_an_unreadable_registration_table_does_not_suppress_the_ceiling():
+    """The ceiling is derived from launch time alone; DynamoDB is not consulted."""
+    dynamodb = FakeDynamoDB(get_error=OSError("GetItem unavailable"))
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat(),
+                                  "RunnerRegistrationProtocol": "ddb-v1"})])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[]), dynamodb=dynamodb)["handler"]({}, None)
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert dynamodb.calls == [], dynamodb.calls
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():

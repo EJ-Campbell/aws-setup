@@ -5,7 +5,28 @@ locals {
   # Runner pool size per architecture. The webhook Lambda enforces it; the cleanup
   # Lambda bounds its queue scan and its per-poll launch count by it. One value so
   # the two can never disagree about how large the pool is.
-  runner_max_per_arch = 4
+  runner_max_per_arch            = 4
+  runner_registration_table_name = "github-runner-registration"
+}
+
+# Bootstrap and cleanup need one atomic answer to "may this instance start the
+# runner service?". A conditional create on the instance ARN gives that answer:
+# user data creates `registered`, or cleanup creates `reaping`, but never both.
+# EC2 tags and GitHub's offset-paginated roster cannot provide that exclusion.
+resource "aws_dynamodb_table" "runner_registration" {
+  count        = var.enable_github_runner ? 1 : 0
+  name         = local.runner_registration_table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "InstanceArn"
+
+  attribute {
+    name = "InstanceArn"
+    type = "S"
+  }
+
+  tags = {
+    Name = local.runner_registration_table_name
+  }
 }
 
 # ============================================
@@ -508,7 +529,12 @@ data "archive_file" "runner_webhook" {
                               {'Key': 'Name', 'Value': f'github-runner-{arch}'},
                               {'Key': 'Role', 'Value': 'github-runner'},
                               {'Key': 'Architecture', 'Value': arch},
-                              {'Key': 'LeaseExpires', 'Value': lease_expiry}
+                              {'Key': 'LeaseExpires', 'Value': lease_expiry},
+                              # Which registration handshake this instance's
+                              # user data runs. It says nothing about whether
+                              # registration succeeded; the cleanup Lambda reads
+                              # that from the DynamoDB row this tag points at.
+                              {'Key': 'RunnerRegistrationProtocol', 'Value': 'ddb-v1'}
                           ]
                       }]
                   )
@@ -642,6 +668,18 @@ resource "aws_lambda_function" "runner_webhook" {
   tags = {
     Name = "github-runner-webhook"
   }
+
+  # The ddb-v1 tag is a promise that the instance's user data can make its
+  # registration claim and that the cleanup Lambda knows what the claim means.
+  # No tagged instance may launch before the table, both IAM grants, the
+  # cleanup Lambda and the user-data parameter carrying that protocol exist.
+  depends_on = [
+    aws_dynamodb_table.runner_registration,
+    aws_iam_role_policy.runner_lambda,
+    aws_iam_role_policy.runner,
+    aws_lambda_function.runner_cleanup,
+    aws_ssm_parameter.runner_user_data,
+  ]
 }
 
 # ============================================
@@ -698,6 +736,14 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = "arn:aws:lambda:us-west-1:928413605543:function:github-runner-webhook"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = aws_dynamodb_table.runner_registration[0].arn
       }
     ]
   })
@@ -1046,14 +1092,84 @@ cd /opt/actions-runner
 curl -sL "$RUNNER_URL" | tar xz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
+# Do not xtrace either token into cloud-init or the serial console.
+set +x
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
     https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
+  RUNNER_NAME="runner-$INSTANCE_ID"
   sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "runner-$INSTANCE_ID" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+
+  # `.runner` is the identity GitHub assigned, written by config.sh with
+  # camelCase keys (the runner serialises RunnerSettings through
+  # VssCamelCasePropertyNamesContractResolver). Refuse to start when config
+  # wrote anything other than this instance's name, or no positive id.
+  RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
+    select(.agentName == $expected)
+    | .agentId
+    | select(type == "number" and . > 0 and floor == .)
+  ' .runner)
+
+  IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/dynamic/instance-identity/document)
+  ACCOUNT_ID=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+    '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
+  IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+    '.region | select(type == "string" and length > 0)')
+  [ "$IDENTITY_REGION" = "$REGION" ]
+  INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$INSTANCE_ID"
+  REGISTRATION_TABLE="${local.runner_registration_table_name}"
+  REGISTERED_AT=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)
+  REGISTRATION_KEY=$(jq -cn --arg arn "$INSTANCE_ARN" \
+    '{InstanceArn: {S: $arn}}')
+  REGISTRATION_ITEM=$(jq -cn \
+    --arg arn "$INSTANCE_ARN" \
+    --arg instance_id "$INSTANCE_ID" \
+    --arg runner_name "$RUNNER_NAME" \
+    --arg runner_id "$RUNNER_ID" \
+    --arg registered_at "$REGISTERED_AT" \
+    '{InstanceArn: {S: $arn}, State: {S: "registered"},
+      InstanceId: {S: $instance_id}, RunnerName: {S: $runner_name},
+      RunnerId: {N: $runner_id}, RegisteredAt: {S: $registered_at}}')
+
+  # Bootstrap and cleanup both conditionally create this row. Bootstrap starts
+  # the service only when it won, or when a consistent read proves that a
+  # PutItem whose answer was lost did in fact write this exact identity.
+  if ! aws dynamodb put-item \
+      --table-name "$REGISTRATION_TABLE" \
+      --item "$REGISTRATION_ITEM" \
+      --condition-expression 'attribute_not_exists(InstanceArn)' \
+      --region "$REGION"; then
+    REGISTRATION_ROW=$(aws dynamodb get-item \
+      --table-name "$REGISTRATION_TABLE" \
+      --key "$REGISTRATION_KEY" \
+      --consistent-read \
+      --region "$REGION" \
+      --output json 2>/dev/null || true)
+    if ! printf '%s' "$REGISTRATION_ROW" | jq -e \
+        --arg arn "$INSTANCE_ARN" \
+        --arg instance_id "$INSTANCE_ID" \
+        --arg runner_name "$RUNNER_NAME" \
+        --arg runner_id "$RUNNER_ID" \
+        '.Item.InstanceArn.S == $arn
+         and .Item.State.S == "registered"
+         and .Item.InstanceId.S == $instance_id
+         and .Item.RunnerName.S == $runner_name
+         and .Item.RunnerId.N == $runner_id' >/dev/null; then
+      echo "FATAL: cleanup won or registration ownership is unknown; refusing to start runner service"
+      curl -fsS -X DELETE -H "Authorization: token $PAT" \
+        "https://api.github.com/repos/ejc3/fcvm/actions/runners/$RUNNER_ID" || true
+      exit 1
+    fi
+  fi
+
   ./svc.sh install ubuntu
   ./svc.sh start
+else
+  echo "FATAL: no usable GitHub runner PAT; refusing to register this runner"
+  exit 1
 fi
 EOF
 }
@@ -1067,7 +1183,8 @@ EOF
 #   ValidationException: The specified parameter value is too large.
 #   Advanced-tier parameters support a maximum parameter value of 8192 characters.
 #
-# base64gzip brings it to 4,712, with room for the script to keep growing.
+# base64gzip brought it to 4,712; the registration claim takes it to about 6,100,
+# still under the limit with room for the script to keep growing.
 #
 # Safe because BOTH decoders are already in the path, and neither is new behaviour:
 #   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
@@ -1108,8 +1225,14 @@ data "archive_file" "runner_cleanup" {
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
+      dynamodb = boto3.client('dynamodb', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
+      REGION = 'us-west-1'
+      # The launcher tags every instance with the registration handshake its
+      # user data runs. Only this value has a DynamoDB row to read.
+      PROTOCOL_TAG = 'RunnerRegistrationProtocol'
+      REGISTRATION_PROTOCOL = 'ddb-v1'
       # Lease duration - busy runners get extended, idle runners expire
       LEASE_DURATION_MINUTES = 60
 
@@ -1286,7 +1409,6 @@ data "archive_file" "runner_cleanup" {
           try:
               resp = ssm.get_parameter(Name='/github-runner/pat', WithDecryption=True)
               pat = resp['Parameter']['Value']
-              print(f'SSM PAT value starts with: {pat[:10] if pat else "None"}...')
               if pat and pat != 'placeholder':
                   return pat
           except Exception as e:
@@ -1448,7 +1570,36 @@ data "archive_file" "runner_cleanup" {
               return None
           return first
 
-      def still_idle(runner_id, pat):
+      def exact_runner(runner_id, runner_name, pat):
+          """Read one runner by id and confirm it is the runner expected, or None.
+
+          GET /actions/runners/{id} answers for whichever registration holds
+          that id. The id is immutable for the life of a registration, but a
+          registration this Lambda read from a DynamoDB row or an earlier
+          roster can have been replaced since, so the answer counts only when
+          both id and name match what was asked for. None means not proven:
+          the call failed, the record is malformed, or it describes another
+          runner. Nothing is decided on None.
+          """
+          if not pat:
+              return None
+          try:
+              record = github_get(
+                  pat, f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}')
+          except Exception as e:
+              print(f'Cannot read runner {runner_id}: {type(e).__name__}: {e}')
+              return None
+          returned_id = record.get('id') if isinstance(record, dict) else None
+          returned_name = record.get('name') if isinstance(record, dict) else None
+          if (not isinstance(returned_id, int) or isinstance(returned_id, bool)
+                  or returned_id != runner_id or returned_name != runner_name):
+              print(f'Runner {runner_id} is not {runner_name}: got id={returned_id!r} '
+                    f'name={returned_name!r}')
+              return None
+          return {'id': returned_id, 'busy': record.get('busy'),
+                  'status': record.get('status')}
+
+      def still_idle(runner_id, runner_name, pat):
           """Re-read ONE runner and confirm GitHub still says it holds no job.
 
           The busy flags this poll acts on were read at the top of the handler,
@@ -1462,12 +1613,8 @@ data "archive_file" "runner_cleanup" {
           so the caller drains instead of terminating, and the hard ceiling still
           bounds how long that can last.
           """
-          try:
-              record = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}')
-          except Exception as e:
-              print(f'Cannot re-read runner {runner_id} before terminating it: {type(e).__name__}: {e}')
-              return False
-          return record.get('busy') is False
+          record = exact_runner(runner_id, runner_name, pat)
+          return record is not None and record.get('busy') is False
 
       def deregister_runner(runner_id, pat):
           """Remove runner from GitHub by ID"""
@@ -1518,6 +1665,123 @@ data "archive_file" "runner_cleanup" {
               if tag['Key'] == key:
                   return tag['Value']
           return None
+
+      # The registration row for a ddb-v1 instance, read three ways. None is
+      # a consistent read that found no item: bootstrap has not claimed
+      # registration. A dict is a well-formed row, `registered` or `reaping`.
+      # REGISTRATION_UNREAD is everything else - the table could not be read,
+      # the configuration to address it is missing, or the row does not
+      # describe this instance - and nothing destructive is decided on it.
+      REGISTRATION_UNREAD = object()
+
+      def registration_arn(instance_id):
+          account_id = os.environ.get('RUNNER_ACCOUNT_ID', '')
+          if not account_id.isdigit() or len(account_id) != 12:
+              return None
+          return f'arn:aws:ec2:{REGION}:{account_id}:instance/{instance_id}'
+
+      def parse_registration(instance_id, item):
+          """Validate one registration row and return its typed identity."""
+          expected_arn = registration_arn(instance_id)
+          if not expected_arn or not isinstance(item, dict):
+              return REGISTRATION_UNREAD
+
+          def string_attr(name):
+              attr = item.get(name)
+              value = attr.get('S') if isinstance(attr, dict) else None
+              return value if isinstance(value, str) and value else None
+
+          if string_attr('InstanceArn') != expected_arn:
+              return REGISTRATION_UNREAD
+          if string_attr('InstanceId') != instance_id:
+              return REGISTRATION_UNREAD
+          state = string_attr('State')
+          if state == 'reaping':
+              if not string_attr('ReapingAt'):
+                  return REGISTRATION_UNREAD
+              return {'state': state, 'instance_arn': expected_arn}
+          if state != 'registered':
+              return REGISTRATION_UNREAD
+          runner_name = string_attr('RunnerName')
+          registered_at = string_attr('RegisteredAt')
+          runner_id_attr = item.get('RunnerId')
+          runner_id_text = (runner_id_attr.get('N')
+                            if isinstance(runner_id_attr, dict) else None)
+          try:
+              runner_id = int(runner_id_text)
+          except (TypeError, ValueError):
+              return REGISTRATION_UNREAD
+          if (runner_name != f'runner-{instance_id}' or not registered_at
+                  or runner_id <= 0 or str(runner_id) != runner_id_text):
+              return REGISTRATION_UNREAD
+          return {'state': state, 'instance_arn': expected_arn,
+                  'runner_name': runner_name, 'runner_id': runner_id}
+
+      def read_registration(instance_id):
+          """Consistent read of one row. None is proven absence; the sentinel is unknown."""
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          instance_arn = registration_arn(instance_id)
+          if not table or not instance_arn:
+              print(f'{instance_id}: REGISTRATION UNREAD: table or account id not configured')
+              return REGISTRATION_UNREAD
+          try:
+              response = dynamodb.get_item(
+                  TableName=table,
+                  Key={'InstanceArn': {'S': instance_arn}},
+                  ConsistentRead=True,
+              )
+          except Exception as e:
+              print(f'{instance_id}: REGISTRATION UNREAD: {type(e).__name__}: {e}')
+              return REGISTRATION_UNREAD
+          if not isinstance(response, dict):
+              print(f'{instance_id}: REGISTRATION UNREAD: GetItem returned '
+                    f'{type(response).__name__}')
+              return REGISTRATION_UNREAD
+          item = response.get('Item')
+          if item is None:
+              return None
+          parsed = parse_registration(instance_id, item)
+          if parsed is REGISTRATION_UNREAD:
+              print(f'{instance_id}: REGISTRATION UNREAD: row does not describe this instance')
+          return parsed
+
+      def claim_reaping(instance_id, now):
+          """Create the `reaping` row, so bootstrap can no longer create `registered`.
+
+          True only when this instance's row is `reaping` at the end of the
+          call. A ConditionalCheckFailedException means a row already exists,
+          and any other error means the outcome of the write is unknown; both
+          are resolved the same way, by a consistent read of what is actually
+          there. A `registered` row loses, and so does an unreadable table.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          instance_arn = registration_arn(instance_id)
+          if not table or not instance_arn:
+              return False
+          item = {
+              'InstanceArn': {'S': instance_arn},
+              'State': {'S': 'reaping'},
+              'InstanceId': {'S': instance_id},
+              'ReapingAt': {'S': now.isoformat()},
+          }
+          try:
+              dynamodb.put_item(
+                  TableName=table,
+                  Item=item,
+                  ConditionExpression='attribute_not_exists(InstanceArn)',
+              )
+              return True
+          except Exception as e:
+              code = getattr(e, 'response', {}).get('Error', {}).get('Code') \
+                  if isinstance(getattr(e, 'response', None), dict) else None
+              if code == 'ConditionalCheckFailedException':
+                  print(f'{instance_id}: reaping claim refused, a row already exists; reading it')
+              else:
+                  print(f'{instance_id}: reaping claim outcome unknown: '
+                        f'{type(e).__name__}: {e}; reading the row')
+          registration = read_registration(instance_id)
+          return (isinstance(registration, dict)
+                  and registration.get('state') == 'reaping')
 
       # A runner instance that has not left `pending` by now is a failed launch, not
       # a runner. AWS accepts run_instances for a metal spot instance it cannot place
@@ -2025,15 +2289,87 @@ data "archive_file" "runner_cleanup" {
                           continue
 
                       # Get runner status from GitHub
+                      protocol = get_tag(instance, PROTOCOL_TAG)
+                      registration = None
                       runner_info = runners.get(runner_name, {})
-                      # What that answer lets the lease phase do, and the one fact
-                      # a later poll cannot recover for itself: that some poll saw
-                      # this runner registered. Read from two places, because the
-                      # stamp is a write that can fail and a renewed lease is one
-                      # that already succeeded.
-                      registered_before = (get_tag(instance, SEEN_TAG) is not None
-                                           or lease_was_renewed(launch_time, lease_expires_str))
-                      verdict = lease_verdict(roster, runner_name, registered_before)
+                      if protocol == REGISTRATION_PROTOCOL:
+                          # This instance's bootstrap claims registration in
+                          # DynamoDB before it starts the runner service, so
+                          # the row is the registration evidence and the row's
+                          # runner id is what to ask GitHub about. A registered
+                          # row reads that one runner by id and checks the name
+                          # it comes back with, which no roster omission can
+                          # affect. No row, or a `reaping` row, is handled
+                          # below once the lease is parsed. Anything else about
+                          # the row is unread, and unread holds.
+                          registration = read_registration(instance_id)
+                          if (isinstance(registration, dict)
+                                  and registration['state'] == 'registered'):
+                              runner_info = exact_runner(registration['runner_id'],
+                                                         registration['runner_name'], pat) or {}
+                              verdict = lease_verdict(
+                                  {runner_name: runner_info} if runner_info else None,
+                                  runner_name, True)
+                          else:
+                              runner_info = {}
+                              verdict = HOLD
+                      else:
+                          # No protocol tag: launched before the handshake
+                          # existed. What the roster's answer lets the lease
+                          # phase do, and the one fact a later poll cannot
+                          # recover for itself: that some poll saw this runner
+                          # registered. Read from two places, because the stamp
+                          # is a write that can fail and a renewed lease is one
+                          # that already succeeded.
+                          registered_before = (get_tag(instance, SEEN_TAG) is not None
+                                               or lease_was_renewed(launch_time, lease_expires_str))
+                          verdict = lease_verdict(roster, runner_name, registered_before)
+
+                      # Parse the lease before the protocol branch below, which
+                      # acts only once the lease has expired.
+                      lease_expires = None
+                      if lease_expires_str:
+                          try:
+                              lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
+                          except Exception as e:
+                              print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
+                              lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
+
+                      # A ddb-v1 instance with no row has not registered, and a
+                      # box that booted and never joined cannot be holding a job
+                      # GitHub handed out. The lease is what reaps it, as it
+                      # always has: nothing else can see it, because it sits in
+                      # `running` where the stalled-launch phase (which walks
+                      # `pending`) does not look. What is new is the race with
+                      # a bootstrap that is about to register: cleanup first
+                      # creates the `reaping` row under the same condition
+                      # bootstrap needs, and terminates only once that row is
+                      # its. A `reaping` row from an earlier poll is a claim
+                      # already won and a terminate to retry.
+                      if protocol == REGISTRATION_PROTOCOL and (
+                              registration is None
+                              or (isinstance(registration, dict)
+                                  and registration['state'] == 'reaping')):
+                          if lease_expires is None or lease_expires > now:
+                              held.append(instance_id)
+                              print(f'{instance_id}: no registration row yet; holding '
+                                    f'until the lease at {lease_expires_str or "unset"}')
+                              continue
+                          if registration is None and not claim_reaping(instance_id, now):
+                              held.append(instance_id)
+                              print(f'{instance_id}: bootstrap won the registration row, or '
+                                    f'the table could not be read; holding')
+                              continue
+                          minutes_until_expiry = (lease_expires - now).total_seconds() / 60
+                          if terminate(instance_id, 'never registered, lease expired'):
+                              print(f'Terminating never-registered: {instance_id} '
+                                    f'(lease expired {-minutes_until_expiry:.1f}m ago, '
+                                    f'reaping row claimed)')
+                              terminated.append(instance_id)
+                              expired.append(instance_id)
+                          else:
+                              terminate_failed.append(instance_id)
+                          continue
 
                       # Age policy: drain at MAX_INSTANCE_AGE_HOURS, hard ceiling
                       # DRAIN_GRACE_MINUTES later. Both are documented at those
@@ -2059,7 +2395,8 @@ data "archive_file" "runner_cleanup" {
                           # Confirmed against a FRESH read first, because the snapshot
                           # this decision came from is tens of seconds old by now and
                           # this path reports nothing as a possible loss.
-                          if runner_info.get('id') and not still_idle(runner_info['id'], pat):
+                          if (runner_info.get('id')
+                                  and not still_idle(runner_info['id'], runner_name, pat)):
                               print(f'Draining: {instance_id} (age={age_hours:.2f}h > '
                                     f'{MAX_INSTANCE_AGE_HOURS}h, idle in the poll snapshot but '
                                     f'not on re-read; leaving it alone)')
@@ -2118,32 +2455,60 @@ data "archive_file" "runner_cleanup" {
                                 f'at the age ceiling if the answer never comes back.')
                           continue
 
-                      # Parse lease expiry
-                      if lease_expires_str:
-                          try:
-                              lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
-                          except Exception as e:
-                              print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
-                              lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                      else:
-                          # No lease tag - set one (legacy instance)
+                      if lease_expires is None:
+                          # No lease tag - set one (legacy instance). A runner
+                          # GitHub reports busy gets a real renewal, with the
+                          # seen stamp; anything else gets the initial lease
+                          # alone, which records nothing about registration.
                           print(f'{instance_id}: no lease tag, setting initial lease')
-                          lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                          renew_lease(instance_id, now)
+                          if verdict == RENEW:
+                              new_expiry = renew_lease(instance_id, now, seen=True)
+                              if new_expiry is not None:
+                                  print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                                  renewed.append(instance_id)
+                              else:
+                                  held.append(instance_id)
+                                  print(f'{instance_id}: renewal failed; lease remains unset')
+                          elif renew_lease(instance_id, now) is None:
+                              held.append(instance_id)
                           continue
 
                       minutes_until_expiry = (lease_expires - now).total_seconds() / 60
 
                       if verdict == RENEW:
                           # Runner is working - RENEW the lease, and carry the seen
-                          # stamp in the same write.
+                          # stamp in the same write. Reported as renewed only when
+                          # EC2 accepted the write: a rejected CreateTags leaves
+                          # the lease where it was, and the poll must say so.
                           new_expiry = renew_lease(instance_id, now, seen=True)
-                          print(f'{instance_id}: busy, renewed lease until {new_expiry}')
-                          renewed.append(instance_id)
+                          if new_expiry is not None:
+                              print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                              renewed.append(instance_id)
+                          else:
+                              held.append(instance_id)
+                              print(f'{instance_id}: renewal failed; lease remains '
+                                    f'{lease_expires_str}')
                           continue
 
                       # Runner is idle - check if lease expired
                       if lease_expires <= now:
+                          # The record this verdict came from was read at the top
+                          # of the poll, and GitHub hands out jobs the whole time.
+                          # Before the lease ends the instance, re-read that one
+                          # runner by id and require the same verdict of the
+                          # fresh answer. An instance the roster never listed has
+                          # no id to re-read; the two roster passes are its
+                          # evidence.
+                          if runner_info.get('id'):
+                              fresh = exact_runner(runner_info['id'], runner_name, pat)
+                              fresh_verdict = lease_verdict(
+                                  {runner_name: fresh} if fresh else None, runner_name, True)
+                              if fresh_verdict != EXPIRE:
+                                  held.append(instance_id)
+                                  print(f'{instance_id}: lease expired, but the runner did '
+                                        f'not read as idle on a fresh read; holding')
+                                  continue
+                              runner_info = fresh
                           if terminate(instance_id, 'lease expired'):
                               if runner_info.get('id'):
                                   deregister_runner(runner_info['id'], pat)
@@ -2354,8 +2719,12 @@ resource "aws_lambda_function" "runner_cleanup" {
 
   environment {
     variables = {
-      WEBHOOK_FUNCTION = var.enable_github_runner ? aws_lambda_function.runner_webhook[0].function_name : ""
-      MAX_RUNNERS      = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
+      # The webhook function's name as a literal: the webhook now depends on
+      # this function (see its depends_on), so this one cannot reference it.
+      WEBHOOK_FUNCTION   = "github-runner-webhook"
+      MAX_RUNNERS        = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
+      REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
+      RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
     }
   }
 
