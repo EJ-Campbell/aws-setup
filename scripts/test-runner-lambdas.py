@@ -1487,6 +1487,30 @@ def case_the_roster_answer_is_recorded_on_the_instance():
     assert second["held"] == ["i-lease"], second
 
 
+def case_a_held_lease_does_not_shield_the_instance_beside_it():
+    """The verdict is per instance, and one poll can hold one and reap another.
+
+    This is the mixed answer the RunnerSeenAt tag exists for: a roster that
+    lists neither box, one of which was registered a moment ago and one of
+    which never registered at all. Holding both would leave a husk running to
+    the 13h30m ceiling; reaping both is ejc3/aws#45.
+    """
+    expired = (NOW - timedelta(minutes=45)).isoformat()
+    ec2 = FakeEC2([
+        instance("i-live", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": expired,
+                       "RunnerSeenAt": (NOW - timedelta(minutes=6)).isoformat()}),
+        instance("i-husk", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": expired}),
+    ])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-other")]))["handler"]({}, None)
+    assert still_running(ec2) == ["i-live"], still_running(ec2)
+    assert terminated_ids(ec2) == ["i-husk"], terminated_ids(ec2)
+    assert result["held"] == ["i-live"], result
+    assert result["expired"] == ["i-husk"], result
+
+
 def case_a_held_runner_is_still_terminated_at_the_ceiling():
     """Holding a lease must not become a way to outlive the ceiling.
 
