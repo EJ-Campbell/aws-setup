@@ -201,7 +201,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
-| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. |
+| GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
 | Mac dev | `us-west-2`, optional Dedicated Host | Disposable 200 GB gp3 root | Temporary macOS build host. Disabled by default; teardown terminates the instance and releases the host after its 24-hour minimum. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
@@ -646,6 +646,15 @@ terminates any runner whose current job has been running for more than three hou
 job that long is wedged, and "busy" alone would renew its lease forever — and counts
 GitHub's queued jobs — across in-progress runs too, and ignoring runs with no jobs — to
 launch what the queue actually needs.
+
+A runner instance lives at most **13 hours 30 minutes**, checked on the five-minute poll,
+so the observed maximum is that plus one interval. Past 12 hours it drains:
+GitHub-idle means terminate now, and a job already in flight is left to finish. 13h30m is
+the hard ceiling, computed from the instance's launch time alone and applied whatever the
+runner is doing and whatever GitHub says, so a wedged host cannot outlive it. A ceiling
+termination that never saw the runner idle logs `HARD-CEILING KILL`; that job will appear
+on GitHub as "the self-hosted runner lost communication with the server", which is
+otherwise indistinguishable from an AWS Spot reclaim.
 
 Terraform owns both halves of that webhook: it generates the HMAC secret, sets it on the
 `ejc3/fcvm` hook through the `integrations/github` provider, and passes the same value to

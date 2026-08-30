@@ -1023,23 +1023,64 @@ data "archive_file" "runner_cleanup" {
       # Lease duration - busy runners get extended, idle runners expire
       LEASE_DURATION_MINUTES = 60
 
-      # Absolute ceiling on a runner instance's life, regardless of busy state.
-      # Renewal is only safe while 'busy' means "making progress". A wedged host
-      # (leaked VMs, load average in the hundreds, unkillable D-state processes)
-      # keeps its assigned job forever, so GitHub keeps reporting busy=true and the
-      # renewal loop below never lets the lease expire - the broken instance becomes
-      # immortal and permanently occupies one of MAX_RUNNERS slots per architecture.
+      # A runner instance's life is bounded in two steps: a SOFT CAP where it stops
+      # being useful and starts draining, and a HARD CEILING it can never outlive.
+      #
+      # Why a bound exists at all: renewal is only safe while 'busy' means "making
+      # progress". A wedged host (leaked VMs, load average in the hundreds,
+      # unkillable D-state processes) keeps its assigned job forever, so GitHub keeps
+      # reporting busy=true and the renewal loop below never lets the lease expire -
+      # the broken instance becomes immortal and permanently occupies one of
+      # MAX_RUNNERS slots per architecture (ejc3/fcvm#871).
       #
       # 12h is a deliberate LOCAL policy, not a platform limit. GitHub allows a
       # self-hosted job to run for up to 5 days (the 6h cap is for GitHub-hosted
       # runners only), and these runners are not ephemeral, so one instance can
-      # legitimately chain many short jobs past 12h of age. The policy trade, made
-      # explicitly: every ejc3/fcvm CI job finishes in well under 2 hours, so a
-      # 12h-old runner is overwhelmingly likely wedged. Worst case the cap kills one
-      # healthy in-flight job, which a re-run fixes; a wedged slot silently starves
-      # the whole pool indefinitely, which no re-run fixes. If a legitimately long
-      # job is ever added to fcvm CI, raise this.
+      # legitimately chain many short jobs past 12h of age. Every ejc3/fcvm CI job
+      # finishes in well under 2 hours, so a runner this old has outlived its
+      # usefulness and is quite likely wedged.
+      #
+      # Past this age the instance DRAINS rather than dying: it is terminated on the
+      # first poll that observes it idle, and a job already in flight is left to
+      # finish. See DRAIN_GRACE_MINUTES for the bound that keeps that from being
+      # open-ended.
       MAX_INSTANCE_AGE_HOURS = 12
+
+      # Grace added on top of the soft cap. MAX_INSTANCE_AGE_HOURS + this is the HARD
+      # CEILING - 13h30m, the absolute maximum lifetime of a runner instance - and it
+      # is enforced regardless of busy state, regardless of whether GitHub answered,
+      # regardless of anything else. It is evaluated on the 5-minute poll, so the
+      # observed maximum is 13h30m plus at most one poll interval.
+      #
+      # Why the cap alone was wrong: it terminated the instance whatever it was
+      # doing. On 2026-08-28/29 it killed i-09fff3a7d97fd4066 at 12.07h and
+      # i-02fefa9deeb59e9c8 at 12.02h with jobs in flight. EC2 recorded "User
+      # initiated" and the spot request said instance-terminated-by-user, but on
+      # GitHub both jobs read as "The self-hosted runner lost communication with the
+      # server" - indistinguishable from a spot reclaim. That cost six reruns in one
+      # night, and a rerun can land on another near-cap runner and die the same way
+      # (ejc3/fcvm#884; the symptom was first recorded in ejc3/fcvm#834).
+      #
+      # Why 90 minutes: it covers the job that is in flight AT the moment a runner
+      # crosses the soft cap, plus the poll that notices it finished. The longest
+      # legitimate self-hosted job measured on this fleet is 43.5 minutes
+      # (Host-Root-arm64-SnapshotEnabled) and a full matrix is about 35, so 90 is a
+      # little over 2x that with the poll interval included. It also keeps the
+      # absolute lifetime at 13h30m, well inside the property ejc3/fcvm#871 needs:
+      # a wedged host dies on a schedule nothing broken can extend.
+      #
+      # Be clear about what it does NOT cover. A draining runner stays registered
+      # and schedulable (the DRAIN branch says why it is not deregistered), so
+      # GitHub can hand it a fresh job in the up-to-5-minute gap between its last
+      # job ending and the poll that notices. A job starting late in the window can
+      # still be cut short at the ceiling, and no value of this constant prevents
+      # that - only an on-box graceful shutdown would, which this Lambda has no
+      # channel to request. The drain removes the guaranteed kill of every job in
+      # flight at 12h; it does not make the ceiling harmless.
+      #
+      # If fcvm ever gains a legitimately long job, raise the SOFT CAP, not this.
+      # This number is sized to one job, not to a working day.
+      DRAIN_GRACE_MINUTES = 90
 
       # A runner whose current job has been executing this long is stuck by
       # definition. Across five recent green CI runs the longest legitimate
@@ -1068,13 +1109,22 @@ data "archive_file" "runner_cleanup" {
               return json.loads(resp.read())
 
       def parse_ts(value):
-          """Parse a GitHub ISO-8601 timestamp; None when absent or malformed"""
+          """Parse a GitHub ISO-8601 timestamp as UTC-aware; None if unusable.
+
+          The result is compared against an aware `now`, and mixing the two raises
+          TypeError - out of get_stuck_runners, out of the handler, and out of the
+          whole poll, so NOTHING gets reaped that invocation, the hard age ceiling
+          included. A timestamp carrying no offset is therefore stamped UTC rather
+          than returned naive: GitHub documents these fields as UTC, and a value
+          that cannot be made comparable is worth less than the poll it would kill.
+          """
           if not value:
               return None
           try:
-              return datetime.fromisoformat(value.replace('Z', '+00:00'))
+              parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
           except Exception:
               return None
+          return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
       def get_stuck_runners(pat, now):
           """Runners whose in-progress job started over MAX_JOB_RUNTIME_MINUTES ago.
@@ -1168,10 +1218,48 @@ data "archive_file" "runner_cleanup" {
                   # status is preserved as-absent when GitHub omits it (fail CLOSED:
                   # a missing status must never count as online, or a wedged busy
                   # runner with a flaky API response is renewed forever again).
-                  return {r['name']: {'id': r['id'], 'busy': r['busy'], 'status': r.get('status')} for r in data.get('runners', [])}
+                  #
+                  # A record without a usable name or id is dropped here rather than
+                  # carried into the phases below.
+                  #
+                  # Name: the orphan phase calls .startswith() on every key, so one
+                  # entry whose name is not a string raises out of the entire poll
+                  # and nothing is reaped that invocation. A runner we cannot name
+                  # is one we cannot match to an instance anyway.
+                  #
+                  # Id: every action taken on a runner needs it. Without one the
+                  # orphan phase would format None into a DELETE URL, and the idle
+                  # path would terminate on a snapshot it cannot re-confirm, because
+                  # the fresh re-read is keyed on the id. Dropping the record makes
+                  # the instance simply unknown, which drains and dies at the
+                  # ceiling: the safe verdict for evidence that cannot be acted on.
+                  return {r['name']: {'id': r['id'], 'busy': r.get('busy'), 'status': r.get('status')}
+                          for r in data.get('runners', [])
+                          if isinstance(r.get('name'), str) and r.get('id') is not None}
           except Exception as e:
               print(f'Failed to get runners: {e}')
           return {}
+
+      def still_idle(runner_id, pat):
+          """Re-read ONE runner and confirm GitHub still says it holds no job.
+
+          The busy flags this poll acts on were read at the top of the handler,
+          before the orphan scan's per-runner EC2 lookups and the stuck-job scan,
+          which between them can spend tens of seconds. GitHub hands out jobs
+          throughout, so terminating on that snapshot destroys whatever the runner
+          picked up in the gap - and does it on the quiet path, where nothing is
+          recorded as a possible loss.
+
+          Fails safe in both directions: unanswerable means "not confirmed idle",
+          so the caller drains instead of terminating, and the hard ceiling still
+          bounds how long that can last.
+          """
+          try:
+              record = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}')
+          except Exception as e:
+              print(f'Cannot re-read runner {runner_id} before terminating it: {type(e).__name__}: {e}')
+              return False
+          return record.get('busy') is False
 
       def deregister_runner(runner_id, pat):
           """Remove runner from GitHub by ID"""
@@ -1188,15 +1276,33 @@ data "archive_file" "runner_cleanup" {
           return False
 
       def get_instance_state(instance_id):
-          """Check if instance exists and is running"""
+          """The instance's state, 'gone' when EC2 says there is no such instance,
+          or None when EC2 could not be asked.
+
+          None has to be distinct from 'gone'. The orphan phase deregisters a runner whose
+          instance has disappeared, and GitHub documents that DELETE as forcing the
+          removal - so reading one transient DescribeInstances failure as "gone"
+          forces out a HEALTHY runner in the middle of a job. That is work
+          destroyed on absent evidence, the same defect as ejc3/fcvm#884 wearing a
+          different phase.
+
+          "Gone" genuinely arrives as an exception: a terminated instance drops out
+          of DescribeInstances about an hour later and the call then raises
+          InvalidInstanceID.NotFound. The error code is what separates the two, so
+          orphans are still cleaned up.
+          """
           try:
               resp = ec2.describe_instances(InstanceIds=[instance_id])
-              for res in resp['Reservations']:
-                  for inst in res['Instances']:
-                      return inst['State']['Name']
-          except Exception:
-              pass
-          return None
+          except Exception as e:
+              code = getattr(e, 'response', {}).get('Error', {}).get('Code')
+              if code in ('InvalidInstanceID.NotFound', 'InvalidInstanceID.Malformed'):
+                  return 'gone'
+              print(f'Cannot read the state of {instance_id}: {type(e).__name__}: {e}')
+              return None
+          for res in resp['Reservations']:
+              for inst in res['Instances']:
+                  return inst['State']['Name']
+          return 'gone'
 
       def get_tag(instance, key):
           """Get tag value from instance"""
@@ -1244,6 +1350,24 @@ data "archive_file" "runner_cleanup" {
               print(f'Failed to terminate stalled launch {instance_id}: {e}')
           return False
 
+      def terminate(instance_id, reason):
+          """Terminate one instance; True only if EC2 accepted the call.
+
+          The per-instance guard in the sweep must not absorb this. A rejected
+          terminate (an IAM change, DisableApiTermination, a transient 5xx) leaves
+          the instance RUNNING, and an invocation that swallowed it would report
+          success while the fleet's only lifetime bound quietly did nothing - and,
+          worse, would log the cause as an unreadable EC2 record. The next poll
+          retries; the age it is judged on only grows.
+          """
+          try:
+              ec2.terminate_instances(InstanceIds=[instance_id])
+              return True
+          except Exception as e:
+              print(f'TERMINATE FAILED: {instance_id} ({reason}) is STILL RUNNING: '
+                    f'{type(e).__name__}: {e}. Retried on the next poll.')
+          return False
+
       def renew_lease(instance_id, now):
           """Extend the lease by LEASE_DURATION_MINUTES"""
           new_expiry = (now + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
@@ -1256,6 +1380,51 @@ data "archive_file" "runner_cleanup" {
           except Exception as e:
               print(f'Failed to renew lease on {instance_id}: {e}')
           return None
+
+      # The four things the age phase can decide. Named constants rather than bare
+      # strings so a typo is a NameError at import, not a termination that silently
+      # stops happening.
+      KEEP = 'keep'
+      DRAIN = 'drain'
+      TERMINATE_IDLE = 'terminate_idle'
+      TERMINATE_CEILING = 'terminate_ceiling'
+
+      def observed_idle(runner_info):
+          """True only when GitHub answered AND says this runner holds no job.
+
+          Anything else - no record for the instance, no 'busy' key, an exception
+          get_runners() swallowed into an empty dict - is absence of evidence, and
+          absence of evidence must never be read as idle. Reading it that way is
+          how a healthy in-flight job gets destroyed on a GitHub blip.
+          """
+          return bool(runner_info) and runner_info.get('busy') is False
+
+      def age_policy(now, launch_time, runner_info):
+          """What the age phase does with one running runner instance. Pure.
+
+          (clock, launch time, GitHub's record for this runner) in, one action out.
+          No AWS or GitHub calls, so scripts/test-runner-lambdas.py pins every
+          branch, including the ones that only occur during a GitHub outage.
+
+          TERMINATE_CEILING is derived from launch_time ALONE. No busy flag, no
+          missing runner record and no failed API call can defer it, because the
+          property ejc3/fcvm#871 needs is that a wedged host dies on a schedule
+          nothing broken can extend. TERMINATE_IDLE requires positive evidence of idleness.
+          Everything else past the soft cap drains.
+
+          This reads `busy` WITHOUT the status == 'online' qualifier the lease phase
+          uses. There, treating an offline-but-busy runner as idle is what stops a
+          wedged host renewing its lease forever. Here the same reading would kill
+          the job of a runner whose connection blipped for one poll, and it buys
+          nothing: the ceiling bounds the wedge, and the stuck-job phase reaps a
+          job running past MAX_JOB_RUNTIME_MINUTES at any age.
+          """
+          age = now - launch_time
+          if age >= timedelta(hours=MAX_INSTANCE_AGE_HOURS, minutes=DRAIN_GRACE_MINUTES):
+              return TERMINATE_CEILING
+          if age <= timedelta(hours=MAX_INSTANCE_AGE_HOURS):
+              return KEEP
+          return TERMINATE_IDLE if observed_idle(runner_info) else DRAIN
 
       # The queue scan is bounded by what the pool could serve, not by a fixed sample
       # of runs. Sampling the newest few runs with status=queued hides real work two
@@ -1360,30 +1529,19 @@ data "archive_file" "runner_cleanup" {
           print(f'Found {len(runners)} runners from GitHub')
           now = datetime.now(timezone.utc)
 
-          # Runners holding a job that has run past MAX_JOB_RUNTIME_MINUTES. Read
-          # once here, acted on in Phase 2b below.
-          stuck_runners = get_stuck_runners(pat, now) if pat else {}
-          if stuck_runners:
-              print(f'Stuck jobs detected on: {sorted(stuck_runners)}')
-
-          # Phase 1: Clean up orphaned GitHub runners (instances gone)
-          orphans_cleaned = []
-          for runner_name, runner_info in runners.items():
-              if not runner_name.startswith('runner-i-'):
-                  print(f'Skipping {runner_name} (not runner-i- pattern)')
-                  continue
-              instance_id = runner_name.replace('runner-', '')
-              state = get_instance_state(instance_id)
-              print(f'Runner {runner_name}: instance state={state}')
-              if state is None or state in ('terminated', 'shutting-down'):
-                  print(f'Cleaning orphan: {runner_name} (state={state})')
-                  if deregister_runner(runner_info['id'], pat):
-                      orphans_cleaned.append(runner_name)
-
-          # Phase 2: Lease-based runner management
+          # Phase 1: the lifetime bound - the lease sweep and the age policy.
+          #
+          # FIRST on purpose. Every other phase here is optional work that can
+          # spend the 240-second budget: per-runner EC2 describes, GitHub DELETEs
+          # at a 10-second timeout, a stuck-job scan of up to eleven 5-second
+          # calls. A Lambda timeout is not catchable, so running any of that ahead
+          # of the sweep means a slow poll never reaches the age check at all and
+          # the hard ceiling silently does not happen.
+          #
           # - Busy runners: renew lease (extend expiry)
           # - Idle runners: don't renew (let lease expire)
           # - Expired lease: terminate
+          # - Past MAX_INSTANCE_AGE_HOURS: drain, then the hard ceiling
           response = ec2.describe_instances(
               Filters=[
                   {'Name': 'tag:Role', 'Values': ['github-runner']},
@@ -1395,96 +1553,256 @@ data "archive_file" "runner_cleanup" {
           renewed = []
           expired = []
           over_age = []
+          # Instances past the soft cap that were left alive to finish work, and
+          # instances the hard ceiling killed without ever seeing them idle. The
+          # second list is the count that matters: it is work we may have destroyed.
+          draining = []
+          hard_killed = []
+          # Instances EC2 refused to terminate. They are STILL RUNNING, so they must
+          # never appear in `terminated`, and the poll must not read as a clean sweep.
+          terminate_failed = []
 
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
-                  instance_id = instance['InstanceId']
-                  launch_time = instance['LaunchTime']
-                  runner_name = f'runner-{instance_id}'
-                  lease_expires_str = get_tag(instance, 'LeaseExpires')
+                  # One unreadable record must cost that instance, not the sweep.
+                  # This loop is the only thing enforcing the fleet's absolute
+                  # lifetime bound, and an exception raised part-way through it
+                  # skips every instance AFTER the failing one - so a single
+                  # malformed field could let an over-ceiling runner live forever,
+                  # invisibly (nothing in this account alarms on Lambda errors).
+                  # An instance whose age cannot be computed has no safe verdict,
+                  # so it is named and skipped; the next poll retries it.
+                  try:
+                      instance_id = instance['InstanceId']
+                      launch_time = instance['LaunchTime']
+                      runner_name = f'runner-{instance_id}'
+                      lease_expires_str = get_tag(instance, 'LeaseExpires')
 
-                  # Skip if launched less than 10 minutes ago (initial setup time)
-                  if now - launch_time < timedelta(minutes=10):
-                      print(f'{instance_id}: launched {(now - launch_time).seconds // 60}m ago, skipping (setup)')
-                      continue
+                      # Skip if launched less than 10 minutes ago (initial setup time)
+                      if now - launch_time < timedelta(minutes=10):
+                          print(f'{instance_id}: launched {(now - launch_time).seconds // 60}m ago, skipping (setup)')
+                          continue
 
-                  # Get runner status from GitHub
-                  runner_info = runners.get(runner_name, {})
-                  # Only treat a runner as busy while GitHub explicitly reports it
-                  # online. A host that wedged mid-job reports busy=true but goes
-                  # offline, and renewing on that keeps a dead slot alive. A MISSING
-                  # status also fails closed to not-busy: the runner then takes the
-                  # idle path, which is harmless on a blip (the existing lease gives
-                  # up to LEASE_DURATION_MINUTES of grace before anything is reaped)
-                  # but can never renew a lease forever on absent evidence.
-                  is_busy = runner_info.get('busy', False) and runner_info.get('status') == 'online'
+                      # Get runner status from GitHub
+                      runner_info = runners.get(runner_name, {})
+                      # Only treat a runner as busy while GitHub explicitly reports it
+                      # online. A host that wedged mid-job reports busy=true but goes
+                      # offline, and renewing on that keeps a dead slot alive. A MISSING
+                      # status also fails closed to not-busy: the runner then takes the
+                      # idle path, which is harmless on a blip (the existing lease gives
+                      # up to LEASE_DURATION_MINUTES of grace before anything is reaped)
+                      # but can never renew a lease forever on absent evidence.
+                      is_busy = runner_info.get('busy', False) and runner_info.get('status') == 'online'
 
-                  # Hard age cap: reap regardless of busy state (see MAX_INSTANCE_AGE_HOURS)
-                  age_hours = (now - launch_time).total_seconds() / 3600
-                  if age_hours > MAX_INSTANCE_AGE_HOURS:
-                      print(f'Terminating over-age: {instance_id} (age={age_hours:.1f}h > {MAX_INSTANCE_AGE_HOURS}h, busy={runner_info.get("busy", False)})')
-                      if runner_info.get('id'):
-                          deregister_runner(runner_info['id'], pat)
-                      ec2.terminate_instances(InstanceIds=[instance_id])
-                      terminated.append(instance_id)
-                      over_age.append(instance_id)
-                      continue
+                      # Age policy: drain at MAX_INSTANCE_AGE_HOURS, hard ceiling
+                      # DRAIN_GRACE_MINUTES later. Both are documented at those
+                      # constants; age_policy() is the whole decision.
+                      age_hours = (now - launch_time).total_seconds() / 3600
+                      ceiling_hours = MAX_INSTANCE_AGE_HOURS + DRAIN_GRACE_MINUTES / 60
+                      action = age_policy(now, launch_time, runner_info)
 
-                  # Parse lease expiry
-                  if lease_expires_str:
-                      try:
-                          lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
-                      except Exception as e:
-                          print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
+                      if action == TERMINATE_CEILING:
+                          # Terminate BEFORE deregistering, and log only what actually
+                          # happened. Deregistering first and then failing to terminate
+                          # is the worst of both outcomes: GitHub documents that DELETE
+                          # as forcing the runner out, which is how a job in flight
+                          # dies, and the instance is still running afterwards. The
+                          # next poll would then find no GitHub record for it, read it
+                          # as unknown, drain it to the ceiling and finally report it
+                          # as work we may have destroyed - all on our own doing.
+                          if not terminate(instance_id, 'hard ceiling'):
+                              terminate_failed.append(instance_id)
+                              continue
+                          if runner_info.get('id'):
+                              deregister_runner(runner_info['id'], pat)
+                          terminated.append(instance_id)
+                          over_age.append(instance_id)
+                          if observed_idle(runner_info):
+                              print(f'Terminating over-age: {instance_id} (age={age_hours:.2f}h '
+                                    f'>= ceiling {ceiling_hours:.2f}h, GitHub reports it idle)')
+                          else:
+                              # LOUD on purpose. A running job just died here, and this
+                              # line is the only record that the loss was OURS. On GitHub
+                              # it renders exactly like an AWS spot reclaim, which cost a
+                              # night of misattributed reruns (ejc3/fcvm#884). Printed
+                              # after the terminate is accepted, so it never claims a job
+                              # is dead on a poll where the instance survived.
+                              hard_killed.append(instance_id)
+                              print(f'HARD-CEILING KILL: {instance_id} terminated at '
+                                    f'age={age_hours:.2f}h (ceiling {ceiling_hours:.2f}h = '
+                                    f'{MAX_INSTANCE_AGE_HOURS}h + {DRAIN_GRACE_MINUTES}m) without '
+                                    f'ever being observed idle (github '
+                                    f'busy={runner_info.get("busy")} '
+                                    f'status={runner_info.get("status")}). Any job it was running '
+                                    f'is now dead, and GitHub will report "The self-hosted runner '
+                                    f'lost communication with the server" for it - that is THIS '
+                                    f'termination, not an AWS spot reclaim.')
+                          continue
+
+                      if action == TERMINATE_IDLE:
+                          # Past the soft cap and holding nothing: go now, before GitHub
+                          # can hand it another job. This is what stops a drained runner
+                          # taking further work, so it fires on the first poll that
+                          # observes idleness rather than waiting for lease expiry.
+                          #
+                          # Confirmed against a FRESH read first, because the snapshot
+                          # this decision came from is tens of seconds old by now and
+                          # this path reports nothing as a possible loss.
+                          if runner_info.get('id') and not still_idle(runner_info['id'], pat):
+                              print(f'Draining: {instance_id} (age={age_hours:.2f}h > '
+                                    f'{MAX_INSTANCE_AGE_HOURS}h, idle in the poll snapshot but '
+                                    f'not on re-read; leaving it alone)')
+                              draining.append(instance_id)
+                              continue
+                          if not terminate(instance_id, 'drained, past the soft cap'):
+                              # Left registered on purpose: it is alive and idle, so it
+                              # should keep taking work rather than be forced out of
+                              # GitHub and left running with nothing to do.
+                              terminate_failed.append(instance_id)
+                              continue
+                          if runner_info.get('id'):
+                              deregister_runner(runner_info['id'], pat)
+                          print(f'Terminating drained: {instance_id} (age={age_hours:.2f}h > '
+                                f'{MAX_INSTANCE_AGE_HOURS}h, GitHub reports it idle)')
+                          terminated.append(instance_id)
+                          over_age.append(instance_id)
+                          continue
+
+                      if action == DRAIN:
+                          # Left running on purpose: GitHub says it holds a job, or could
+                          # not be asked. Deliberately NOT deregistered. GitHub documents
+                          # that DELETE as "forces the removal of a self-hosted runner"
+                          # and does not define what becomes of a job the runner is
+                          # part-way through; a forced removal that ends the job is the
+                          # exact failure being fixed here, so the shared fleet is not
+                          # where we find out. It dies at the ceiling whatever happens.
+                          ceiling_at = launch_time + timedelta(hours=MAX_INSTANCE_AGE_HOURS,
+                                                               minutes=DRAIN_GRACE_MINUTES)
+                          print(f'Draining: {instance_id} (age={age_hours:.2f}h > '
+                                f'{MAX_INSTANCE_AGE_HOURS}h, github '
+                                f'busy={runner_info.get("busy")} '
+                                f'status={runner_info.get("status")}; hard ceiling in '
+                                f'{(ceiling_at - now).total_seconds() / 60:.0f}m)')
+                          draining.append(instance_id)
+                          continue
+
+                      # Parse lease expiry
+                      if lease_expires_str:
+                          try:
+                              lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
+                          except Exception as e:
+                              print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
+                              lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
+                      else:
+                          # No lease tag - set one (legacy instance)
+                          print(f'{instance_id}: no lease tag, setting initial lease')
                           lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                  else:
-                      # No lease tag - set one (legacy instance)
-                      print(f'{instance_id}: no lease tag, setting initial lease')
-                      lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                      renew_lease(instance_id, now)
-                      continue
+                          renew_lease(instance_id, now)
+                          continue
 
-                  minutes_until_expiry = (lease_expires - now).total_seconds() / 60
+                      minutes_until_expiry = (lease_expires - now).total_seconds() / 60
 
-                  if is_busy:
-                      # Runner is working - RENEW the lease
-                      new_expiry = renew_lease(instance_id, now)
-                      print(f'{instance_id}: busy, renewed lease until {new_expiry}')
-                      renewed.append(instance_id)
-                      continue
+                      if is_busy:
+                          # Runner is working - RENEW the lease
+                          new_expiry = renew_lease(instance_id, now)
+                          print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                          renewed.append(instance_id)
+                          continue
 
-                  # Runner is idle - check if lease expired
-                  if lease_expires <= now:
-                      print(f'Terminating expired: {instance_id} (lease expired {-minutes_until_expiry:.1f}m ago)')
-                      if runner_info.get('id'):
-                          deregister_runner(runner_info['id'], pat)
-                      ec2.terminate_instances(InstanceIds=[instance_id])
-                      terminated.append(instance_id)
-                      expired.append(instance_id)
-                  else:
-                      print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
+                      # Runner is idle - check if lease expired
+                      if lease_expires <= now:
+                          if terminate(instance_id, 'lease expired'):
+                              if runner_info.get('id'):
+                                  deregister_runner(runner_info['id'], pat)
+                              print(f'Terminating expired: {instance_id} '
+                                    f'(lease expired {-minutes_until_expiry:.1f}m ago)')
+                              terminated.append(instance_id)
+                              expired.append(instance_id)
+                          else:
+                              terminate_failed.append(instance_id)
+                      else:
+                          print(f'{instance_id}: idle, lease expires in {minutes_until_expiry:.1f}m (not renewing)')
+                  except Exception as e:
+                      broken = instance.get('InstanceId') if isinstance(instance, dict) else None
+                      print(f'UNREADABLE INSTANCE RECORD ({broken or "no InstanceId"}): '
+                            f'{type(e).__name__}: {e}. Its age cannot be computed, so there is '
+                            f'no safe verdict and it is skipped - this instance is NOT covered '
+                            f'by the lifetime bound until its record reads cleanly. Every other '
+                            f'instance is still swept.')
 
-          # Phase 2b: Reap runners whose current job has exceeded the ceiling.
-          # Phase 2 cannot see this case: GitHub reports the runner online and busy
+          # Phase 2: runners whose current job has run past MAX_JOB_RUNTIME_MINUTES.
+          #
+          # Wrapped because this is the only GitHub-derived phase that runs BEFORE
+          # the reaping phases, and it parses arbitrary API payloads. An exception
+          # escaping it takes the whole invocation down before a single instance is
+          # examined, which would let the hard age ceiling be deferred indefinitely
+          # by one malformed field. Reaping must not depend on this scan succeeding;
+          # losing it costs only the stuck-job check, which the next poll retries.
+          stuck_runners = {}
+          if pat:
+              try:
+                  stuck_runners = get_stuck_runners(pat, now)
+              except Exception as e:
+                  print(f'Stuck-job scan failed, continuing without it: {type(e).__name__}: {e}')
+          if stuck_runners:
+              print(f'Stuck jobs detected on: {sorted(stuck_runners)}')
+
+          # Reap them. The sweep above cannot see this case: GitHub reports the
+          # runner online and busy
           # the whole time, so the lease is renewed on every poll forever. The job's
           # own age is per-job, so back-to-back healthy jobs never accumulate
           # toward it and a healthy busy runner is never reaped.
           stuck_terminated = []
-          running_ids = {i['InstanceId'] for r in response['Reservations'] for i in r['Instances']}
+          # .get, because the sweep above deliberately tolerates a record it cannot
+          # read; rebuilding this set with [] would re-raise on the same record and
+          # take every phase after it with it, on every poll.
+          running_ids = {i.get('InstanceId') for r in response['Reservations'] for i in r['Instances']}
           for runner_name, (job_name, minutes) in sorted(stuck_runners.items()):
               instance_id = runner_name.replace('runner-', '')
               if instance_id not in running_ids or instance_id in terminated:
                   continue
-              print(f'Terminating stuck: {instance_id} (job {job_name!r} in_progress '
-                    f'{minutes:.0f}m > {MAX_JOB_RUNTIME_MINUTES}m)')
+              # Through terminate(), like every site in the sweep. A raw call here
+              # raised straight out of the handler on a rejected TerminateInstances
+              # and took every later phase with it, the queued-job launcher
+              # included - and since the sweep moved ahead of the orphan cleanup,
+              # that cleanup no longer runs before this point either.
+              if not terminate(instance_id, 'job past MAX_JOB_RUNTIME_MINUTES'):
+                  terminate_failed.append(instance_id)
+                  continue
               runner_info = runners.get(runner_name, {})
               if runner_info.get('id'):
                   deregister_runner(runner_info['id'], pat)
-              ec2.terminate_instances(InstanceIds=[instance_id])
+              print(f'Terminating stuck: {instance_id} (job {job_name!r} in_progress '
+                    f'{minutes:.0f}m > {MAX_JOB_RUNTIME_MINUTES}m)')
               terminated.append(instance_id)
               stuck_terminated.append(instance_id)
 
-          # Phase 3: Clean up stale AMI builder instances (> 2 hours old)
+          # Phase 3: Clean up orphaned GitHub runners (instances gone)
+          orphans_cleaned = []
+          for runner_name, runner_info in runners.items():
+              if not runner_name.startswith('runner-i-'):
+                  print(f'Skipping {runner_name} (not runner-i- pattern)')
+                  continue
+              instance_id = runner_name.replace('runner-', '')
+              if instance_id in running_ids:
+                  # The sweep listed this instance as running moments ago, so it is
+                  # demonstrably alive whatever a per-id lookup says now.
+                  # DescribeInstances is eventually consistent and AWS documents
+                  # InvalidInstanceID.NotFound as transient after RunInstances, so
+                  # that error alone is not proof of absence - and acting on it
+                  # forces a live runner out of GitHub, killing whatever it is
+                  # running.
+                  continue
+              state = get_instance_state(instance_id)
+              print(f'Runner {runner_name}: instance state={state}')
+              # None means EC2 could not be asked. Leave the registration alone:
+              # a runner mid-job would be forced out on nothing but an API blip.
+              if state in ('gone', 'terminated', 'shutting-down'):
+                  print(f'Cleaning orphan: {runner_name} (state={state})')
+                  if deregister_runner(runner_info['id'], pat):
+                      orphans_cleaned.append(runner_name)
+
+          # Phase 4: Clean up stale AMI builder instances (> 2 hours old)
           ami_builder_terminated = []
           ami_response = ec2.describe_instances(
               Filters=[
@@ -1498,11 +1816,14 @@ data "archive_file" "runner_cleanup" {
                   launch_time = instance['LaunchTime']
                   age_hours = (now - launch_time).total_seconds() / 3600
                   if age_hours > 2:
-                      print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
-                      ec2.terminate_instances(InstanceIds=[instance_id])
-                      ami_builder_terminated.append(instance_id)
+                      # Through terminate() for the same reason as the sweep: a raw
+                      # call here loses the stalled-launch reap and the launcher to
+                      # one rejected TerminateInstances.
+                      if terminate(instance_id, 'stale AMI builder'):
+                          print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
+                          ami_builder_terminated.append(instance_id)
 
-          # Phase 3b: Reap launches that never came up
+          # Phase 5: Reap launches that never came up
           # A spot metal launch AWS cannot place sits in `pending`, where the lease
           # phase above cannot see it - that phase only walks `running` instances.
           # Left alone the husk holds one of MAX_RUNNERS slots and, worse, takes the
@@ -1525,7 +1846,7 @@ data "archive_file" "runner_cleanup" {
                   if reap_stalled_launch(instance_id, now):
                       stalled_launches.append(instance_id)
 
-          # Phase 4: Launch runners for queued jobs
+          # Phase 6: Launch runners for queued jobs
           # GitHub does not redeliver workflow_job webhooks, so a delivery lost to a
           # bad secret, or a launch lost to spot capacity, is only ever recovered
           # here. That makes this poll the last line of defence, and it has to see
@@ -1576,7 +1897,7 @@ data "archive_file" "runner_cleanup" {
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
     EOF
     filename = "lambda_function.py"
   }
