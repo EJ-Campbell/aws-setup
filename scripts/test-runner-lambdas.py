@@ -168,10 +168,12 @@ class FakeClientError(Exception):
 
 
 class FakeSSM:
-    def __init__(self, pat="ghp_test"):
+    def __init__(self, pat="ghp_test", journal=None):
         self.pat = pat
+        self.journal = journal if journal is not None else []
 
     def get_parameter(self, **kw):
+        self.journal.append(f"ssm:get_parameter:{kw['Name']}")
         if kw["Name"].endswith("/pat"):
             return {"Parameter": {"Value": self.pat}}
         return {"Parameter": {"Value": "IyEvYmluL2Jhc2gK"}}
@@ -215,13 +217,13 @@ class FakeGitHub:
 
     def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
                  delete_error=False, recheck=None, journal=None, runners_total=None,
-                 omit_runners_total=False):
+                 omit_runners_total=False, runner_payloads=None):
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.runners = list(runners)
         # Every /actions/runners call raises: a PAT that lost its scope, a 5xx, a
-        # rate limit. get_runners() swallows it and returns {}, so the reaper sees
-        # no record for any instance - the state a decision must survive.
+        # rate limit. get_runners() turns it into an unread roster, so the reaper
+        # has no record for any instance - the state a decision must survive.
         self.runners_error = runners_error
         # A deregistration that fails must never stop a termination.
         self.delete_error = delete_error
@@ -236,6 +238,13 @@ class FakeGitHub:
         # The response carries no total_count key at all, so completeness
         # cannot be checked against anything.
         self.omit_runners_total = omit_runners_total
+        # Exact successive /actions/runners payloads, when pagination itself is
+        # the input under test: a roster that changes between two complete
+        # reads, or a page boundary that shifts under a concurrent registration.
+        # Once exhausted, the last payload keeps answering, so a later phase
+        # does not get an unrelated fake failure.
+        self.runner_payloads = list(runner_payloads) if runner_payloads is not None else None
+        self.runner_payload_index = 0
         self.journal = journal if journal is not None else []
         self.requests = []
         self.deletes = []
@@ -274,6 +283,10 @@ class FakeGitHub:
         if "/actions/runners" in url:
             if self.runners_error:
                 raise OSError("GitHub is unreachable")
+            if self.runner_payloads:
+                index = min(self.runner_payload_index, len(self.runner_payloads) - 1)
+                self.runner_payload_index += 1
+                return self.runner_payloads[index]
             window = self.runners[(page - 1) * per_page: page * per_page]
             if self.omit_runners_total:
                 return {"runners": window}
@@ -1341,7 +1354,7 @@ def case_absolute_runner_lifetime_is_13h30m():
 def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                runners_error=False, runners_total=None, ssm=None,
                instance_id="i-lease", omit_runners_total=False, create_tags_error=None,
-               create_tags_reject_keys=None):
+               create_tags_reject_keys=None, runner_payloads=None):
     """One cleanup poll over a single running runner UNDER the soft cap.
 
     The lease is what is under test, so the instance is deliberately young
@@ -1355,7 +1368,8 @@ def lease_poll(lease_minutes_ago=45, age_minutes=60, tags=None, runners=(),
                   create_tags_error=create_tags_error,
                   create_tags_reject_keys=create_tags_reject_keys)
     github = FakeGitHub(runners=list(runners), runners_error=runners_error,
-                        runners_total=runners_total, omit_runners_total=omit_runners_total)
+                        runners_total=runners_total, omit_runners_total=omit_runners_total,
+                        runner_payloads=runner_payloads)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
@@ -1521,8 +1535,9 @@ def case_a_roster_of_exactly_the_page_limit_is_still_a_complete_read():
     result, ec2, github, _ = lease_poll(runners=roster)
     assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
     assert result["expired"] == ["i-lease"], result
+    # Ten pages per pass, and get_runners() makes two passes.
     reads = [url for url in github.requests if "/actions/runners?" in url]
-    assert len(reads) == 10, reads
+    assert len(reads) == 20, reads
 
 
 def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
@@ -1534,6 +1549,168 @@ def case_the_webhook_accepts_a_complete_roster_at_the_page_limit():
     assert names == {r["name"] for r in roster}, names
     reads = [url for url in github.requests if "/actions/runners?" in url]
     assert len(reads) == 10, reads
+
+
+def case_an_unusable_runner_identity_makes_the_roster_unread():
+    """A name needs text and an id needs to be a positive, non-bool integer.
+
+    Every action on a runner formats its id into a URL, and `True` is an int
+    to isinstance(). A record with any of these identities held the lease on
+    the old check only when the field was None; the rest passed as usable.
+    """
+    invalid = [
+        {"id": 7, "name": ""},
+        {"id": 7, "name": "   "},
+        {"id": True, "name": "runner-i-lease"},
+        {"id": False, "name": "runner-i-lease"},
+        {"id": 0, "name": "runner-i-lease"},
+        {"id": -1, "name": "runner-i-lease"},
+        {"id": 7.0, "name": "runner-i-lease"},
+        {"id": "7", "name": "runner-i-lease"},
+    ]
+    for identity in invalid:
+        record = {**identity, "busy": False, "status": "online"}
+        result, ec2, github, _ = lease_poll(runners=[record])
+        assert still_running(ec2) == ["i-lease"], (identity, still_running(ec2))
+        assert result["held"] == ["i-lease"], (identity, result)
+        assert github.deletes == [], (identity, github.deletes)
+
+
+def case_a_roster_that_changes_between_reads_cannot_expire_a_lease():
+    """Two complete reads that disagree are a roster that was moving.
+
+    The first pass lists one runner and adds up to its total_count; the
+    second lists two. One pass alone was accepted and the lease of the runner
+    the first pass did not list expired on it.
+    """
+    other = runner_record("i-other", runner_id=1)
+    target = runner_record("i-lease", runner_id=2)
+    payloads = [
+        {"total_count": 1, "runners": [other]},
+        {"total_count": 2, "runners": [other, target]},
+    ]
+    result, ec2, github, _ = lease_poll(runners=[other, target], runner_payloads=payloads)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    reads = [url for url in github.requests if "/actions/runners?" in url]
+    assert len(reads) == 2, reads
+
+
+def case_a_total_count_that_moves_between_pages_makes_the_roster_unread():
+    """A count that differs from one page to the next is a roster that changed mid-read.
+
+    The second page reports a LOWER total than the first. The last page's
+    count used to be the one compared, so 101 records against a total of 100
+    passed as complete and the runner neither page listed read as absent.
+    """
+    first = [runner_record(f"i-other-{n}", runner_id=n + 1) for n in range(100)]
+    last = runner_record("i-other-100", runner_id=101)
+    result, ec2, _, _ = lease_poll(runners=first + [last], runner_payloads=[
+        {"total_count": 101, "runners": first},
+        {"total_count": 100, "runners": [last]},
+    ])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_a_duplicate_across_pages_makes_the_roster_unread():
+    """A repeated name or id is a page boundary that shifted under the read.
+
+    The record it displaced is missing from an answer that still adds up to
+    total_count, so the count check passes and the missing runner reads as
+    absent. Repeated by both fields, by name only and by id only.
+    """
+    first = [runner_record(f"i-other-{n}", runner_id=n + 1) for n in range(100)]
+    repeats = [
+        first[-1],
+        {**first[-1], "name": "runner-i-different-name"},
+        {**first[-1], "id": 1001},
+    ]
+    for repeated in repeats:
+        result, ec2, _, _ = lease_poll(runners=first, runner_payloads=[
+            {"total_count": 101, "runners": first},
+            {"total_count": 101, "runners": [repeated]},
+        ])
+        assert still_running(ec2) == ["i-lease"], (repeated, still_running(ec2))
+        assert result["held"] == ["i-lease"], (repeated, result)
+
+
+def case_a_repeated_name_degrades_the_webhook_to_the_instance_count():
+    """The launch-side reader, same defect class: a repeated record hides a displaced one.
+
+    A full first page and a second page that repeats its last record add up
+    to total_count, so the count check passes. The fourth live runner is the
+    record the repeat displaced; unseen, it dropped `counted` to three and
+    metal was launched into a full pool.
+    """
+    live = [{"id": n + 1, "name": f"runner-i-live{n}", "status": "online", "busy": True}
+            for n in range(3)]
+    filler = [{"id": 100 + n, "name": f"runner-i-fill{n}", "status": "online", "busy": True}
+              for n in range(97)]
+    result, ec2 = webhook_capacity_poll(live, runner_payloads=[
+        {"total_count": 101, "runners": live + filler},
+        {"total_count": 101, "runners": [live[2]]},
+    ])
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_every_ceiling_terminate_precedes_every_optional_tag_write():
+    """No instance in the fleet is written to before every ceiling has been applied.
+
+    A younger instance is listed first and needs both the seen stamp and a
+    lease renewal. Either write can stall for the rest of the budget, and the
+    older instance later in the response must already be gone by then.
+    Ordering per instance did not cover this: the older one had not been
+    reached when the younger one's writes ran.
+    """
+    journal = []
+    ec2 = FakeEC2([
+        instance("i-young", "c7g.metal", "running", 60, arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+        instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+    ], journal=journal)
+    github = FakeGitHub(runners=[runner_record("i-young", runner_id=1),
+                                 runner_record("i-aged", runner_id=2)], journal=journal)
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert result["renewed"] == ["i-young"], result
+    kill = journal.index("ec2:terminate:i-aged")
+    tag_writes = [i for i, e in enumerate(journal) if e.startswith("ec2:create_tags:")]
+    assert tag_writes, journal
+    assert all(kill < i for i in tag_writes), journal
+
+
+def case_every_ceiling_terminate_precedes_the_pat_read_and_the_roster():
+    """The SSM read and the roster pages are optional to a launch-time-only bound.
+
+    Both can stall (SSM at boto3's retried read timeout, GitHub at ten pages
+    of a 10-second call each), so both come after every ceiling termination.
+    """
+    journal = []
+    ec2 = FakeEC2([
+        instance("i-aged-a", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+        instance("i-aged-b", "c7g.metal", "running", HARD_CEILING_MINUTES + 10,
+                 arch="arm64",
+                 tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()}),
+    ], journal=journal)
+    github = FakeGitHub(runners=[runner_record("i-aged-a", runner_id=1),
+                                 runner_record("i-aged-b", runner_id=2)], journal=journal)
+    ssm = FakeSSM(journal=journal)
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github, ssm=ssm)["handler"]({}, None)
+    assert sorted(result["hard_killed"]) == ["i-aged-a", "i-aged-b"], result
+    kills = [i for i, e in enumerate(journal) if e.startswith("ec2:terminate:i-aged-")]
+    assert len(kills) == 2, journal
+    optional = [i for i, e in enumerate(journal)
+                if e.startswith("ssm:") or e.startswith("github:GET:")]
+    assert optional, journal
+    assert all(kill < i for kill in kills for i in optional), journal
 
 
 def case_a_held_lease_does_not_shield_the_instance_beside_it():
@@ -1835,7 +2012,8 @@ def case_a_nameless_runner_record_cannot_stop_a_launch():
     assert len(launched_types(ec2)) == 1, launched_types(ec2)
     assert result["body"].startswith("Launched 1 x86_64 runner"), result
 
-def webhook_capacity_poll(roster, live=4, runners_total=None, omit_runners_total=False):
+def webhook_capacity_poll(roster, live=4, runners_total=None, omit_runners_total=False,
+                          runner_payloads=None):
     """One queued x86 event against `live` running instances and this roster."""
     ec2 = FakeEC2([instance(f"i-live{n}", "c5d.metal", "running", 60) for n in range(live)])
     event = {"body": json.dumps({
@@ -1843,7 +2021,8 @@ def webhook_capacity_poll(roster, live=4, runners_total=None, omit_runners_total
         "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
     })}
     github = FakeGitHub(runners=roster, runners_total=runners_total,
-                        omit_runners_total=omit_runners_total)
+                        omit_runners_total=omit_runners_total,
+                        runner_payloads=runner_payloads)
     result = webhook(ec2, github=github)["handler"](event, None)
     return result, ec2
 

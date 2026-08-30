@@ -222,7 +222,14 @@ compare (without it a page-size heuristic accepts any short array as the whole r
 every record has to carry a usable `name` and `id`. A short page reads exactly like "that
 runner is not registered", so truncation is the same fail-open arriving through pagination.
 Reaching `total_count` is what ends a read: a roster of exactly ten full pages is complete,
-not a list that ran past the page limit.
+not a list that ran past the page limit. `total_count` also has to be the same on every page
+and at least what the pages hold, a name has to contain text, an id has to be a positive
+integer (`True` is an `int` to Python, and neither it nor `0` is an id a DELETE URL can
+carry), and no name or id may repeat: offset pagination hands the same record out twice when
+a registration moves across a page boundary mid-read, and the runner it displaced is then
+missing from a read that still adds up. The cleanup Lambda reads the roster twice and holds
+every lease if the two passes differ, because a roster that changed while it was read is not
+evidence about which runners are absent.
 A record that cannot be represented is not dropped, for the same reason: dropped, it still
 counted toward `total_count`, so the read passed as complete and simply did not list that
 runner, which is the never-registered `EXPIRE` for any instance without `RunnerSeenAt` (every
@@ -292,10 +299,14 @@ that notices it finished: the longest legitimate self-hosted job measured here i
 minutes and a full matrix is about 35.
 
 **A bound is only real if the sweep runs and reaches every instance.** The ceiling lives in
-one loop. Anything that raises before or during that loop, or simply spends the Lambda's
-240-second budget before reaching it, disables it for every instance the poll had not got to
-— and nothing in this account alarms on Lambda errors, so it would be invisible. Five things
-hold it open.
+a pass of its own, the first thing the handler does after listing the fleet. It reads nothing
+but each instance's id and launch time and terminates every instance over the ceiling before
+the PAT is read from SSM, before GitHub is asked anything, and before any tag is written. A
+per-instance ordering was not enough: a `CreateTags` for a younger instance earlier in the
+response can stall for the rest of the Lambda's 240-second budget (boto3 retries a 60-second
+read timeout), and so can the SSM read or a slow roster page, and an older instance later in
+the response then never reaches its check. Nothing in this account alarms on Lambda errors,
+so a deferred ceiling would be invisible. Five more things hold it open.
 
 *Order.* The sweep is **Phase 1**, ahead of the orphan cleanup and the stuck-job scan. Both of
 those are unbounded GitHub work (one EC2 describe per registered runner plus deregistrations
@@ -320,15 +331,15 @@ call, so it never claims a job is dead on a poll where the instance survived.
 naive one, and comparing it raised `TypeError` out of the whole invocation.
 
 *The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else, and
-*`get_runners` drops records without a usable `name` or `id`*: the orphan phase calls
-`.startswith()` on every key and formats the id straight into a DELETE URL, and the idle
-path keys its fresh re-read on the id. A dropped record makes the instance simply unknown,
-which drains and dies at the ceiling.
+*`get_runners` makes the whole roster unread on a record without a usable `name` or `id`*:
+the orphan phase calls `.startswith()` on every key and formats the id straight into a DELETE
+URL, and the idle path keys its fresh re-read on the id. An unread roster holds every lease
+and leaves the ceiling as the bound.
 
-*Each instance's turn through the loop is wrapped individually.* An instance whose age cannot
-be computed has no safe verdict, so it is named with an `UNREADABLE INSTANCE RECORD` line —
-which says outright that this instance is not covered by the bound until its record reads
-cleanly — and every other instance is still swept.
+*Each instance's turn through both loops is wrapped individually.* An instance whose age
+cannot be computed has no safe verdict, so it is named with an `UNREADABLE INSTANCE RECORD`
+line — which says outright that this instance is not covered by the bound until its record
+reads cleanly — and every other instance is still swept.
 
 **Three places that read absence as evidence, all fixed.** Terminating or deregistering a
 runner is destructive, so it may only happen on evidence that is both fresh and positive.

@@ -131,6 +131,7 @@ data "archive_file" "runner_webhook" {
               print('No usable PAT in SSM; runner health is unknown')
               return None
           names = set()
+          seen_names = set()
           collected = 0
           total = None
           try:
@@ -140,13 +141,26 @@ data "archive_file" "runner_webhook" {
                   if not isinstance(batch, list):
                       print('Runner list carries no runners array; runner health is unknown')
                       return None
+                  # total_count has to be an integer the check can compare, has
+                  # to be the same on every page (a count that moved between
+                  # pages is a roster that changed under the read), and has to
+                  # be at least what the pages hold.
                   reported = data.get('total_count')
-                  if not isinstance(reported, int) or isinstance(reported, bool):
+                  if (not isinstance(reported, int) or isinstance(reported, bool)
+                          or reported < 0):
                       print(f'Runner list reports total_count={reported!r}, which cannot be '
                             f'compared with the pages read; runner health is unknown')
                       return None
-                  total = reported
-                  collected += len(batch)
+                  if total is None:
+                      total = reported
+                  elif reported != total:
+                      print(f'Runner list total_count changed from {total} to {reported} '
+                            f'between pages; runner health is unknown')
+                      return None
+                  if collected + len(batch) > total:
+                      print(f'Runner list holds more records than its total_count={total}; '
+                            f'runner health is unknown')
+                      return None
                   # A record without a usable name or status makes the whole answer
                   # unknown. Skipped, it is an online runner the cap cannot see: a
                   # full pool of four reads as three, `counted` falls below the cap,
@@ -154,14 +168,25 @@ data "archive_file" "runner_webhook" {
                   # get_capacity() is written to fail away from. A missing status is
                   # not "offline" for the same reason; it is a field GitHub did not
                   # send. Unknown health degrades to the instance count.
+                  #
+                  # A name that repeats is the same answer: offset pagination can
+                  # hand the same record out twice when a registration moves
+                  # across a page boundary mid-read, and the runner it displaced
+                  # is then missing from a read that still adds up to total_count.
                   for r in batch:
-                      if (not isinstance(r, dict) or not isinstance(r.get('name'), str)
+                      name = r.get('name') if isinstance(r, dict) else None
+                      if (not isinstance(name, str) or not name.strip()
                               or not isinstance(r.get('status'), str)):
                           print('Runner list has a record with no usable name or status; '
                                 'runner health is unknown')
                           return None
+                      if name in seen_names:
+                          print(f'Runner list repeats {name!r}; runner health is unknown')
+                          return None
+                      seen_names.add(name)
                       if r['status'] == 'online':
-                          names.add(r['name'])
+                          names.add(name)
+                  collected += len(batch)
                   # Reaching total_count ends the read. A roster of exactly
                   # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
                   # into the else below and was reported as unknown, on a read
@@ -1276,33 +1301,33 @@ data "archive_file" "runner_cleanup" {
       ROSTER_PAGE_LIMIT = 10
       ROSTER_PAGE_SIZE = 100
 
-      def get_runners(pat):
-          """The registered runners as {name: {id, busy, status}}, or None.
+      def read_roster_once(pat):
+          """One complete pass over the runner roster, or None if it was not one.
 
-          None means the roster could not be READ, and it is deliberately
-          distinct from {} ("GitHub answered, and nothing is registered").
-          Callers act on that difference: an unread roster is not evidence that
-          any runner is idle, and reading it as one is what terminated runners
-          mid-job under the soft cap during a GitHub outage (ejc3/aws#45).
-
-          Incomplete counts as unread, in four shapes. The call raises. The
+          Incomplete counts as unread, in these shapes. The call raises. The
           payload carries no runners array. The pages come back short of the
           total_count GitHub reports beside them - which reads exactly like
           "that runner is not registered", the same fail-open arriving through
           pagination instead of through an exception; per_page was already
           raised from the default 30 to 100 for that reason, and a bigger page
-          is not a completeness check. Or the answer holds something this
-          function cannot represent: a record without a usable name or id, or
-          a total_count that is missing or not an integer, which is a
-          completeness check that cannot run - a page-size heuristic on its
-          own accepts any short array as the whole roster. Such a record used
-          to be dropped and the rest kept,
-          but it still counted toward total_count, so the read passed as
+          is not a completeness check. total_count is missing, not an integer,
+          negative, or differs between pages, so the completeness check cannot
+          run or the roster moved under the read. The pages hold more records
+          than total_count. A record cannot be represented: no usable name, or
+          an id that is not a positive integer (a bool is an int in Python,
+          and neither True nor 0 is a runner id a DELETE URL can carry). Or an
+          identity repeats: offset pagination hands the same record out twice
+          when a registration moves across a page boundary mid-read, and the
+          runner it displaced is then absent from a read that still adds up.
+
+          A record that cannot be represented used to be dropped and the rest
+          kept, but it still counted toward total_count, so the read passed as
           complete and simply did not list that runner - and a roster that
           does not list a runner is what lease_verdict() reads as "never
           registered" for an instance without RunnerSeenAt.
           """
           roster = {}
+          seen_ids = set()
           collected = 0
           total = None
           try:
@@ -1320,12 +1345,20 @@ data "archive_file" "runner_cleanup" {
                       print('ROSTER UNREAD: the runners response carries no runners array')
                       return None
                   reported = data.get('total_count')
-                  if not isinstance(reported, int) or isinstance(reported, bool):
+                  if (not isinstance(reported, int) or isinstance(reported, bool)
+                          or reported < 0):
                       print(f'ROSTER UNREAD: total_count={reported!r} cannot be compared '
                             f'with the pages read')
                       return None
-                  total = reported
-                  collected += len(batch)
+                  if total is None:
+                      total = reported
+                  elif reported != total:
+                      print(f'ROSTER UNREAD: total_count changed from {total} to '
+                            f'{reported} between pages')
+                      return None
+                  if collected + len(batch) > total:
+                      print(f'ROSTER UNREAD: more records than total_count={total}')
+                      return None
                   # status is preserved as-absent when GitHub omits it: a missing
                   # status must never count as online, or a wedged busy runner
                   # with a flaky API response is renewed forever again.
@@ -1350,12 +1383,22 @@ data "archive_file" "runner_cleanup" {
                       if not isinstance(r, dict):
                           print(f'ROSTER UNREAD: a runner record is {type(r).__name__}, not an object')
                           return None
-                      if not isinstance(r.get('name'), str) or r.get('id') is None:
+                      name = r.get('name')
+                      runner_id = r.get('id')
+                      if (not isinstance(name, str) or not name.strip()
+                              or not isinstance(runner_id, int)
+                              or isinstance(runner_id, bool) or runner_id <= 0):
                           print(f'ROSTER UNREAD: a runner record has no usable name or id '
-                                f'(name={r.get("name")!r} id={r.get("id")!r})')
+                                f'(name={name!r} id={runner_id!r})')
                           return None
-                      roster[r['name']] = {'id': r['id'], 'busy': r.get('busy'),
-                                           'status': r.get('status')}
+                      if name in roster or runner_id in seen_ids:
+                          print(f'ROSTER UNREAD: a runner identity repeats '
+                                f'(name={name!r} id={runner_id!r})')
+                          return None
+                      seen_ids.add(runner_id)
+                      roster[name] = {'id': runner_id, 'busy': r.get('busy'),
+                                      'status': r.get('status')}
+                  collected += len(batch)
                   # Reaching total_count ends the read. A roster of exactly
                   # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
                   # into the else below and was reported unread, on a read that
@@ -1375,6 +1418,35 @@ data "archive_file" "runner_cleanup" {
                     f'GitHub reports')
               return None
           return roster
+
+      def get_runners(pat):
+          """The registered runners as {name: {id, busy, status}}, or None.
+
+          None means the roster could not be READ, and it is deliberately
+          distinct from {} ("GitHub answered, and nothing is registered").
+          Callers act on that difference: an unread roster is not evidence that
+          any runner is idle, and reading it as one is what terminated runners
+          mid-job under the soft cap during a GitHub outage (ejc3/aws#45).
+
+          Two complete passes, and they have to agree. One pass that adds up
+          to total_count with no repeated identity can still be wrong about
+          which runners it lists: a registration that moves across a page
+          boundary between two page requests shifts a different record off
+          the read, and nothing inside that pass can see it. A roster that
+          differs between two passes was changing while it was read, and a
+          read of a changing roster is not evidence of absence. Two GitHub
+          calls per poll in the steady state, against a five-minute schedule.
+          """
+          first = read_roster_once(pat)
+          if first is None:
+              return None
+          second = read_roster_once(pat)
+          if second is None:
+              return None
+          if first != second:
+              print('ROSTER UNREAD: the roster changed between two complete reads')
+              return None
+          return first
 
       def still_idle(runner_id, pat):
           """Re-read ONE runner and confirm GitHub still says it holds no job.
@@ -1787,28 +1859,10 @@ data "archive_file" "runner_cleanup" {
           return demand
 
       def handler(event, context):
-          pat = get_github_pat()
-          print(f'PAT available: {bool(pat)}')
-          # `roster is None` means the answer never arrived: the call failed, the
-          # payload was unusable, the read was short of GitHub's own total_count,
-          # a record in it could not be represented, or there was no PAT to ask
-          # with. It is NOT the same as an empty roster, and every decision
-          # below that ends an instance on roster evidence goes through
-          # lease_verdict() or observed_idle(), both of which can tell the two
-          # apart. (The stuck-job phase ends instances too, but on per-job
-          # evidence, and it reaps nothing when GitHub does not answer.)
-          # `runners` is the same thing flattened for the phases that only
-          # iterate it.
-          roster = get_runners(pat) if pat else None
-          if roster is None:
-              print('ROSTER UNREAD this poll: no lease may lapse on it, and the age '
-                    'ceiling is the only bound still in force')
-          else:
-              print(f'Found {len(roster)} runners from GitHub')
-          runners = roster if roster is not None else {}
           now = datetime.now(timezone.utc)
 
-          # Phase 1: the lifetime bound - the lease sweep and the age policy.
+          # Phase 1: the lifetime bound - the ceiling pass, then the lease sweep
+          # and the age policy.
           #
           # FIRST on purpose. Every other phase here is optional work that can
           # spend the 240-second budget: per-runner EC2 describes, GitHub DELETEs
@@ -1846,10 +1900,23 @@ data "archive_file" "runner_cleanup" {
           # never appear in `terminated`, and the poll must not read as a clean sweep.
           terminate_failed = []
 
+          # The ceiling pass. It walks the whole fleet reading nothing but
+          # InstanceId and LaunchTime and terminates every instance over the
+          # ceiling, before the PAT is read, before GitHub is asked anything
+          # and before any tag is written. age_policy() derives
+          # TERMINATE_CEILING from launch_time alone, so nothing here waits
+          # on an answer. Ordering the writes per instance was not enough: a
+          # CreateTags for a younger instance earlier in the response can
+          # stall for the rest of the budget (boto3 retries a 60s read
+          # timeout), so can the SSM read or a slow roster page, a Lambda
+          # timeout is not catchable, and an older instance later in the
+          # response then never reaches its check.
+          ceiling_instances = set()
+          ceiling_terminated = []
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
-                  # One unreadable record must cost that instance, not the sweep.
-                  # This loop is the only thing enforcing the fleet's absolute
+                  # One unreadable record must cost that instance, not the pass.
+                  # This is the only thing enforcing the fleet's absolute
                   # lifetime bound, and an exception raised part-way through it
                   # skips every instance AFTER the failing one - so a single
                   # malformed field could let an over-ceiling runner live forever,
@@ -1858,6 +1925,96 @@ data "archive_file" "runner_cleanup" {
                   # so it is named and skipped; the next poll retries it.
                   try:
                       instance_id = instance['InstanceId']
+                      launch_time = instance['LaunchTime']
+                      if age_policy(now, launch_time, {}) != TERMINATE_CEILING:
+                          continue
+                      # Whatever terminate() answers, the sweep below leaves this
+                      # instance alone: an instance over the ceiling gets no
+                      # optional write after EC2 has refused the required one.
+                      ceiling_instances.add(instance_id)
+                      if not terminate(instance_id, 'hard ceiling'):
+                          terminate_failed.append(instance_id)
+                          continue
+                      terminated.append(instance_id)
+                      over_age.append(instance_id)
+                      ceiling_terminated.append(
+                          (instance_id, (now - launch_time).total_seconds() / 3600))
+                  except Exception as e:
+                      broken = instance.get('InstanceId') if isinstance(instance, dict) else None
+                      print(f'UNREADABLE INSTANCE RECORD ({broken or "no InstanceId"}) in the '
+                            f'ceiling pass: {type(e).__name__}: {e}. Its age cannot be '
+                            f'computed, so there is no safe verdict and it is skipped - '
+                            f'this instance is NOT covered by the lifetime bound until its '
+                            f'record reads cleanly. Every other instance is still checked.')
+
+          # Every ceiling termination has been attempted. Only now is the PAT
+          # read and GitHub asked.
+          pat = get_github_pat()
+          print(f'PAT available: {bool(pat)}')
+          # `roster is None` means the answer never arrived: the call failed, the
+          # payload was unusable, the read was short of GitHub's own total_count,
+          # a record in it could not be represented, the roster changed between
+          # two reads, or there was no PAT to ask with. It is NOT the same as
+          # an empty roster, and every decision below that ends an instance on
+          # roster evidence goes through lease_verdict() or observed_idle(),
+          # both of which can tell the two apart. (The stuck-job phase ends
+          # instances too, but on per-job evidence, and it reaps nothing when
+          # GitHub does not answer.) `runners` is the same thing flattened for
+          # the phases that only iterate it.
+          roster = get_runners(pat) if pat else None
+          if roster is None:
+              print('ROSTER UNREAD this poll: no lease may lapse on it, and the age '
+                    'ceiling is the only bound still in force')
+          else:
+              print(f'Found {len(roster)} runners from GitHub')
+          runners = roster if roster is not None else {}
+
+          # Deregister the ceiling terminations and log what happened to each.
+          # Terminate ran BEFORE deregister on purpose. Deregistering first and
+          # then failing to terminate is the worst of both outcomes: GitHub
+          # documents that DELETE as forcing the runner out, which is how a job
+          # in flight dies, and the instance is still running afterwards. The
+          # next poll would then find no GitHub record for it, read it as
+          # unknown, drain it to the ceiling and finally report it as work we
+          # may have destroyed - all on our own doing.
+          ceiling_hours = MAX_INSTANCE_AGE_HOURS + DRAIN_GRACE_MINUTES / 60
+          for instance_id, age_hours in ceiling_terminated:
+              runner_info = runners.get(f'runner-{instance_id}', {})
+              if runner_info.get('id'):
+                  deregister_runner(runner_info['id'], pat)
+              if observed_idle(runner_info):
+                  print(f'Terminating over-age: {instance_id} (age={age_hours:.2f}h '
+                        f'>= ceiling {ceiling_hours:.2f}h, GitHub reports it idle)')
+              else:
+                  # LOUD on purpose. A running job just died here, and this
+                  # line is the only record that the loss was OURS. On GitHub
+                  # it renders exactly like an AWS spot reclaim, which cost a
+                  # night of misattributed reruns (ejc3/fcvm#884). Printed
+                  # after the terminate is accepted, so it never claims a job
+                  # is dead on a poll where the instance survived.
+                  hard_killed.append(instance_id)
+                  print(f'HARD-CEILING KILL: {instance_id} terminated at '
+                        f'age={age_hours:.2f}h (ceiling {ceiling_hours:.2f}h = '
+                        f'{MAX_INSTANCE_AGE_HOURS}h + {DRAIN_GRACE_MINUTES}m) without '
+                        f'ever being observed idle (github '
+                        f'busy={runner_info.get("busy")} '
+                        f'status={runner_info.get("status")}). Any job it was running '
+                        f'is now dead, and GitHub will report "The self-hosted runner '
+                        f'lost communication with the server" for it - that is THIS '
+                        f'termination, not an AWS spot reclaim.')
+
+          for reservation in response['Reservations']:
+              for instance in reservation['Instances']:
+                  # One unreadable record must cost that instance, not the sweep.
+                  # An exception raised part-way through this loop skips every
+                  # instance AFTER the failing one, so it is named and skipped
+                  # and the next poll retries it. The ceiling pass above has
+                  # already decided every instance it could read; the ones it
+                  # decided are not touched again here.
+                  try:
+                      instance_id = instance['InstanceId']
+                      if instance_id in ceiling_instances:
+                          continue
                       launch_time = instance['LaunchTime']
                       runner_name = f'runner-{instance_id}'
                       lease_expires_str = get_tag(instance, 'LeaseExpires')
@@ -1882,54 +2039,14 @@ data "archive_file" "runner_cleanup" {
                       # DRAIN_GRACE_MINUTES later. Both are documented at those
                       # constants; age_policy() is the whole decision.
                       age_hours = (now - launch_time).total_seconds() / 3600
-                      ceiling_hours = MAX_INSTANCE_AGE_HOURS + DRAIN_GRACE_MINUTES / 60
                       action = age_policy(now, launch_time, runner_info)
 
-                      if action == TERMINATE_CEILING:
-                          # Terminate BEFORE deregistering, and log only what actually
-                          # happened. Deregistering first and then failing to terminate
-                          # is the worst of both outcomes: GitHub documents that DELETE
-                          # as forcing the runner out, which is how a job in flight
-                          # dies, and the instance is still running afterwards. The
-                          # next poll would then find no GitHub record for it, read it
-                          # as unknown, drain it to the ceiling and finally report it
-                          # as work we may have destroyed - all on our own doing.
-                          if not terminate(instance_id, 'hard ceiling'):
-                              terminate_failed.append(instance_id)
-                              continue
-                          if runner_info.get('id'):
-                              deregister_runner(runner_info['id'], pat)
-                          terminated.append(instance_id)
-                          over_age.append(instance_id)
-                          if observed_idle(runner_info):
-                              print(f'Terminating over-age: {instance_id} (age={age_hours:.2f}h '
-                                    f'>= ceiling {ceiling_hours:.2f}h, GitHub reports it idle)')
-                          else:
-                              # LOUD on purpose. A running job just died here, and this
-                              # line is the only record that the loss was OURS. On GitHub
-                              # it renders exactly like an AWS spot reclaim, which cost a
-                              # night of misattributed reruns (ejc3/fcvm#884). Printed
-                              # after the terminate is accepted, so it never claims a job
-                              # is dead on a poll where the instance survived.
-                              hard_killed.append(instance_id)
-                              print(f'HARD-CEILING KILL: {instance_id} terminated at '
-                                    f'age={age_hours:.2f}h (ceiling {ceiling_hours:.2f}h = '
-                                    f'{MAX_INSTANCE_AGE_HOURS}h + {DRAIN_GRACE_MINUTES}m) without '
-                                    f'ever being observed idle (github '
-                                    f'busy={runner_info.get("busy")} '
-                                    f'status={runner_info.get("status")}). Any job it was running '
-                                    f'is now dead, and GitHub will report "The self-hosted runner '
-                                    f'lost communication with the server" for it - that is THIS '
-                                    f'termination, not an AWS spot reclaim.')
-                          continue
-
-                      # Stamp the roster's answer only now. A CreateTags can stall
-                      # for the rest of the budget (boto3 retries a 60s read
-                      # timeout), a Lambda timeout is not catchable, and this
-                      # sweep is the only thing enforcing the lifetime bound, so
-                      # no write for an instance may run ahead of its ceiling
-                      # decision. A renewal below carries the same stamp; this
-                      # call covers every listed runner that is not renewed.
+                      # Stamp the roster's answer. Every write to EC2 sits after
+                      # the ceiling pass: a CreateTags can stall for the rest of
+                      # the budget (boto3 retries a 60s read timeout) and a
+                      # Lambda timeout is not catchable. A renewal below carries
+                      # the same stamp; this call covers every listed runner
+                      # that is not renewed.
                       if roster is not None and runner_name in roster:
                           mark_seen(instance_id, now)
 
