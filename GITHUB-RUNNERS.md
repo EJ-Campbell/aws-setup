@@ -164,10 +164,11 @@ indistinguishable from a code defect.
 both gates refuse the shapes they exist for, and that each precedes registration.
 
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
-(`rate(5 minutes)`) and does six things, four of them using the PAT: deregisters GitHub
+(`rate(5 minutes)`) and does seven things, five of them using the PAT: deregisters GitHub
 runners whose instance is gone; renews the lease on busy runners (+60m) and lets idle ones
 expire, then terminates and deregisters anything past its lease (instances younger than 10
-minutes are skipped so setup isn't interrupted); **terminates any runner whose current job
+minutes are skipped so setup isn't interrupted); drains runners past the 12h soft cap and
+terminates them at the 13h30m hard ceiling; **terminates any runner whose current job
 has been `in_progress` longer than `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray
 `ami-builder-temp` instances older than 2 hours (pure EC2, no PAT); reaps launches still
 `pending` after 15 minutes; and counts GitHub's queued jobs to launch what the queue
@@ -192,23 +193,106 @@ whose scheduler is the thing that failed.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
 only while GitHub explicitly reports it `online` (a missing `status` fails closed to
-not-busy), and no instance outlives `MAX_INSTANCE_AGE_HOURS` (12h) regardless of busy
-state. Both exist because `busy` means "holds a job", not "makes progress": on 2026-08-07
-two ARM runners wedged with ~490 leaked `firecracker` processes and load averages of 389
-and 523 (disk was fine at 46%/67%). They kept their assigned jobs, so GitHub kept
-reporting `busy=true`, so the lease was renewed every 5 minutes for 21 hours. They
-occupied 2 of the 4 ARM slots while doing no work, and `get_running_runners` — which
-counts EC2 instances, not healthy runners — reported the pool at max, so no replacement
-ever launched and CI sat queued.
+not-busy), and no instance outlives the hard ceiling below. Both exist because `busy` means
+"holds a job", not "makes progress": on 2026-08-07 two ARM runners wedged with ~490 leaked
+`firecracker` processes and load averages of 389 and 523 (disk was fine at 46%/67%). They
+kept their assigned jobs, so GitHub kept reporting `busy=true`, so the lease was renewed
+every 5 minutes for 21 hours. They occupied 2 of the 4 ARM slots while doing no work, and
+`get_running_runners` — which counts EC2 instances, not healthy runners — reported the pool
+at max, so no replacement ever launched and CI sat queued.
 
-The 12h ceiling is a deliberate **local policy**, not a platform limit: GitHub allows a
+**Runner lifetime: drain at 12h, hard ceiling at 13h30m.** `MAX_INSTANCE_AGE_HOURS` (12h) is
+a soft cap. Past it the instance drains: it is terminated on the first poll that sees GitHub
+report it idle, and a job already in flight is left to finish. `DRAIN_GRACE_MINUTES` (90) on
+top of that is the hard ceiling, **13h30m, the absolute maximum lifetime of a runner
+instance** — enforced regardless of busy state, regardless of whether GitHub answered,
+regardless of anything else, because it is computed from the instance's launch time alone.
+The poll runs every 5 minutes, so the observed maximum is 13h30m plus at most one poll
+interval. A ceiling termination that never observed the runner idle logs `HARD-CEILING KILL`
+with the GitHub state it saw, and reports it in the poll result as `hard_killed`; that line
+is the only record distinguishing our termination from an AWS spot reclaim.
+
+The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners
 only), and these runners are not ephemeral, so one instance can legitimately chain many
-short jobs past 12h of age. The trade, made explicitly: every fcvm CI job finishes in
-well under 2 hours, so a 12h-old runner is overwhelmingly likely wedged. Worst case the
-cap kills one healthy in-flight job, which a re-run fixes; a wedged slot silently starves
-the whole pool indefinitely, which no re-run fixes. Raise `MAX_INSTANCE_AGE_HOURS` if a
-legitimately long job is ever added.
+short jobs past 12h of age. Every fcvm CI job finishes in well under 2 hours, so a 12h-old
+runner has outlived its usefulness. Raise `MAX_INSTANCE_AGE_HOURS`, not the grace, if a
+legitimately long job is ever added — the grace is sized to one job, not to a working day.
+
+The grace exists because the cap used to terminate whatever the runner was doing. On
+2026-08-28/29 it killed `i-09fff3a7d97fd4066` at 12.07h and `i-02fefa9deeb59e9c8` at 12.02h
+with jobs in flight; EC2 recorded `User initiated` and the spot request said
+`instance-terminated-by-user`, but on GitHub both read as "The self-hosted runner lost
+communication with the server", indistinguishable from a spot reclaim, and it cost six
+reruns in one night (`ejc3/fcvm#884`, symptom first recorded in `ejc3/fcvm#834`). 90 minutes
+covers the longest job that can be in flight when a runner crosses the soft cap plus the poll
+that notices it finished: the longest legitimate self-hosted job measured here is 43.5
+minutes and a full matrix is about 35.
+
+**A bound is only real if the sweep runs and reaches every instance.** The ceiling lives in
+one loop. Anything that raises before or during that loop, or simply spends the Lambda's
+240-second budget before reaching it, disables it for every instance the poll had not got to
+— and nothing in this account alarms on Lambda errors, so it would be invisible. Five things
+hold it open.
+
+*Order.* The sweep is **Phase 1**, ahead of the orphan cleanup and the stuck-job scan. Both of
+those are unbounded GitHub work (one EC2 describe per registered runner plus deregistrations
+at a 10-second timeout; up to eleven calls at five seconds), and a Lambda timeout cannot be
+caught, so anything slow ahead of the sweep means the age check simply never happens.
+
+*Every termination goes through one `terminate()` helper*, including the stuck-job and
+AMI-builder reaps, which used to call `ec2.terminate_instances` raw. One rejected call there
+raised out of the handler and took every later phase with it, the queued-job launcher
+included. A rejected call is now reported in `terminate_failed` with a `TERMINATE FAILED`
+line naming the instance, and is never counted in `terminated`, because the instance is still
+running and a poll that reads as a clean sweep would be lying.
+
+*Terminate first, deregister second.* Deregistering and then failing to terminate is the
+worst available outcome: GitHub's DELETE forces the runner out, which is how a job in flight
+dies, and the instance is still up afterwards. The next poll would then find no GitHub record
+for it, read it as unknown, drain it to the ceiling, and finally report it as work we may have
+destroyed. The `HARD-CEILING KILL` line is likewise printed only once EC2 has accepted the
+call, so it never claims a job is dead on a poll where the instance survived.
+
+*`parse_ts` returns UTC-aware datetimes.* A GitHub timestamp with no offset used to produce a
+naive one, and comparing it raised `TypeError` out of the whole invocation.
+
+*The stuck-job scan is wrapped*, so losing it costs the stuck-job check and nothing else, and
+*`get_runners` drops records without a usable `name` or `id`*: the orphan phase calls
+`.startswith()` on every key and formats the id straight into a DELETE URL, and the idle
+path keys its fresh re-read on the id. A dropped record makes the instance simply unknown,
+which drains and dies at the ceiling.
+
+*Each instance's turn through the loop is wrapped individually.* An instance whose age cannot
+be computed has no safe verdict, so it is named with an `UNREADABLE INSTANCE RECORD` line —
+which says outright that this instance is not covered by the bound until its record reads
+cleanly — and every other instance is still swept.
+
+**Three places that read absence as evidence, all fixed.** Terminating or deregistering a
+runner is destructive, so it may only happen on evidence that is both fresh and positive.
+
+`get_instance_state` distinguishes "EC2 says there is no such instance" from "EC2 could not be
+asked": the orphan phase deregisters on the first and leaves the second alone, because one
+transient `DescribeInstances` failure used to force a healthy runner out mid-job.
+
+Even `InvalidInstanceID.NotFound` is not taken as proof on its own — AWS documents it as
+transient after `RunInstances` — so the orphan phase first checks the instance against the set
+of running runners the sweep listed moments earlier. An id in that set is demonstrably alive
+whatever a per-id lookup says.
+
+And an idle verdict past the soft cap is confirmed against a fresh single-runner read before
+the instance is terminated, because the flags the poll is acting on were captured before the
+rest of the invocation ran and GitHub hands out jobs the whole time. An unanswerable re-read
+drains instead, and the ceiling bounds how long that lasts.
+
+A draining runner is **not** deregistered while GitHub reports it busy. GitHub documents that
+DELETE as forcing the runner's removal and does not say what happens to a job it is part-way
+through, and a forced removal that ends the job is the same failure. What stops a drained
+runner picking up new work is that the poll which first observes it idle terminates it, so
+the exposure is at most one 5-minute interval after its job ends. A job started inside
+that window and still running at the ceiling is still killed; that residual case is what the
+`HARD-CEILING KILL` line is for. Closing it entirely would need an on-box graceful shutdown
+(`Runner.Listener` finishing its job and exiting), which the Lambda has no channel to request.
 
 **A spot capacity failure has to move the launcher to the next instance type.** It cannot
 discover one by itself: `run_instances` returns an instance ID for a spot request AWS cannot

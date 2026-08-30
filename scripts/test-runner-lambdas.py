@@ -58,9 +58,24 @@ def extract_lambda_sources():
 class FakeEC2:
     """Just enough EC2 to drive the launcher and the reaper."""
 
-    def __init__(self, instances=(), run_instances_errors=None):
+    def __init__(self, instances=(), run_instances_errors=None, terminate_error=None,
+                 lookup_error=None, journal=None):
         self.instances = list(instances)
         self.run_instances_errors = run_instances_errors or {}
+        # TerminateInstances rejected: an IAM change, DisableApiTermination, a
+        # transient 5xx. The instance stays alive, so a poll that reports success
+        # here would be claiming the fleet's lifetime bound took effect when it
+        # did not.
+        self.terminate_error = terminate_error
+        # DescribeInstances(InstanceIds=...) failing. Distinct from "no such
+        # instance": one is "could not ask", the other is "it is gone", and the
+        # orphan phase deregisters on the second.
+        self.lookup_error = lookup_error
+        # Optional list shared with FakeGitHub, so the ORDER of AWS and GitHub work
+        # within one invocation can be asserted. Phase order is a safety property
+        # here: a Lambda timeout is not catchable, so anything unbounded that runs
+        # ahead of the age sweep can stop the sweep happening at all.
+        self.journal = journal if journal is not None else []
         self.calls = []
 
     def _matches(self, instance, filters):
@@ -78,7 +93,14 @@ class FakeEC2:
 
     def describe_instances(self, **kw):
         self.calls.append(("describe_instances", kw))
+        if "InstanceIds" in kw and self.lookup_error:
+            raise self.lookup_error
         matched = [i for i in self.instances if self._matches(i, kw.get("Filters", []))]
+        # get_instance_state() looks an instance up by id with no filters. Without
+        # honouring InstanceIds every lookup would answer with the first instance in
+        # the list, so a case about one runner would silently be answered by another.
+        if "InstanceIds" in kw:
+            matched = [i for i in matched if i["InstanceId"] in kw["InstanceIds"]]
         return {"Reservations": [{"Instances": matched}] if matched else []}
 
     def describe_images(self, **kw):
@@ -97,9 +119,30 @@ class FakeEC2:
 
     def terminate_instances(self, **kw):
         self.calls.append(("terminate_instances", kw))
+        self.journal.append(f"ec2:terminate:{','.join(kw['InstanceIds'])}")
+        if self.terminate_error:
+            raise self.terminate_error
+        # An accepted terminate MOVES the instance. Leaving it 'running' let a case
+        # assert an outcome that only held because the fake froze the world: later
+        # phases in the same poll see 'shutting-down' in reality, not 'running'.
+        for inst in self.instances:
+            if inst.get("InstanceId") in kw["InstanceIds"]:
+                inst["State"] = {"Name": "shutting-down"}
 
     def ops(self, name):
         return [kw for op, kw in self.calls if op == name]
+
+
+class FakeClientError(Exception):
+    """Shaped like botocore's ClientError, which carries its code in .response.
+
+    The Lambda cannot import botocore (it is present in the runtime, but the
+    handler only ever sees the exception), so it reads the code off the object.
+    """
+
+    def __init__(self, code, message="fake"):
+        super().__init__(f"An error occurred ({code}): {message}")
+        self.response = {"Error": {"Code": code, "Message": message}}
 
 
 class FakeSSM:
@@ -148,19 +191,58 @@ class FakeLambdaClient:
 class FakeGitHub:
     """Routes GitHub REST URLs to canned JSON, honouring status and page."""
 
-    def __init__(self, runs=(), jobs=None, runners=()):
+    def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
+                 delete_error=False, recheck=None, journal=None):
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.runners = list(runners)
+        # Every /actions/runners call raises: a PAT that lost its scope, a 5xx, a
+        # rate limit. get_runners() swallows it and returns {}, so the reaper sees
+        # no record for any instance - the state a decision must survive.
+        self.runners_error = runners_error
+        # A deregistration that fails must never stop a termination.
+        self.delete_error = delete_error
+        # What GET /actions/runners/{id} answers, when that must differ from the
+        # list this poll already read: {runner_id: record or None-to-fail}.
+        self.recheck = recheck or {}
+        self.journal = journal if journal is not None else []
         self.requests = []
+        self.deletes = []
 
-    def _payload(self, url):
+    def _payload(self, req):
+        url = getattr(req, "url", req)
+        method = getattr(req, "method", None)
         self.requests.append(url)
+        self.journal.append(f"github:{method or 'GET'}:{url.split('/repos/ejc3/fcvm')[-1]}")
+        if method == "DELETE":
+            self.deletes.append(url)
+            if self.delete_error:
+                raise OSError("GitHub refused the deregistration")
+            # Deregistration REMOVES the runner, and a second DELETE for the same id
+            # 404s. Without that, a case could not tell "cleaned one orphan" from
+            # "deregistered the same runner twice".
+            gone = int(url.rsplit("/", 1)[-1])
+            before = len(self.runners)
+            self.runners = [r for r in self.runners if r.get("id") != gone]
+            if len(self.runners) == before:
+                raise OSError("HTTP Error 404: Not Found")
+            return {}
         page_match = re.search(r"[?&]page=(\d+)", url)
         per_page_match = re.search(r"per_page=(\d+)", url)
         page = int(page_match.group(1)) if page_match else 1
         per_page = int(per_page_match.group(1)) if per_page_match else 30
+        one_runner = re.search(r"/actions/runners/(\d+)$", url)
+        if one_runner:
+            record = self.recheck.get(int(one_runner.group(1)), "unset")
+            if record == "unset":
+                record = next((r for r in self.runners
+                               if r.get("id") == int(one_runner.group(1))), None)
+            if record is None:
+                raise OSError("GitHub is unreachable")
+            return record
         if "/actions/runners" in url:
+            if self.runners_error:
+                raise OSError("GitHub is unreachable")
             return {"runners": self.runners}
         jobs_match = re.search(r"/actions/runs/(\d+)/jobs", url)
         if jobs_match:
@@ -193,10 +275,17 @@ class FakeGitHub:
             def __exit__(self, *exc):
                 return False
 
+        # Request objects carry the method so a DELETE (deregistration) is
+        # distinguishable from a GET at the point urlopen is actually called.
+        class Req:
+            def __init__(self, url, method=None):
+                self.url = url
+                self.method = method
+
         module = types.SimpleNamespace()
         module.request = types.SimpleNamespace(
-            Request=lambda url, **kw: url,
-            urlopen=lambda url, **kw: Response(github._payload(url)),
+            Request=lambda url, **kw: Req(url, kw.get("method")),
+            urlopen=lambda req, **kw: Response(github._payload(req)),
         )
         return module
 
@@ -244,10 +333,16 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     })
 
     # Freeze the clock so "stalled for 20 minutes" is a fact, not a race.
+    #
+    # The tz argument is honoured rather than ignored: every Lambda call site
+    # passes timezone.utc, and one that stopped would start comparing a naive
+    # clock against boto3's aware LaunchTime. A fake that returns an aware value
+    # either way hides that, so `now()` with no tz returns naive here exactly as
+    # the real datetime does.
     class FixedDatetime(namespace["datetime"]):
         @classmethod
         def now(cls, tz=None):
-            return now
+            return now if tz is not None else now.replace(tzinfo=None)
 
     namespace["datetime"] = FixedDatetime
     return namespace
@@ -582,6 +677,615 @@ def case_young_pending_launch_is_left_alone():
     result = cleanup(ec2, FakeGitHub())["handler"]({}, None)
     assert result["stalled_launches"] == [], result
     assert ec2.ops("terminate_instances") == []
+
+
+# --------------------------------------------------------------------------
+# Cases: the age policy - drain at the soft cap, hard ceiling above it
+# --------------------------------------------------------------------------
+
+# The policy these cases assert, in minutes. Spelled out rather than read back
+# from the Lambda, so a case says what the fleet is supposed to do instead of
+# following whatever the constants happen to hold;
+# case_absolute_runner_lifetime_is_13h30m is what ties the two together.
+SOFT_CAP_MINUTES = 12 * 60          # MAX_INSTANCE_AGE_HOURS: stop taking new work
+DRAIN_GRACE_MINUTES = 90            # time an in-flight job gets to finish
+HARD_CEILING_MINUTES = SOFT_CAP_MINUTES + DRAIN_GRACE_MINUTES   # 13h30m, unconditional
+
+
+def runner_record(instance_id="i-aged", busy=True, status="online", runner_id=77):
+    """One entry as GitHub's /actions/runners list returns it."""
+    return {"id": runner_id, "name": f"runner-{instance_id}", "busy": busy, "status": status}
+
+
+def age_poll(age_minutes, runners=(), runners_error=False, delete_error=False,
+             instance_id="i-aged", runs=(), terminate_error=None, recheck=None,
+             extra_instances=()):
+    """One cleanup poll over a single running runner of the given age.
+
+    Returns (result, ec2, github, stdout). Driving the real handler rather than
+    age_policy() alone is deliberate: it is the wiring, not the predicate, that
+    decides whether an instance is actually terminated.
+    """
+    ec2 = FakeEC2([instance(instance_id, "c7g.metal", "running", age_minutes, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})]
+                  + list(extra_instances),
+                  terminate_error=terminate_error)
+    github = FakeGitHub(runs=list(runs), runners=list(runners), recheck=recheck,
+                        runners_error=runners_error, delete_error=delete_error)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    return result, ec2, github, buf.getvalue()
+
+
+def terminated_ids(ec2):
+    return [i for kw in ec2.ops("terminate_instances") for i in kw["InstanceIds"]]
+
+
+def case_busy_runner_past_the_soft_cap_is_drained_not_killed():
+    """ejc3/fcvm#884: a job in flight at 12h must be allowed to finish.
+
+    The pre-fix Lambda terminated at MAX_INSTANCE_AGE_HOURS regardless of busy.
+    On 2026-08-28/29 that killed i-09fff3a7d97fd4066 at 12.07h and
+    i-02fefa9deeb59e9c8 at 12.02h, both mid-job, both reported to GitHub as
+    "The self-hosted runner lost communication with the server".
+    """
+    result, ec2, github, _ = age_poll(SOFT_CAP_MINUTES + 30, runners=[runner_record()])
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+    # And it is NOT deregistered while busy. GitHub documents that DELETE as
+    # "forces the removal of a self-hosted runner" and says nothing about a job
+    # the runner is part-way through; a forced removal that ends the job is the
+    # failure this case exists to prevent. The runner stops taking new work by
+    # being terminated on the first poll that sees it idle, which is at most one
+    # 5-minute interval after its job ends.
+    assert github.deletes == [], github.deletes
+
+
+def case_busy_runner_just_under_the_hard_ceiling_is_still_draining():
+    """The grace is a real window, not a rounding error on the soft cap."""
+    result, ec2, _, _ = age_poll(HARD_CEILING_MINUTES - 5, runners=[runner_record()])
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+
+
+def case_busy_runner_past_the_hard_ceiling_is_terminated():
+    """The ceiling is unconditional. ejc3/fcvm#871's wedged host reports busy forever.
+
+    Draining on `busy` is only safe because this bound exists: a host whose
+    scheduler has failed holds its job for as long as it is alive, so waiting for
+    "not busy" is waiting for something that never comes.
+    """
+    result, ec2, github, _ = age_poll(HARD_CEILING_MINUTES + 5, runners=[runner_record()])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert github.deletes, "the runner must be deregistered as well as terminated"
+
+
+def case_hard_ceiling_kill_of_a_busy_runner_is_loud():
+    """The log line is the only trace that the loss was ours and not AWS's.
+
+    All three causes render identically on GitHub as "lost communication with
+    the server", so the Lambda has to say which one it was.
+    """
+    _, _, _, out = age_poll(HARD_CEILING_MINUTES + 5, runners=[runner_record()])
+    assert "HARD-CEILING KILL" in out, out
+    assert "not an AWS spot reclaim" in out, out
+    assert "busy=True" in out, out
+
+
+def case_idle_runner_past_the_soft_cap_is_terminated_immediately():
+    """Draining is not a reprieve: an idle over-age runner goes now.
+
+    This is what keeps the drain from becoming a way to live longer. It is also
+    the only mechanism stopping a drained runner picking up new work, so it must
+    fire on the first poll that observes idleness, not at lease expiry.
+    """
+    result, ec2, github, _ = age_poll(SOFT_CAP_MINUTES + 5,
+                                      runners=[runner_record(busy=False)])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["over_age"] == ["i-aged"], result
+    assert result["draining"] == [], result
+    assert result["hard_killed"] == [], result
+    assert github.deletes, "an idle drained runner must be deregistered"
+
+
+def case_unreachable_github_drains_inside_the_grace():
+    """No answer from GitHub is not evidence that the runner is idle.
+
+    Reading an API failure as "idle" would terminate a runner mid-job on every
+    GitHub blip, which is ejc3/fcvm#884 again with a different trigger. The ceiling below
+    is what makes it safe to wait instead.
+    """
+    result, ec2, _, _ = age_poll(SOFT_CAP_MINUTES + 30, runners_error=True)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+
+
+def case_unreachable_github_is_still_terminated_at_the_ceiling():
+    """The ceiling cannot be deferred by a GitHub error.
+
+    get_runners() swallows the exception and returns {}, so the reaper has no
+    record at all for this instance - exactly the state in which a bound that
+    needed one would leak the instance forever.
+    """
+    result, ec2, _, out = age_poll(HARD_CEILING_MINUTES + 5, runners_error=True)
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["over_age"] == ["i-aged"], result
+    assert result["hard_killed"] == ["i-aged"], result
+    assert "HARD-CEILING KILL" in out, out
+
+
+def case_runner_missing_from_github_is_still_terminated_at_the_ceiling():
+    """GitHub answers and has no record for this instance: same outcome."""
+    result, ec2, _, _ = age_poll(HARD_CEILING_MINUTES + 5, runners=[])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+
+
+def case_ceiling_terminates_even_when_deregistration_fails():
+    """A failed DELETE must not abort the terminate that follows it."""
+    result, ec2, github, _ = age_poll(HARD_CEILING_MINUTES + 5, runners=[runner_record()],
+                                      delete_error=True)
+    assert github.deletes, "the deregistration must at least be attempted"
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+
+
+def case_busy_runner_under_the_soft_cap_is_untouched():
+    """Ordinary life is unchanged: renew the lease, terminate nothing."""
+    result, ec2, github, _ = age_poll(SOFT_CAP_MINUTES - 60, runners=[runner_record()])
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == [], result
+    assert result["over_age"] == [], result
+    assert result["renewed"] == ["i-aged"], result
+    assert github.deletes == [], github.deletes
+
+
+def case_age_policy_ceiling_ignores_every_reported_runner_state():
+    """Past the ceiling the verdict is the same for every possible input.
+
+    The point of the ceiling is that it is computable from the launch time
+    alone. Anything it consulted - a busy flag, a status, a tag, a GitHub
+    response - is something that can be missing or wrong, and a bound that can be
+    deferred by a broken component is not a bound.
+    """
+    module = cleanup(FakeEC2(), FakeGitHub())
+    policy = module["age_policy"]
+    launched = NOW - timedelta(minutes=HARD_CEILING_MINUTES + 1)
+    states = [
+        None, {},
+        {"busy": True, "status": "online"},
+        {"busy": True, "status": "offline"},
+        {"busy": True, "status": None},
+        {"busy": False, "status": "online"},
+        {"busy": None, "status": None},
+        {"status": "online"},
+        {"id": 1},
+    ]
+    for state in states:
+        verdict = policy(NOW, launched, state)
+        assert verdict == module["TERMINATE_CEILING"], (state, verdict)
+
+
+def case_malformed_github_timestamp_cannot_block_the_ceiling():
+    """A bad value from GitHub must not abort the poll before anything is reaped.
+
+    get_stuck_runners() runs before the age phase. parse_ts() used to hand back a
+    NAIVE datetime for a timestamp carrying no timezone designator, and comparing
+    that to the aware `now` raises TypeError out of the entire poll: no lease
+    renewals, no reaping, and in particular no hard ceiling. That is the ceiling
+    being deferred by a GitHub value, which is the one thing it must never be.
+    """
+    result, ec2, _, _ = age_poll(
+        HARD_CEILING_MINUTES + 5, runners=[runner_record()],
+        runs=[{"id": 1, "status": "in_progress", "run_started_at": "2026-08-07T16:00:00"}])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+
+
+def case_a_bad_runner_record_cannot_block_the_ceiling():
+    """One unusable entry in GitHub's runner list must not kill the poll.
+
+    The orphan phase calls runner_name.startswith() on every key, so a record whose
+    name is not a string raises AttributeError out of the whole invocation, and
+    every instance - including one past the ceiling - survives it.
+    """
+    result, ec2, _, _ = age_poll(
+        HARD_CEILING_MINUTES + 5,
+        runners=[{"id": 1, "name": None, "busy": True, "status": "online"},
+                 runner_record()])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+
+
+def case_one_unreadable_instance_cannot_block_another_ceiling_kill():
+    """A malformed EC2 record must cost that instance, not the whole sweep.
+
+    The age of an instance with no LaunchTime cannot be computed, so there is no
+    safe verdict for it and it is skipped and logged. What must not happen is the
+    exception ending the loop, because everything after it - here a runner well
+    past the hard ceiling - then outlives the bound.
+    """
+    broken = instance("i-broken", "c7g.metal", "running", 120, arch="arm64")
+    del broken["LaunchTime"]
+    aged = instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5, arch="arm64",
+                    tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})
+    ec2 = FakeEC2([broken, aged])
+    github = FakeGitHub(runners=[runner_record()])
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert "i-broken" in buf.getvalue(), "the skipped instance must be named in the log"
+
+
+def case_stuck_scan_still_works_on_a_timestamp_with_no_offset():
+    """Surviving a bad timestamp is not enough; the scan must still do its job.
+
+    The handler now swallows anything get_stuck_runners() throws, so a naive
+    timestamp would no longer kill the poll - it would silently disable the
+    MAX_JOB_RUNTIME_MINUTES reaper for that invocation instead, which is the
+    fail-open form of the same bug. parse_ts() stamping UTC is what keeps the scan
+    working rather than merely surviving.
+    """
+    stale = (NOW - timedelta(minutes=300)).replace(tzinfo=None).isoformat()
+    ec2 = FakeEC2([instance("i-stuck", "c7g.metal", "running", 60, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})])
+    github = FakeGitHub(
+        runners=[runner_record("i-stuck")],
+        runs=[{"id": 5, "status": "in_progress", "run_started_at": stale}],
+        jobs={5: [{"name": "Host-Root-arm64", "status": "in_progress",
+                   "started_at": stale, "runner_name": "runner-i-stuck",
+                   "labels": ["self-hosted", "Linux", "ARM64"]}]},
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["stuck_terminated"] == ["i-stuck"], result
+    assert terminated_ids(ec2) == ["i-stuck"], terminated_ids(ec2)
+
+
+def case_a_failing_stuck_scan_cannot_block_the_ceiling():
+    """Whatever get_stuck_runners() does with a payload, the reaping still runs.
+
+    It is the only GitHub-derived phase ahead of the age phase and it parses
+    arbitrary API responses, so it is the likeliest thing to throw something
+    nobody predicted. Injecting the failure directly covers the shapes a fixture
+    cannot enumerate.
+    """
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})])
+    module = cleanup(ec2, FakeGitHub(runners=[runner_record()]))
+
+    def explode(pat, now):
+        raise RuntimeError("GitHub returned something unparseable")
+
+    module["get_stuck_runners"] = explode
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = module["handler"]({}, None)
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+
+
+def case_drain_outranks_an_expired_lease():
+    """A draining runner is not handed back to the lease phase.
+
+    A runner that drains does not renew, so its lease expires 60 minutes later
+    while it is still inside the grace. If the drain fell through instead of
+    ending the iteration, the lease phase would terminate it on that evidence -
+    which is the original defect wearing a different hat, since "GitHub did not
+    answer" is why the runner is draining in the first place.
+    """
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", SOFT_CAP_MINUTES + 30,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat()})])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners_error=True))["handler"]({}, None)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+    assert result["expired"] == [], result
+
+
+def case_the_ceiling_fires_at_the_ceiling_not_after_it():
+    """Exactly 13h30m is over, not under. Pins >= against a silent >.
+
+    A boundary only reached by a test at the boundary; +/-5 minutes on either
+    side cannot tell the two comparisons apart.
+    """
+    module = cleanup(FakeEC2(), FakeGitHub())
+    policy, busy = module["age_policy"], {"id": 1, "busy": True, "status": "online"}
+    exactly = NOW - timedelta(minutes=HARD_CEILING_MINUTES)
+    a_moment_earlier = NOW - timedelta(minutes=HARD_CEILING_MINUTES, microseconds=-1)
+    assert policy(NOW, exactly, busy) == module["TERMINATE_CEILING"]
+    assert policy(NOW, a_moment_earlier, busy) == module["DRAIN"]
+    # And the soft cap keeps its own boundary: exactly 12h is still ordinary life.
+    assert policy(NOW, NOW - timedelta(minutes=SOFT_CAP_MINUTES), busy) == module["KEEP"]
+
+
+def case_a_failed_terminate_is_never_reported_as_a_termination():
+    """A terminate that EC2 rejects leaves the instance RUNNING. Say so.
+
+    The per-instance guard around the loop body must not absorb this. An
+    invocation that swallows the rejection, returns terminated=[] and logs it as
+    an unreadable EC2 *record* is claiming the fleet's only lifetime bound took
+    effect when the instance is still up: fail-open, and mislabelled at that.
+    """
+    result, ec2, _, out = age_poll(
+        HARD_CEILING_MINUTES + 5, runners=[runner_record()],
+        terminate_error=FakeClientError("UnauthorizedOperation"))
+    assert terminated_ids(ec2) == ["i-aged"], "the terminate must at least be attempted"
+    assert result["terminated"] == [], result
+    assert result["hard_killed"] == [], result
+    assert result["terminate_failed"] == ["i-aged"], result
+    assert "TERMINATE FAILED" in out, out
+    assert "UNREADABLE INSTANCE RECORD" not in out, out
+
+
+def case_a_record_with_no_instance_id_cannot_stop_the_later_phases():
+    """The sweep's guard names "no InstanceId", so that input must be survivable.
+
+    The stuck-job phase rebuilds the instance-id set from the same reservations
+    OUTSIDE the per-instance guard. One record without the key raised KeyError there
+    and took every later phase with it - the stuck-job reaper, the orphan cleanup,
+    the AMI and stalled-launch sweeps and the launcher - on every poll for as long
+    as the record existed.
+    """
+    nameless = instance("i-nameless", "c7g.metal", "running", 120, arch="arm64")
+    del nameless["InstanceId"]
+    stalled = instance("i-stalled", "c5d.metal", "pending", 30)
+    result, ec2, _, _ = age_poll(HARD_CEILING_MINUTES + 5, runners=[runner_record()],
+                                 extra_instances=[nameless, stalled])
+    assert result["hard_killed"] == ["i-aged"], result
+    # The stalled-launch phase runs after the sweep; if the KeyError is back, the
+    # poll never gets there.
+    assert result["stalled_launches"] == ["i-stalled"], result
+
+
+def case_an_idle_verdict_is_rechecked_before_the_runner_is_terminated():
+    """The busy flag read at the top of the poll is seconds stale by now.
+
+    Between that read and this terminate comes the rest of the poll. GitHub hands
+    out jobs the whole time, so terminating a runner past the soft cap on the
+    ORIGINAL observation destroys the job it picked up in the gap - and on that path
+    the poll reports the benign "GitHub reports it idle", so the HARD-CEILING KILL
+    line would not even record the loss.
+    """
+    result, ec2, _, _ = age_poll(
+        SOFT_CAP_MINUTES + 5,
+        runners=[runner_record(busy=False)],
+        recheck={77: {"id": 77, "name": "runner-i-aged", "busy": True, "status": "online"}})
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+
+
+def case_an_unanswerable_recheck_drains_rather_than_terminating():
+    """If the re-read fails there is no fresh evidence, so do not act on stale.
+
+    Costs at most the rest of the grace window, which the ceiling bounds.
+    """
+    result, ec2, _, _ = age_poll(SOFT_CAP_MINUTES + 5,
+                                 runners=[runner_record(busy=False)], recheck={77: None})
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+
+
+def case_a_confirmed_idle_runner_is_still_terminated_at_the_soft_cap():
+    """The re-check must not turn the drain into a way to live forever."""
+    result, ec2, github, _ = age_poll(SOFT_CAP_MINUTES + 5,
+                                      runners=[runner_record(busy=False)])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["over_age"] == ["i-aged"], result
+    assert github.deletes, "an idle drained runner must be deregistered"
+
+
+def case_a_ceiling_kill_of_an_idle_runner_is_quiet():
+    """Loud means "we may have destroyed work", so it must not cry wolf.
+
+    A runner can reach the ceiling and only then be observed idle: GitHub was
+    unreachable for the whole grace window and answers on the last poll. That is a
+    clean reap, and printing HARD-CEILING KILL for it would report a job loss that
+    did not happen - the inverse of the mislabelling in ejc3/fcvm#884.
+    """
+    result, ec2, _, out = age_poll(HARD_CEILING_MINUTES + 5,
+                                   runners=[runner_record(busy=False)])
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["over_age"] == ["i-aged"], result
+    assert result["hard_killed"] == [], result
+    assert "HARD-CEILING KILL" not in out, out
+
+
+def case_a_busy_runner_is_not_deregistered_when_ec2_cannot_be_read():
+    """The orphan phase must not read "could not ask EC2" as "the instance is gone".
+
+    It deregisters a runner whose instance has disappeared, and GitHub documents
+    that DELETE as forcing the removal. One transient DescribeInstances failure
+    therefore forced out a runner in the middle of a job, which is exactly the
+    class of loss this file is trying to stop.
+    """
+    # Deliberately NOT in the sweep's running set, so the cross-check there cannot
+    # answer for this and get_instance_state's own verdict is what is under test.
+    ec2 = FakeEC2([], lookup_error=FakeClientError("RequestLimitExceeded"))
+    github = FakeGitHub(runners=[runner_record("i-live")])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert github.deletes == [], github.deletes
+    assert result["orphans_cleaned"] == [], result
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+
+
+def case_a_runner_whose_instance_really_is_gone_is_still_deregistered():
+    """The other half: EC2 saying "no such instance" must still clean the orphan.
+
+    A terminated instance drops out of DescribeInstances entirely about an hour
+    later and the call then raises InvalidInstanceID.NotFound, so "gone" arrives
+    as an exception too. Telling the two apart is the whole point.
+    """
+    ec2 = FakeEC2([], lookup_error=FakeClientError("InvalidInstanceID.NotFound"))
+    github = FakeGitHub(runners=[runner_record("i-vanished")])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["orphans_cleaned"] == ["runner-i-vanished"], result
+    assert github.deletes, "the orphaned registration must be removed"
+
+
+def case_the_age_sweep_runs_before_the_optional_cleanups():
+    """Phase order is a safety property, because a Lambda timeout is not catchable.
+
+    Everything ahead of the sweep can spend the 240-second budget. The orphan scan
+    issues one EC2 describe per registered runner and deregisters at a 10-second
+    timeout, and the stuck-job scan can spend eleven GitHub calls at five seconds
+    each. If either runs long the invocation dies before a single instance has been
+    examined, and the hard ceiling simply does not happen that poll - with nothing
+    able to catch it and nothing in this account alarming on Lambda errors. So the
+    bound goes first and the optional work goes after it.
+    """
+    journal = []
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  journal=journal)
+    github = FakeGitHub(
+        runners=[runner_record(), {"id": 99, "name": "runner-i-vanished",
+                                   "busy": False, "status": "offline"}],
+        runs=[run(1, "in_progress")], journal=journal)
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert result["orphans_cleaned"] == ["runner-i-vanished"], result
+
+    kill = journal.index("ec2:terminate:i-aged")
+    orphan_delete = next(i for i, e in enumerate(journal) if e.startswith("github:DELETE:/actions/runners/99"))
+    stuck_scan = next(i for i, e in enumerate(journal) if "/actions/runs?status=in_progress" in e)
+    assert kill < orphan_delete, journal
+    assert kill < stuck_scan, journal
+
+
+def case_a_runner_record_with_no_id_is_not_acted_on():
+    """A record with no id can be neither re-read nor deregistered, so drop it.
+
+    Keeping it lets two things happen. The idle path terminates on a snapshot it
+    cannot confirm, because the fresh re-check is skipped when there is no id to
+    re-read. And the orphan phase indexes runner_info['id'] directly, so a None
+    would be formatted straight into the DELETE URL. Dropping it in get_runners
+    makes the instance simply unknown, which drains and dies at the ceiling.
+    """
+    result, ec2, github, _ = age_poll(
+        SOFT_CAP_MINUTES + 5,
+        runners=[{"name": "runner-i-aged", "busy": False, "status": "online"}])
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["draining"] == ["i-aged"], result
+    assert not any("None" in url for url in github.requests), github.requests
+
+
+def case_a_rejected_stuck_reap_does_not_kill_the_poll():
+    """The stuck-job reap must go through terminate() like every other site.
+
+    It called ec2.terminate_instances directly, outside any guard, so one rejected
+    call raised out of the handler and took every later phase with it - including
+    the queued-job launcher, which this file calls the last line of defence for
+    webhooks GitHub does not redeliver. The reorder widened that: the orphan
+    cleanup used to have run by this point and now has not.
+    """
+    stale = (NOW - timedelta(minutes=300)).isoformat()
+    ec2 = FakeEC2([instance("i-stuck", "c7g.metal", "running", 60, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  terminate_error=FakeClientError("UnauthorizedOperation"))
+    github = FakeGitHub(
+        runners=[runner_record("i-stuck")],
+        runs=[{"id": 5, "status": "in_progress", "run_started_at": stale}],
+        jobs={5: [{"name": "Host-Root-arm64", "status": "in_progress", "started_at": stale,
+                   "runner_name": "runner-i-stuck",
+                   "labels": ["self-hosted", "Linux", "ARM64"]},
+                  job("queued", "arm64")]})
+    invoker = FakeLambdaClient()
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        result = cleanup(ec2, github, invoker)["handler"]({}, None)
+    assert result["stuck_terminated"] == [], result
+    assert result["terminate_failed"] == ["i-stuck"], result
+    assert "TERMINATE FAILED" in buf.getvalue()
+    # The launcher is the LAST phase, so reaching it proves the poll survived.
+    # It is also the phase that matters most: GitHub does not redeliver webhooks,
+    # so this poll is the only retry a queued job gets.
+    assert invoker.arch_invokes() == {"arm64": 1}, invoker.arch_invokes()
+
+
+def case_a_rejected_ami_builder_terminate_does_not_kill_the_poll():
+    """Same class, the other raw call site."""
+    ec2 = FakeEC2([instance("i-ami", "c7g.metal", "running", 200,
+                            tags={"Name": "ami-builder-temp"})],
+                  terminate_error=FakeClientError("UnauthorizedOperation"))
+    queued = run(9, "queued")
+    github = FakeGitHub(runs=[queued], jobs={queued["id"]: [job("queued", "x86_64")]})
+    invoker = FakeLambdaClient()
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github, invoker)["handler"]({}, None)
+    assert result["ami_builder_terminated"] == [], result
+    assert invoker.arch_invokes() == {"x86_64": 1}, invoker.arch_invokes()
+
+
+def case_a_runner_is_deregistered_only_after_ec2_accepts_the_terminate():
+    """Deregistering first, then failing to terminate, is the worst outcome.
+
+    It forces a runner out of GitHub - which is how a job in flight dies - and
+    leaves the instance alive anyway. The next poll then has no GitHub record for
+    it, so it reads as unknown, drains, and is finally hard-killed 85 minutes
+    later while being loudly reported as work we may have destroyed. Terminate
+    first: if EC2 refuses, the runner keeps working and keeps its registration.
+    """
+    result, ec2, github, _ = age_poll(
+        SOFT_CAP_MINUTES + 5, runners=[runner_record(busy=False)],
+        terminate_error=FakeClientError("UnauthorizedOperation"))
+    assert result["terminate_failed"] == ["i-aged"], result
+    assert github.deletes == [], github.deletes
+
+
+def case_a_failed_ceiling_terminate_is_not_announced_as_a_dead_job():
+    """HARD-CEILING KILL says a job "is now dead". Only say it if it is.
+
+    Logging before attempting the call produced both "is now dead" and "STILL
+    RUNNING" for one instance in one poll, and counted it in hard_killed - the
+    number documented as work we may have destroyed.
+    """
+    result, _, github, out = age_poll(
+        HARD_CEILING_MINUTES + 5, runners=[runner_record()],
+        terminate_error=FakeClientError("UnauthorizedOperation"))
+    assert result["hard_killed"] == [], result
+    assert "HARD-CEILING KILL" not in out, out
+    assert "TERMINATE FAILED" in out, out
+    # And the runner keeps its registration. Deregistering first, then failing to
+    # terminate, forces a live runner out of GitHub (killing whatever it runs) and
+    # leaves the instance up regardless - the worst of both, for no gain.
+    assert github.deletes == [], github.deletes
+
+
+def case_a_running_instance_is_never_deregistered_on_a_notfound_blip():
+    """DescribeInstances is eventually consistent; the bulk read is the witness.
+
+    AWS documents InvalidInstanceID.NotFound as transient after RunInstances, so
+    it is not by itself proof that an instance is gone. The sweep has already
+    listed every running runner instance this poll, so if the id is in that list
+    it is demonstrably alive and its registration must be left alone.
+    """
+    ec2 = FakeEC2([instance("i-live", "c7g.metal", "running", 60, arch="arm64",
+                            tags={"LeaseExpires": (NOW + timedelta(minutes=30)).isoformat()})],
+                  lookup_error=FakeClientError("InvalidInstanceID.NotFound"))
+    github = FakeGitHub(runners=[runner_record("i-live")])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, github)["handler"]({}, None)
+    assert result["orphans_cleaned"] == [], result
+    assert github.deletes == [], github.deletes
+
+
+def case_absolute_runner_lifetime_is_13h30m():
+    """The one number a reader of this fleet needs, pinned so it cannot drift.
+
+    12h soft cap + 90m grace. The cleanup Lambda polls every 5 minutes, so the
+    observed maximum is this plus at most one poll interval.
+    """
+    module = cleanup(FakeEC2(), FakeGitHub())
+    total = module["MAX_INSTANCE_AGE_HOURS"] * 60 + module["DRAIN_GRACE_MINUTES"]
+    assert total == HARD_CEILING_MINUTES == 13 * 60 + 30, total
 
 
 def poll(github, env=None):
