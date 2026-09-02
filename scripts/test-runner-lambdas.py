@@ -1526,6 +1526,26 @@ def case_a_runner_that_never_registered_still_dies_at_its_lease():
     assert result["expired"] == ["i-lease"], result
 
 
+def case_an_initial_lease_that_ec2_refused_is_reported_as_held():
+    """An instance with no lease tag whose CreateTags failed still has no lease.
+
+    The poll result is what the alarm and the operator read. Reporting nothing
+    for this instance says the sweep handled it; it did not, the lease tag is
+    still absent, and the next poll has to try again. `held` is what that is.
+    """
+    ec2 = FakeEC2([instance("i-lease", "c7g.metal", "running", 60, arch="arm64", tags={})],
+                  create_tags_error=OSError("CreateTags throttled"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(
+            runners=[runner_record("i-lease", busy=False)]))["handler"]({}, None)
+    assert result["held"] == ["i-lease"], result
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["expired"] == [], result
+    lease_tags = [t for i in ec2.instances for t in i.get("Tags", [])
+                  if t["Key"] == "LeaseExpires"]
+    assert lease_tags == [], lease_tags
+
+
 def case_a_registered_runner_missing_from_a_readable_roster_holds_its_lease():
     """Seen before, absent now: one of the two explanations is a live job.
 
@@ -1697,17 +1717,41 @@ def case_a_roster_that_changes_between_reads_cannot_expire_a_lease():
 def case_a_total_count_that_moves_between_pages_makes_the_roster_unread():
     """A count that differs from one page to the next is a roster that changed mid-read.
 
-    The second page reports a LOWER total than the first. The last page's
-    count used to be the one compared, so 101 records against a total of 100
-    passed as complete and the runner neither page listed read as absent.
+    Only the between-page comparison can catch this fixture. The pages never
+    hold more records than the count they claim, so the overflow check passes
+    on every one of them, and the read adds up to the LAST count reported and
+    passes the completeness check too. Reading `total = reported` on every
+    page, as this used to, accepts all three pages and reports a complete
+    roster that is missing whatever the shrinking count dropped.
+
+    Both passes are served, so the check under test is the only thing holding
+    the lease: read_roster_once() returning a short second pass would hold it
+    whatever the per-page checks did.
     """
-    first = [runner_record(f"i-other-{n}", runner_id=n + 1) for n in range(100)]
-    last = runner_record("i-other-100", runner_id=101)
-    result, ec2, _, _ = lease_poll(runners=first + [last], runner_payloads=[
-        {"total_count": 101, "runners": first},
-        {"total_count": 100, "runners": [last]},
-    ])
+    records = [runner_record(f"i-other-{n}", runner_id=n + 1) for n in range(250)]
+    payloads = [
+        {"total_count": 300, "runners": records[:100]},
+        {"total_count": 250, "runners": records[100:200]},
+        {"total_count": 250, "runners": records[200:]},
+    ]
+    result, ec2, _, _ = lease_poll(runners=records, runner_payloads=payloads * 2)
     assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+
+
+def case_more_records_than_total_count_makes_the_roster_unread():
+    """A page holding more records than GitHub's own count is not a complete read.
+
+    The completeness check after the loop is `collected < total`, so a read
+    that came back with MORE than total_count passes it. That is a roster
+    whose count and contents disagree, and treating it as authoritative lets
+    it expire the lease of any instance it does not list.
+    """
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record(f"i-other-{n}", runner_id=n + 1) for n in range(100)],
+        runners_total=50)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["expired"] == [], result
     assert result["held"] == ["i-lease"], result
 
 
@@ -1725,10 +1769,13 @@ def case_a_duplicate_across_pages_makes_the_roster_unread():
         {**first[-1], "id": 1001},
     ]
     for repeated in repeats:
+        # Both passes served. With only the two pages, the second pass reads
+        # one short page and the read is held by the completeness check
+        # instead of by the identity check this case is about.
         result, ec2, _, _ = lease_poll(runners=first, runner_payloads=[
             {"total_count": 101, "runners": first},
             {"total_count": 101, "runners": [repeated]},
-        ])
+        ] * 2)
         assert still_running(ec2) == ["i-lease"], (repeated, still_running(ec2))
         assert result["held"] == ["i-lease"], (repeated, result)
 
@@ -1749,6 +1796,34 @@ def case_a_repeated_name_degrades_the_webhook_to_the_instance_count():
         {"total_count": 101, "runners": live + filler},
         {"total_count": 101, "runners": [live[2]]},
     ])
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_a_total_count_that_moves_between_pages_degrades_the_webhook():
+    """The launch-side reader, same fixture: only the between-page check catches it.
+
+    Every page holds fewer records than the count it reports, and the read
+    adds up to the last count, so the overflow check and the completeness
+    check both pass. Accepted, the roster names none of the four live
+    instances, `counted` falls to zero and metal is launched into a full pool.
+    """
+    records = [{"id": n + 1, "name": f"runner-i-other-{n}", "status": "online", "busy": True}
+               for n in range(250)]
+    result, ec2 = webhook_capacity_poll(records, runner_payloads=[
+        {"total_count": 300, "runners": records[:100]},
+        {"total_count": 250, "runners": records[100:200]},
+        {"total_count": 250, "runners": records[200:]},
+    ])
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_more_records_than_total_count_degrades_the_webhook():
+    """A page holding more records than total_count is not a readable roster either."""
+    records = [{"id": n + 1, "name": f"runner-i-other-{n}", "status": "online", "busy": True}
+               for n in range(100)]
+    result, ec2 = webhook_capacity_poll(records, runners_total=50)
     assert launched_types(ec2) == [], launched_types(ec2)
     assert result["body"] == "Max x86_64 runners (4) reached", result
 
@@ -1874,6 +1949,62 @@ def case_a_protocol_box_that_never_claimed_registration_dies_at_its_lease():
     assert dynamodb.items[instance_arn("i-lease")] == reaping_item()
 
 
+def case_a_lost_registration_row_cannot_reap_a_runner_that_did_register():
+    """An absent row is proof of "never registered" only while nothing contradicts it.
+
+    The row is the only registration evidence ddb-v1 writes, and nothing in the
+    protocol deletes one, so cleanup reads absence as "bootstrap never got that
+    far". That inference fails the moment a row is lost rather than never
+    written: replacing the table (a rename, a hash_key change, a bad import) or
+    deleting one item leaves a registered, busy runner with no row, and the
+    no-row branch then claims `reaping` and terminates it at its next lease
+    expiry, without deregistering it. The signals ejc3/aws#46 established say
+    the opposite about the same instance: the roster lists the runner, a
+    RunnerSeenAt stamp records that some poll saw it, or the lease is later
+    than the launcher's initial one. Any of them makes the missing row a lost
+    row, and the instance is held to the ceiling.
+    """
+    seen = (NOW - timedelta(minutes=6)).isoformat()
+    ddb = {"RunnerRegistrationProtocol": "ddb-v1"}
+    signals = [
+        # The roster lists this runner right now, busy and online.
+        ("on the roster", dict(ddb), [runner_record("i-lease")], 60, 45),
+        # Absent from a readable roster, but stamped by an earlier poll.
+        ("seen before", dict(ddb, RunnerSeenAt=seen), [runner_record("i-other")], 60, 45),
+        # No stamp, but the lease sits past launch + LEASE_DURATION_MINUTES, so
+        # some poll renewed it on a busy answer.
+        ("lease renewed", dict(ddb), [runner_record("i-other")], 130, 5),
+    ]
+    for label, tags, runners, age_minutes, lease_minutes_ago in signals:
+        dynamodb = FakeDynamoDB()
+        result, ec2, _, _ = lease_poll(
+            tags=tags, runners=runners, dynamodb=dynamodb,
+            age_minutes=age_minutes, lease_minutes_ago=lease_minutes_ago)
+        assert still_running(ec2) == ["i-lease"], (label, still_running(ec2))
+        assert terminated_ids(ec2) == [], (label, terminated_ids(ec2))
+        assert result["expired"] == [], (label, result)
+        assert result["held"] == ["i-lease"], (label, result)
+        # No claim written: the row is missing, not this Lambda's to take.
+        assert dynamodb.ops("put_item") == [], (label, dynamodb.ops("put_item"))
+
+
+def case_a_lost_registration_row_beside_a_reaping_claim_still_holds():
+    """The same rule after a claim: a reaping row does not outrank the roster.
+
+    A `reaping` row is a claim an earlier poll won, and the retry path
+    terminates on it. If GitHub now lists that runner, the claim was won
+    against a bootstrap that had already registered, so the terminate waits
+    for the roster to stop listing it or for the ceiling.
+    """
+    dynamodb = FakeDynamoDB([reaping_item()])
+    result, ec2, _, _ = lease_poll(
+        tags={"RunnerRegistrationProtocol": "ddb-v1"},
+        runners=[runner_record("i-lease")], dynamodb=dynamodb)
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["expired"] == [], result
+    assert result["held"] == ["i-lease"], result
+
+
 def case_a_protocol_box_is_held_until_its_lease_expires():
     """Cleanup does not race a bootstrap that is still inside its lease."""
     dynamodb = FakeDynamoDB()
@@ -1944,6 +2075,9 @@ def case_a_malformed_registration_row_holds():
     bad_state = registered_item(); bad_state["State"] = {"S": "pending"}; rows.append(bad_state)
     other = registered_item("i-other"); other["InstanceArn"] = {"S": instance_arn("i-lease")}
     rows.append(other)
+    # A `reaping` row is a claim, and a claim with no ReapingAt is not one this
+    # Lambda can show it made. Read as a claim, it terminates the instance.
+    undated = reaping_item(); del undated["ReapingAt"]; rows.append(undated)
     for row in rows:
         dynamodb = FakeDynamoDB([row])
         result, ec2, _, _ = lease_poll(
@@ -1951,6 +2085,41 @@ def case_a_malformed_registration_row_holds():
         assert still_running(ec2) == ["i-lease"], (row, still_running(ec2))
         assert result["held"] == ["i-lease"], (row, result)
         assert dynamodb.ops("put_item") == [], (row, dynamodb.ops("put_item"))
+
+
+def case_a_registration_row_that_describes_another_instance_renews_nothing():
+    """The row's identity fields decide whose GitHub answer this lease is read from.
+
+    Each row here would read as a live registration if its identity were not
+    checked, and GitHub answers busy and online for the id it carries: an
+    accepted row renews THIS instance's lease on evidence about a different
+    box. Refused, the row is unread, and unread holds. The lease-expiry
+    recheck cannot stand in for these checks: it asks about the instance's own
+    runner name, so it never sees a row that renewed the lease before it.
+    """
+    wrong_instance_id = registered_item()
+    wrong_instance_id["InstanceId"] = {"S": "i-other"}
+    wrong_arn = registered_item()
+    wrong_arn["InstanceArn"] = {"S": instance_arn("i-other")}
+    here = runner_record("i-lease", busy=True, runner_id=77)
+    there = {"id": 77, "name": "runner-i-other", "busy": True, "status": "online"}
+    rows = [
+        ("InstanceId names another instance", wrong_instance_id, here),
+        ("InstanceArn names another instance", wrong_arn, here),
+        ("RunnerName is another runner", registered_item(runner_name="runner-i-other"), there),
+    ]
+    for label, row, answer in rows:
+        dynamodb = FakeDynamoDB()
+        # Keyed by the instance under test whatever the row's own ARN says:
+        # the key is what GetItem asks for, the attribute is what is checked.
+        dynamodb.items[instance_arn("i-lease")] = row
+        result, ec2, _, _ = lease_poll(
+            age_minutes=70, lease_minutes_ago=5,
+            tags={"RunnerRegistrationProtocol": "ddb-v1"}, runners=[],
+            dynamodb=dynamodb, recheck={77: answer})
+        assert result["renewed"] == [], (label, result)
+        assert result["held"] == ["i-lease"], (label, result)
+        assert still_running(ec2) == ["i-lease"], (label, still_running(ec2))
 
 
 def case_an_unreadable_registration_table_holds():
@@ -2051,6 +2220,30 @@ def case_an_unreadable_registration_table_does_not_suppress_the_ceiling():
         result = cleanup(ec2, FakeGitHub(runners=[]), dynamodb=dynamodb)["handler"]({}, None)
     assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
     assert result["hard_killed"] == ["i-aged"], result
+    assert dynamodb.calls == [], dynamodb.calls
+
+
+def case_a_lost_registration_row_cannot_hold_an_instance_past_the_ceiling():
+    """Holding a lost-row instance is a lease decision, and the ceiling is not one.
+
+    Every signal that makes a missing row hold is present here at once: the
+    row is gone, GitHub lists the runner busy and online, and the instance
+    carries a RunnerSeenAt stamp. It is still terminated, by the pre-pass that
+    reads nothing but InstanceId and LaunchTime and runs before the PAT, the
+    roster and the table.
+    """
+    dynamodb = FakeDynamoDB()
+    ec2 = FakeEC2([instance("i-aged", "c7g.metal", "running", HARD_CEILING_MINUTES + 5,
+                            arch="arm64",
+                            tags={"LeaseExpires": (NOW - timedelta(minutes=45)).isoformat(),
+                                  "RunnerRegistrationProtocol": "ddb-v1",
+                                  "RunnerSeenAt": (NOW - timedelta(minutes=6)).isoformat()})])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub(runners=[runner_record("i-aged")]),
+                         dynamodb=dynamodb)["handler"]({}, None)
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert result["held"] == [], result
     assert dynamodb.calls == [], dynamodb.calls
 
 

@@ -645,9 +645,11 @@ validates the exact identity in `.runner`, conditionally records `State=register
 instance ARN in DynamoDB, and starts the service only after that identity is confirmed.
 
 Cleanup runs every five minutes. A registered `ddb-v1` runner is checked by its exact
-GitHub runner id, and one that never registered is reaped after its lease through a
-conditional `State=reaping` claim on its row, so a bootstrap arriving at the same moment
-finds the row taken and does not start the service. Instances launched before the tag
+GitHub runner id, and one with no row is reaped after its lease through a conditional
+`State=reaping` claim on that row, so a bootstrap arriving at the same moment finds the row
+taken and does not start the service. A missing row beside evidence that the runner did
+register (GitHub still lists it, a `RunnerSeenAt` stamp, or a renewed lease) is a lost row,
+and the instance is held to the age ceiling rather than reaped. Instances launched before the tag
 existed keep the roster-based rules: a renewed lease or a `RunnerSeenAt` stamp holds them
 on roster absence, and a readable roster that has never listed one expires its lease.
 Cleanup also reaps stalled launches, terminates jobs running for more than three hours,

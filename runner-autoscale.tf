@@ -19,6 +19,16 @@ resource "aws_dynamodb_table" "runner_registration" {
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "InstanceArn"
 
+  # An absent row is how cleanup recognises a box that never registered, so
+  # deleting this table (a rename, a hash_key change, an import mistake,
+  # `enable_github_runner = false` while runners are live) removes the
+  # registration evidence of every running instance at once. Nothing is reaped
+  # for it - the lease phase holds an instance whose runner GitHub still lists
+  # or whose RunnerSeenAt stamp is set - but every new boot then fails closed
+  # and the fleet stops taking work. Tearing the fleet down deliberately means
+  # setting this to false in its own apply first.
+  deletion_protection_enabled = true
+
   attribute {
     name = "InstanceArn"
     type = "S"
@@ -1204,6 +1214,17 @@ resource "aws_ssm_parameter" "runner_user_data" {
   tags = {
     Name = "github-runner-user-data"
   }
+
+  # This user data claims a registration row before it starts the runner
+  # service. The webhook Lambda reads this parameter fresh on every launch, so
+  # a launch between this write and the grant would boot a claiming bootstrap
+  # with no PutItem permission: it fails closed and deregisters, at the cost of
+  # a metal spot box-hour and a delayed job. The parameter therefore lands
+  # after the table and the grant, not merely before the webhook that reads it.
+  depends_on = [
+    aws_dynamodb_table.runner_registration,
+    aws_iam_role_policy.runner,
+  ]
 }
 
 # ============================================
@@ -1580,6 +1601,14 @@ data "archive_file" "runner_cleanup" {
           both id and name match what was asked for. None means not proven:
           the call failed, the record is malformed, or it describes another
           runner. Nothing is decided on None.
+
+          A 404 is folded into None with every other failure. GitHub returns
+          it both for a runner that no longer exists and for a PAT without
+          repo admin scope, and the two are not separable from here, so a
+          deregistered ddb-v1 runner holds until the ceiling instead of
+          expiring at its lease. That costs an idle instance for up to 12.5
+          hours; reading a 404 as EXPIRE would cost a working fleet on a
+          scope change.
           """
           if not pat:
               return None
@@ -2047,6 +2076,13 @@ data "archive_file" "runner_cleanup" {
       # timeout, which is not catchable, so a long scan would kill the whole poll
       # and launch NOTHING. A truncated scan under-counts demand, which the next
       # poll corrects; a dead poll corrects nothing.
+      #
+      # The 240s invocation is not all this scan's. The lease sweep ahead of it
+      # makes two full roster passes (up to ROSTER_PAGE_LIMIT pages each at a
+      # 10s timeout) plus one 5s by-id read per registered ddb-v1 instance and
+      # one more per lease expiry. At a pool of 8 that is about 40s of by-id
+      # reads. Raising the page limit or the pool size spends the same 240s, so
+      # check this budget against them.
       QUEUE_SCAN_TIME_BUDGET_SECONDS = 120
 
       def github_get(pat, url):
@@ -2227,8 +2263,10 @@ data "archive_file" "runner_cleanup" {
           # the phases that only iterate it.
           roster = get_runners(pat) if pat else None
           if roster is None:
-              print('ROSTER UNREAD this poll: no lease may lapse on it, and the age '
-                    'ceiling is the only bound still in force')
+              print('ROSTER UNREAD this poll: no lease may lapse on the roster. A '
+                    'ddb-v1 instance with a registration row is still judged by its '
+                    'own by-id read; for everything else the age ceiling is the only '
+                    'bound still in force')
           else:
               print(f'Found {len(roster)} runners from GitHub')
           runners = roster if roster is not None else {}
@@ -2354,6 +2392,31 @@ data "archive_file" "runner_cleanup" {
                               held.append(instance_id)
                               print(f'{instance_id}: no registration row yet; holding '
                                     f'until the lease at {lease_expires_str or "unset"}')
+                              continue
+                          # Absence of a row is proof of "never registered"
+                          # only while nothing contradicts it. Nothing in this
+                          # protocol deletes a row, so a row that is gone was
+                          # LOST (the table replaced, an item deleted), not
+                          # never written, and reaping on it terminates a
+                          # runner that may hold a job without deregistering
+                          # it. The evidence ejc3/aws#46 already collects says
+                          # which of the two it is: a roster listing this runner,
+                          # a RunnerSeenAt stamp, or a lease later than the
+                          # launcher's initial one all mean some poll saw it
+                          # registered. Hold on any of them and let the
+                          # ceiling bound the instance, as it bounds every
+                          # instance.
+                          registered_before = (
+                              get_tag(instance, SEEN_TAG) is not None
+                              or lease_was_renewed(launch_time, lease_expires_str))
+                          on_roster = roster is not None and runner_name in roster
+                          if registered_before or on_roster:
+                              held.append(instance_id)
+                              print(f'{instance_id}: REGISTRATION ROW MISSING for a runner '
+                                    f'that did register (roster lists it: {on_roster}, '
+                                    f'seen stamp or renewed lease: {registered_before}). '
+                                    f'Holding to the age ceiling rather than reaping it as '
+                                    f'never registered.')
                               continue
                           if registration is None and not claim_reaping(instance_id, now):
                               held.append(instance_id)

@@ -188,6 +188,30 @@ else
     bad "runner role lacks source-instance-scoped registration-table access"
 fi
 
+# The registration row is the only thing that says a ddb-v1 instance registered.
+# Losing the table (a rename, a hash_key change, `enable_github_runner = false`
+# with runners live) leaves every running instance without one. The cleanup
+# Lambda holds those to the ceiling rather than reaping them, and every new boot
+# fails closed, but the fleet still stops working, so the table is not deletable
+# by an apply that did not mean to delete it.
+if awk '/resource "aws_dynamodb_table" "runner_registration"/{f=1} f{print} f&&/^\}$/{exit}' \
+     "$TF_FILE" | grep -q 'deletion_protection_enabled = true'; then
+    ok "the registration table cannot be deleted by an unintended apply"
+else
+    bad "aws_dynamodb_table.runner_registration has no deletion protection"
+fi
+
+# Within one apply the user-data parameter can be written before the grant that
+# lets the instance use it. The old webhook reads that parameter on every launch,
+# so a launch in that window boots a claiming bootstrap with no PutItem
+# permission: it fails closed, deregisters, and costs a metal spot box-hour.
+if awk '/resource "aws_ssm_parameter" "runner_user_data"/{f=1} f{print} f&&/^\}$/{exit}' \
+     "$TF_FILE" | grep -q 'aws_iam_role_policy.runner,'; then
+    ok "user data that claims registration waits for the grant that allows it"
+else
+    bad "aws_ssm_parameter.runner_user_data can be written before the runner grant"
+fi
+
 if grep -q 'aws_lambda_function.runner_cleanup,' "$TF_FILE" \
    && grep -q 'aws_iam_role_policy.runner_lambda,' "$TF_FILE" \
    && grep -q 'aws_iam_role_policy.runner,' "$TF_FILE" \
@@ -219,16 +243,34 @@ if [ "$1 $2" = "ssm get-parameter" ]; then
     echo ghp_test
 elif [ "$1 $2" = "dynamodb put-item" ]; then
     echo put-item >> "$JOURNAL"
+    # The claim IS the conditional create. A put without it overwrites a row
+    # cleanup may already own, so the fake refuses to answer one.
+    case " $* " in
+      *" --condition-expression attribute_not_exists(InstanceArn) "*) : ;;
+      *) echo "put-item is not a conditional create: $*" >&2; exit 90 ;;
+    esac
     [ "$FAKE_SCENARIO" = bootstrap ] && exit 0
     exit 1
 elif [ "$1 $2" = "dynamodb get-item" ]; then
     echo get-item >> "$JOURNAL"
+    # An eventually consistent read can miss the write it is resolving, which
+    # is the one question this read exists to answer.
+    case " $* " in
+      *" --consistent-read "*) : ;;
+      *) echo "get-item is not a consistent read: $*" >&2; exit 90 ;;
+    esac
     if [ "$FAKE_SCENARIO" = unknown_registered ]; then
         jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
           --arg instance "$INSTANCE_ID" \
           '{Item:{InstanceArn:{S:$arn},State:{S:"registered"},
             InstanceId:{S:$instance},RunnerName:{S:("runner-"+$instance)},
             RunnerId:{N:"77"},RegisteredAt:{S:"2026-08-07T20:00:00Z"}}}'
+    elif [ "$FAKE_SCENARIO" = foreign_registered ]; then
+        jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
+          --arg instance "$INSTANCE_ID" \
+          '{Item:{InstanceArn:{S:$arn},State:{S:"registered"},
+            InstanceId:{S:$instance},RunnerName:{S:("runner-"+$instance)},
+            RunnerId:{N:"78"},RegisteredAt:{S:"2026-08-07T20:00:00Z"}}}'
     elif [ "$FAKE_SCENARIO" = cleanup ]; then
         jq -cn --arg arn "arn:aws:ec2:$REGION:928413605543:instance/$INSTANCE_ID" \
           --arg instance "$INSTANCE_ID" \
@@ -309,6 +351,10 @@ registration_case bootstrap          0 1 0
 registration_case unknown_registered 0 1 0
 registration_case cleanup            1 0 1
 registration_case unread             1 0 1
+# A `registered` row under this ARN that names a different runner id is not
+# this bootstrap's claim. Only the identity predicates refuse it: its State is
+# `registered` and its ARN, InstanceId and RunnerName all match.
+registration_case foreign_registered 1 0 1
 
 echo
 echo "passed=$PASS failed=$FAIL"
