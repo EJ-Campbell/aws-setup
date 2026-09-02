@@ -5,7 +5,38 @@ locals {
   # Runner pool size per architecture. The webhook Lambda enforces it; the cleanup
   # Lambda bounds its queue scan and its per-poll launch count by it. One value so
   # the two can never disagree about how large the pool is.
-  runner_max_per_arch = 4
+  runner_max_per_arch            = 4
+  runner_registration_table_name = "github-runner-registration"
+}
+
+# Bootstrap and cleanup need one atomic answer to "may this instance start the
+# runner service?". A conditional create on the instance ARN gives that answer:
+# user data creates `registered`, or cleanup creates `reaping`, but never both.
+# EC2 tags and GitHub's offset-paginated roster cannot provide that exclusion.
+resource "aws_dynamodb_table" "runner_registration" {
+  count        = var.enable_github_runner ? 1 : 0
+  name         = local.runner_registration_table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "InstanceArn"
+
+  # An absent row is how cleanup recognises a box that never registered, so
+  # deleting this table (a rename, a hash_key change, an import mistake,
+  # `enable_github_runner = false` while runners are live) removes the
+  # registration evidence of every running instance at once. Nothing is reaped
+  # for it - the lease phase holds an instance whose runner GitHub still lists
+  # or whose RunnerSeenAt stamp is set - but every new boot then fails closed
+  # and the fleet stops taking work. Tearing the fleet down deliberately means
+  # setting this to false in its own apply first.
+  deletion_protection_enabled = true
+
+  attribute {
+    name = "InstanceArn"
+    type = "S"
+  }
+
+  tags = {
+    Name = local.runner_registration_table_name
+  }
 }
 
 # ============================================
@@ -131,6 +162,7 @@ data "archive_file" "runner_webhook" {
               print('No usable PAT in SSM; runner health is unknown')
               return None
           names = set()
+          seen_names = set()
           collected = 0
           total = None
           try:
@@ -140,13 +172,26 @@ data "archive_file" "runner_webhook" {
                   if not isinstance(batch, list):
                       print('Runner list carries no runners array; runner health is unknown')
                       return None
+                  # total_count has to be an integer the check can compare, has
+                  # to be the same on every page (a count that moved between
+                  # pages is a roster that changed under the read), and has to
+                  # be at least what the pages hold.
                   reported = data.get('total_count')
-                  if not isinstance(reported, int) or isinstance(reported, bool):
+                  if (not isinstance(reported, int) or isinstance(reported, bool)
+                          or reported < 0):
                       print(f'Runner list reports total_count={reported!r}, which cannot be '
                             f'compared with the pages read; runner health is unknown')
                       return None
-                  total = reported
-                  collected += len(batch)
+                  if total is None:
+                      total = reported
+                  elif reported != total:
+                      print(f'Runner list total_count changed from {total} to {reported} '
+                            f'between pages; runner health is unknown')
+                      return None
+                  if collected + len(batch) > total:
+                      print(f'Runner list holds more records than its total_count={total}; '
+                            f'runner health is unknown')
+                      return None
                   # A record without a usable name or status makes the whole answer
                   # unknown. Skipped, it is an online runner the cap cannot see: a
                   # full pool of four reads as three, `counted` falls below the cap,
@@ -154,14 +199,31 @@ data "archive_file" "runner_webhook" {
                   # get_capacity() is written to fail away from. A missing status is
                   # not "offline" for the same reason; it is a field GitHub did not
                   # send. Unknown health degrades to the instance count.
+                  #
+                  # A name that repeats is the same answer: offset pagination can
+                  # hand the same record out twice when a registration moves
+                  # across a page boundary mid-read, and the runner it displaced
+                  # is then missing from a read that still adds up to total_count.
                   for r in batch:
-                      if (not isinstance(r, dict) or not isinstance(r.get('name'), str)
+                      name = r.get('name') if isinstance(r, dict) else None
+                      if (not isinstance(name, str) or not name.strip()
                               or not isinstance(r.get('status'), str)):
                           print('Runner list has a record with no usable name or status; '
                                 'runner health is unknown')
                           return None
+                      if name in seen_names:
+                          print(f'Runner list repeats {name!r}; runner health is unknown')
+                          return None
+                      seen_names.add(name)
                       if r['status'] == 'online':
-                          names.add(r['name'])
+                          names.add(name)
+                  collected += len(batch)
+                  # Reaching total_count ends the read. A roster of exactly
+                  # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
+                  # into the else below and was reported as unknown, on a read
+                  # that had come back complete.
+                  if collected == total:
+                      break
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:
@@ -477,7 +539,12 @@ data "archive_file" "runner_webhook" {
                               {'Key': 'Name', 'Value': f'github-runner-{arch}'},
                               {'Key': 'Role', 'Value': 'github-runner'},
                               {'Key': 'Architecture', 'Value': arch},
-                              {'Key': 'LeaseExpires', 'Value': lease_expiry}
+                              {'Key': 'LeaseExpires', 'Value': lease_expiry},
+                              # Which registration handshake this instance's
+                              # user data runs. It says nothing about whether
+                              # registration succeeded; the cleanup Lambda reads
+                              # that from the DynamoDB row this tag points at.
+                              {'Key': 'RunnerRegistrationProtocol', 'Value': 'ddb-v1'}
                           ]
                       }]
                   )
@@ -611,6 +678,18 @@ resource "aws_lambda_function" "runner_webhook" {
   tags = {
     Name = "github-runner-webhook"
   }
+
+  # The ddb-v1 tag is a promise that the instance's user data can make its
+  # registration claim and that the cleanup Lambda knows what the claim means.
+  # No tagged instance may launch before the table, both IAM grants, the
+  # cleanup Lambda and the user-data parameter carrying that protocol exist.
+  depends_on = [
+    aws_dynamodb_table.runner_registration,
+    aws_iam_role_policy.runner_lambda,
+    aws_iam_role_policy.runner,
+    aws_lambda_function.runner_cleanup,
+    aws_ssm_parameter.runner_user_data,
+  ]
 }
 
 # ============================================
@@ -667,6 +746,14 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = "arn:aws:lambda:us-west-1:928413605543:function:github-runner-webhook"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = aws_dynamodb_table.runner_registration[0].arn
       }
     ]
   })
@@ -1015,14 +1102,87 @@ cd /opt/actions-runner
 curl -sL "$RUNNER_URL" | tar xz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
+# Do not xtrace either token into cloud-init or the serial console.
+set +x
 PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
 if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
   REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
     https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
+  RUNNER_NAME="runner-$INSTANCE_ID"
   sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "runner-$INSTANCE_ID" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+
+  # `.runner` is the identity GitHub assigned, written by config.sh with
+  # camelCase keys (the runner serialises RunnerSettings through
+  # VssCamelCasePropertyNamesContractResolver). Refuse to start when config
+  # wrote anything other than this instance's name, or no positive id.
+  RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
+    select(.agentName == $expected)
+    | .agentId
+    | select(type == "number" and . > 0 and floor == .)
+  ' .runner)
+
+  IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/dynamic/instance-identity/document)
+  ACCOUNT_ID=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+    '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
+  IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
+    '.region | select(type == "string" and length > 0)')
+  if [ "$IDENTITY_REGION" != "$REGION" ]; then
+    echo "FATAL: instance identity region $IDENTITY_REGION does not match $REGION; refusing to register this runner"
+    exit 1
+  fi
+  INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$INSTANCE_ID"
+  REGISTRATION_TABLE="${local.runner_registration_table_name}"
+  REGISTERED_AT=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)
+  REGISTRATION_KEY=$(jq -cn --arg arn "$INSTANCE_ARN" \
+    '{InstanceArn: {S: $arn}}')
+  REGISTRATION_ITEM=$(jq -cn \
+    --arg arn "$INSTANCE_ARN" \
+    --arg instance_id "$INSTANCE_ID" \
+    --arg runner_name "$RUNNER_NAME" \
+    --arg runner_id "$RUNNER_ID" \
+    --arg registered_at "$REGISTERED_AT" \
+    '{InstanceArn: {S: $arn}, State: {S: "registered"},
+      InstanceId: {S: $instance_id}, RunnerName: {S: $runner_name},
+      RunnerId: {N: $runner_id}, RegisteredAt: {S: $registered_at}}')
+
+  # Bootstrap and cleanup both conditionally create this row. Bootstrap starts
+  # the service only when it won, or when a consistent read proves that a
+  # PutItem whose answer was lost did in fact write this exact identity.
+  if ! aws dynamodb put-item \
+      --table-name "$REGISTRATION_TABLE" \
+      --item "$REGISTRATION_ITEM" \
+      --condition-expression 'attribute_not_exists(InstanceArn)' \
+      --region "$REGION"; then
+    REGISTRATION_ROW=$(aws dynamodb get-item \
+      --table-name "$REGISTRATION_TABLE" \
+      --key "$REGISTRATION_KEY" \
+      --consistent-read \
+      --region "$REGION" \
+      --output json 2>/dev/null || true)
+    if ! printf '%s' "$REGISTRATION_ROW" | jq -e \
+        --arg arn "$INSTANCE_ARN" \
+        --arg instance_id "$INSTANCE_ID" \
+        --arg runner_name "$RUNNER_NAME" \
+        --arg runner_id "$RUNNER_ID" \
+        '.Item.InstanceArn.S == $arn
+         and .Item.State.S == "registered"
+         and .Item.InstanceId.S == $instance_id
+         and .Item.RunnerName.S == $runner_name
+         and .Item.RunnerId.N == $runner_id' >/dev/null; then
+      echo "FATAL: cleanup won or registration ownership is unknown; refusing to start runner service"
+      curl -fsS -X DELETE -H "Authorization: token $PAT" \
+        "https://api.github.com/repos/ejc3/fcvm/actions/runners/$RUNNER_ID" || true
+      exit 1
+    fi
+  fi
+
   ./svc.sh install ubuntu
   ./svc.sh start
+else
+  echo "FATAL: no usable GitHub runner PAT; refusing to register this runner"
+  exit 1
 fi
 EOF
 }
@@ -1036,7 +1196,8 @@ EOF
 #   ValidationException: The specified parameter value is too large.
 #   Advanced-tier parameters support a maximum parameter value of 8192 characters.
 #
-# base64gzip brings it to 4,712, with room for the script to keep growing.
+# base64gzip brought it to 4,712; the registration claim takes it to about 6,100,
+# still under the limit with room for the script to keep growing.
 #
 # Safe because BOTH decoders are already in the path, and neither is new behaviour:
 #   - cloud-init's EC2 datasource calls util.maybe_b64decode on the raw user-data
@@ -1056,6 +1217,17 @@ resource "aws_ssm_parameter" "runner_user_data" {
   tags = {
     Name = "github-runner-user-data"
   }
+
+  # This user data claims a registration row before it starts the runner
+  # service. The webhook Lambda reads this parameter fresh on every launch, so
+  # a launch between this write and the grant would boot a claiming bootstrap
+  # with no PutItem permission: it fails closed and deregisters, at the cost of
+  # a metal spot box-hour and a delayed job. The parameter therefore lands
+  # after the table and the grant, not merely before the webhook that reads it.
+  depends_on = [
+    aws_dynamodb_table.runner_registration,
+    aws_iam_role_policy.runner,
+  ]
 }
 
 # ============================================
@@ -1077,8 +1249,14 @@ data "archive_file" "runner_cleanup" {
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
+      dynamodb = boto3.client('dynamodb', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
+      REGION = 'us-west-1'
+      # The launcher tags every instance with the registration handshake its
+      # user data runs. Only this value has a DynamoDB row to read.
+      PROTOCOL_TAG = 'RunnerRegistrationProtocol'
+      REGISTRATION_PROTOCOL = 'ddb-v1'
       # Lease duration - busy runners get extended, idle runners expire
       LEASE_DURATION_MINUTES = 60
 
@@ -1255,7 +1433,6 @@ data "archive_file" "runner_cleanup" {
           try:
               resp = ssm.get_parameter(Name='/github-runner/pat', WithDecryption=True)
               pat = resp['Parameter']['Value']
-              print(f'SSM PAT value starts with: {pat[:10] if pat else "None"}...')
               if pat and pat != 'placeholder':
                   return pat
           except Exception as e:
@@ -1270,33 +1447,33 @@ data "archive_file" "runner_cleanup" {
       ROSTER_PAGE_LIMIT = 10
       ROSTER_PAGE_SIZE = 100
 
-      def get_runners(pat):
-          """The registered runners as {name: {id, busy, status}}, or None.
+      def read_roster_once(pat):
+          """One complete pass over the runner roster, or None if it was not one.
 
-          None means the roster could not be READ, and it is deliberately
-          distinct from {} ("GitHub answered, and nothing is registered").
-          Callers act on that difference: an unread roster is not evidence that
-          any runner is idle, and reading it as one is what terminated runners
-          mid-job under the soft cap during a GitHub outage (ejc3/aws#45).
-
-          Incomplete counts as unread, in four shapes. The call raises. The
+          Incomplete counts as unread, in these shapes. The call raises. The
           payload carries no runners array. The pages come back short of the
           total_count GitHub reports beside them - which reads exactly like
           "that runner is not registered", the same fail-open arriving through
           pagination instead of through an exception; per_page was already
           raised from the default 30 to 100 for that reason, and a bigger page
-          is not a completeness check. Or the answer holds something this
-          function cannot represent: a record without a usable name or id, or
-          a total_count that is missing or not an integer, which is a
-          completeness check that cannot run - a page-size heuristic on its
-          own accepts any short array as the whole roster. Such a record used
-          to be dropped and the rest kept,
-          but it still counted toward total_count, so the read passed as
+          is not a completeness check. total_count is missing, not an integer,
+          negative, or differs between pages, so the completeness check cannot
+          run or the roster moved under the read. The pages hold more records
+          than total_count. A record cannot be represented: no usable name, or
+          an id that is not a positive integer (a bool is an int in Python,
+          and neither True nor 0 is a runner id a DELETE URL can carry). Or an
+          identity repeats: offset pagination hands the same record out twice
+          when a registration moves across a page boundary mid-read, and the
+          runner it displaced is then absent from a read that still adds up.
+
+          A record that cannot be represented used to be dropped and the rest
+          kept, but it still counted toward total_count, so the read passed as
           complete and simply did not list that runner - and a roster that
           does not list a runner is what lease_verdict() reads as "never
           registered" for an instance without RunnerSeenAt.
           """
           roster = {}
+          seen_ids = set()
           collected = 0
           total = None
           try:
@@ -1314,12 +1491,20 @@ data "archive_file" "runner_cleanup" {
                       print('ROSTER UNREAD: the runners response carries no runners array')
                       return None
                   reported = data.get('total_count')
-                  if not isinstance(reported, int) or isinstance(reported, bool):
+                  if (not isinstance(reported, int) or isinstance(reported, bool)
+                          or reported < 0):
                       print(f'ROSTER UNREAD: total_count={reported!r} cannot be compared '
                             f'with the pages read')
                       return None
-                  total = reported
-                  collected += len(batch)
+                  if total is None:
+                      total = reported
+                  elif reported != total:
+                      print(f'ROSTER UNREAD: total_count changed from {total} to '
+                            f'{reported} between pages')
+                      return None
+                  if collected + len(batch) > total:
+                      print(f'ROSTER UNREAD: more records than total_count={total}')
+                      return None
                   # status is preserved as-absent when GitHub omits it: a missing
                   # status must never count as online, or a wedged busy runner
                   # with a flaky API response is renewed forever again.
@@ -1344,12 +1529,28 @@ data "archive_file" "runner_cleanup" {
                       if not isinstance(r, dict):
                           print(f'ROSTER UNREAD: a runner record is {type(r).__name__}, not an object')
                           return None
-                      if not isinstance(r.get('name'), str) or r.get('id') is None:
+                      name = r.get('name')
+                      runner_id = r.get('id')
+                      if (not isinstance(name, str) or not name.strip()
+                              or not isinstance(runner_id, int)
+                              or isinstance(runner_id, bool) or runner_id <= 0):
                           print(f'ROSTER UNREAD: a runner record has no usable name or id '
-                                f'(name={r.get("name")!r} id={r.get("id")!r})')
+                                f'(name={name!r} id={runner_id!r})')
                           return None
-                      roster[r['name']] = {'id': r['id'], 'busy': r.get('busy'),
-                                           'status': r.get('status')}
+                      if name in roster or runner_id in seen_ids:
+                          print(f'ROSTER UNREAD: a runner identity repeats '
+                                f'(name={name!r} id={runner_id!r})')
+                          return None
+                      seen_ids.add(runner_id)
+                      roster[name] = {'id': runner_id, 'busy': r.get('busy'),
+                                      'status': r.get('status')}
+                  collected += len(batch)
+                  # Reaching total_count ends the read. A roster of exactly
+                  # ROSTER_PAGE_LIMIT full pages otherwise fell out of the loop
+                  # into the else below and was reported unread, on a read that
+                  # had come back complete.
+                  if collected == total:
+                      break
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:
@@ -1364,7 +1565,73 @@ data "archive_file" "runner_cleanup" {
               return None
           return roster
 
-      def still_idle(runner_id, pat):
+      def get_runners(pat):
+          """The registered runners as {name: {id, busy, status}}, or None.
+
+          None means the roster could not be READ, and it is deliberately
+          distinct from {} ("GitHub answered, and nothing is registered").
+          Callers act on that difference: an unread roster is not evidence that
+          any runner is idle, and reading it as one is what terminated runners
+          mid-job under the soft cap during a GitHub outage (ejc3/aws#45).
+
+          Two complete passes, and they have to agree. One pass that adds up
+          to total_count with no repeated identity can still be wrong about
+          which runners it lists: a registration that moves across a page
+          boundary between two page requests shifts a different record off
+          the read, and nothing inside that pass can see it. A roster that
+          differs between two passes was changing while it was read, and a
+          read of a changing roster is not evidence of absence. Two GitHub
+          calls per poll in the steady state, against a five-minute schedule.
+          """
+          first = read_roster_once(pat)
+          if first is None:
+              return None
+          second = read_roster_once(pat)
+          if second is None:
+              return None
+          if first != second:
+              print('ROSTER UNREAD: the roster changed between two complete reads')
+              return None
+          return first
+
+      def exact_runner(runner_id, runner_name, pat):
+          """Read one runner by id and confirm it is the runner expected, or None.
+
+          GET /actions/runners/{id} answers for whichever registration holds
+          that id. The id is immutable for the life of a registration, but a
+          registration this Lambda read from a DynamoDB row or an earlier
+          roster can have been replaced since, so the answer counts only when
+          both id and name match what was asked for. None means not proven:
+          the call failed, the record is malformed, or it describes another
+          runner. Nothing is decided on None.
+
+          A 404 is folded into None with every other failure. GitHub returns
+          it both for a runner that no longer exists and for a PAT without
+          repo admin scope, and the two are not separable from here, so a
+          deregistered ddb-v1 runner holds until the ceiling instead of
+          expiring at its lease. That costs an idle instance for up to 12.5
+          hours; reading a 404 as EXPIRE would cost a working fleet on a
+          scope change.
+          """
+          if not pat:
+              return None
+          try:
+              record = github_get(
+                  pat, f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}')
+          except Exception as e:
+              print(f'Cannot read runner {runner_id}: {type(e).__name__}: {e}')
+              return None
+          returned_id = record.get('id') if isinstance(record, dict) else None
+          returned_name = record.get('name') if isinstance(record, dict) else None
+          if (not isinstance(returned_id, int) or isinstance(returned_id, bool)
+                  or returned_id != runner_id or returned_name != runner_name):
+              print(f'Runner {runner_id} is not {runner_name}: got id={returned_id!r} '
+                    f'name={returned_name!r}')
+              return None
+          return {'id': returned_id, 'busy': record.get('busy'),
+                  'status': record.get('status')}
+
+      def still_idle(runner_id, runner_name, pat):
           """Re-read ONE runner and confirm GitHub still says it holds no job.
 
           The busy flags this poll acts on were read at the top of the handler,
@@ -1378,12 +1645,8 @@ data "archive_file" "runner_cleanup" {
           so the caller drains instead of terminating, and the hard ceiling still
           bounds how long that can last.
           """
-          try:
-              record = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runners/{runner_id}')
-          except Exception as e:
-              print(f'Cannot re-read runner {runner_id} before terminating it: {type(e).__name__}: {e}')
-              return False
-          return record.get('busy') is False
+          record = exact_runner(runner_id, runner_name, pat)
+          return record is not None and record.get('busy') is False
 
       def deregister_runner(runner_id, pat):
           """Remove runner from GitHub by ID"""
@@ -1434,6 +1697,123 @@ data "archive_file" "runner_cleanup" {
               if tag['Key'] == key:
                   return tag['Value']
           return None
+
+      # The registration row for a ddb-v1 instance, read three ways. None is
+      # a consistent read that found no item: bootstrap has not claimed
+      # registration. A dict is a well-formed row, `registered` or `reaping`.
+      # REGISTRATION_UNREAD is everything else - the table could not be read,
+      # the configuration to address it is missing, or the row does not
+      # describe this instance - and nothing destructive is decided on it.
+      REGISTRATION_UNREAD = object()
+
+      def registration_arn(instance_id):
+          account_id = os.environ.get('RUNNER_ACCOUNT_ID', '')
+          if not account_id.isdigit() or len(account_id) != 12:
+              return None
+          return f'arn:aws:ec2:{REGION}:{account_id}:instance/{instance_id}'
+
+      def parse_registration(instance_id, item):
+          """Validate one registration row and return its typed identity."""
+          expected_arn = registration_arn(instance_id)
+          if not expected_arn or not isinstance(item, dict):
+              return REGISTRATION_UNREAD
+
+          def string_attr(name):
+              attr = item.get(name)
+              value = attr.get('S') if isinstance(attr, dict) else None
+              return value if isinstance(value, str) and value else None
+
+          if string_attr('InstanceArn') != expected_arn:
+              return REGISTRATION_UNREAD
+          if string_attr('InstanceId') != instance_id:
+              return REGISTRATION_UNREAD
+          state = string_attr('State')
+          if state == 'reaping':
+              if not string_attr('ReapingAt'):
+                  return REGISTRATION_UNREAD
+              return {'state': state, 'instance_arn': expected_arn}
+          if state != 'registered':
+              return REGISTRATION_UNREAD
+          runner_name = string_attr('RunnerName')
+          registered_at = string_attr('RegisteredAt')
+          runner_id_attr = item.get('RunnerId')
+          runner_id_text = (runner_id_attr.get('N')
+                            if isinstance(runner_id_attr, dict) else None)
+          try:
+              runner_id = int(runner_id_text)
+          except (TypeError, ValueError):
+              return REGISTRATION_UNREAD
+          if (runner_name != f'runner-{instance_id}' or not registered_at
+                  or runner_id <= 0 or str(runner_id) != runner_id_text):
+              return REGISTRATION_UNREAD
+          return {'state': state, 'instance_arn': expected_arn,
+                  'runner_name': runner_name, 'runner_id': runner_id}
+
+      def read_registration(instance_id):
+          """Consistent read of one row. None is proven absence; the sentinel is unknown."""
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          instance_arn = registration_arn(instance_id)
+          if not table or not instance_arn:
+              print(f'{instance_id}: REGISTRATION UNREAD: table or account id not configured')
+              return REGISTRATION_UNREAD
+          try:
+              response = dynamodb.get_item(
+                  TableName=table,
+                  Key={'InstanceArn': {'S': instance_arn}},
+                  ConsistentRead=True,
+              )
+          except Exception as e:
+              print(f'{instance_id}: REGISTRATION UNREAD: {type(e).__name__}: {e}')
+              return REGISTRATION_UNREAD
+          if not isinstance(response, dict):
+              print(f'{instance_id}: REGISTRATION UNREAD: GetItem returned '
+                    f'{type(response).__name__}')
+              return REGISTRATION_UNREAD
+          item = response.get('Item')
+          if item is None:
+              return None
+          parsed = parse_registration(instance_id, item)
+          if parsed is REGISTRATION_UNREAD:
+              print(f'{instance_id}: REGISTRATION UNREAD: row does not describe this instance')
+          return parsed
+
+      def claim_reaping(instance_id, now):
+          """Create the `reaping` row, so bootstrap can no longer create `registered`.
+
+          True only when this instance's row is `reaping` at the end of the
+          call. A ConditionalCheckFailedException means a row already exists,
+          and any other error means the outcome of the write is unknown; both
+          are resolved the same way, by a consistent read of what is actually
+          there. A `registered` row loses, and so does an unreadable table.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          instance_arn = registration_arn(instance_id)
+          if not table or not instance_arn:
+              return False
+          item = {
+              'InstanceArn': {'S': instance_arn},
+              'State': {'S': 'reaping'},
+              'InstanceId': {'S': instance_id},
+              'ReapingAt': {'S': now.isoformat()},
+          }
+          try:
+              dynamodb.put_item(
+                  TableName=table,
+                  Item=item,
+                  ConditionExpression='attribute_not_exists(InstanceArn)',
+              )
+              return True
+          except Exception as e:
+              code = getattr(e, 'response', {}).get('Error', {}).get('Code') \
+                  if isinstance(getattr(e, 'response', None), dict) else None
+              if code == 'ConditionalCheckFailedException':
+                  print(f'{instance_id}: reaping claim refused, a row already exists; reading it')
+              else:
+                  print(f'{instance_id}: reaping claim outcome unknown: '
+                        f'{type(e).__name__}: {e}; reading the row')
+          registration = read_registration(instance_id)
+          return (isinstance(registration, dict)
+                  and registration.get('state') == 'reaping')
 
       # A runner instance that has not left `pending` by now is a failed launch, not
       # a runner. AWS accepts run_instances for a metal spot instance it cannot place
@@ -1699,6 +2079,13 @@ data "archive_file" "runner_cleanup" {
       # timeout, which is not catchable, so a long scan would kill the whole poll
       # and launch NOTHING. A truncated scan under-counts demand, which the next
       # poll corrects; a dead poll corrects nothing.
+      #
+      # The 240s invocation is not all this scan's. The lease sweep ahead of it
+      # makes two full roster passes (up to ROSTER_PAGE_LIMIT pages each at a
+      # 10s timeout) plus one 5s by-id read per registered ddb-v1 instance and
+      # one more per lease expiry. At a pool of 8 that is about 40s of by-id
+      # reads. Raising the page limit or the pool size spends the same 240s, so
+      # check this budget against them.
       QUEUE_SCAN_TIME_BUDGET_SECONDS = 120
 
       def github_get(pat, url):
@@ -1775,28 +2162,10 @@ data "archive_file" "runner_cleanup" {
           return demand
 
       def handler(event, context):
-          pat = get_github_pat()
-          print(f'PAT available: {bool(pat)}')
-          # `roster is None` means the answer never arrived: the call failed, the
-          # payload was unusable, the read was short of GitHub's own total_count,
-          # a record in it could not be represented, or there was no PAT to ask
-          # with. It is NOT the same as an empty roster, and every decision
-          # below that ends an instance on roster evidence goes through
-          # lease_verdict() or observed_idle(), both of which can tell the two
-          # apart. (The stuck-job phase ends instances too, but on per-job
-          # evidence, and it reaps nothing when GitHub does not answer.)
-          # `runners` is the same thing flattened for the phases that only
-          # iterate it.
-          roster = get_runners(pat) if pat else None
-          if roster is None:
-              print('ROSTER UNREAD this poll: no lease may lapse on it, and the age '
-                    'ceiling is the only bound still in force')
-          else:
-              print(f'Found {len(roster)} runners from GitHub')
-          runners = roster if roster is not None else {}
           now = datetime.now(timezone.utc)
 
-          # Phase 1: the lifetime bound - the lease sweep and the age policy.
+          # Phase 1: the lifetime bound - the ceiling pass, then the lease sweep
+          # and the age policy.
           #
           # FIRST on purpose. Every other phase here is optional work that can
           # spend the 240-second budget: per-runner EC2 describes, GitHub DELETEs
@@ -1834,10 +2203,23 @@ data "archive_file" "runner_cleanup" {
           # never appear in `terminated`, and the poll must not read as a clean sweep.
           terminate_failed = []
 
+          # The ceiling pass. It walks the whole fleet reading nothing but
+          # InstanceId and LaunchTime and terminates every instance over the
+          # ceiling, before the PAT is read, before GitHub is asked anything
+          # and before any tag is written. age_policy() derives
+          # TERMINATE_CEILING from launch_time alone, so nothing here waits
+          # on an answer. Ordering the writes per instance was not enough: a
+          # CreateTags for a younger instance earlier in the response can
+          # stall for the rest of the budget (boto3 retries a 60s read
+          # timeout), so can the SSM read or a slow roster page, a Lambda
+          # timeout is not catchable, and an older instance later in the
+          # response then never reaches its check.
+          ceiling_instances = set()
+          ceiling_terminated = []
           for reservation in response['Reservations']:
               for instance in reservation['Instances']:
-                  # One unreadable record must cost that instance, not the sweep.
-                  # This loop is the only thing enforcing the fleet's absolute
+                  # One unreadable record must cost that instance, not the pass.
+                  # This is the only thing enforcing the fleet's absolute
                   # lifetime bound, and an exception raised part-way through it
                   # skips every instance AFTER the failing one - so a single
                   # malformed field could let an over-ceiling runner live forever,
@@ -1846,6 +2228,98 @@ data "archive_file" "runner_cleanup" {
                   # so it is named and skipped; the next poll retries it.
                   try:
                       instance_id = instance['InstanceId']
+                      launch_time = instance['LaunchTime']
+                      if age_policy(now, launch_time, {}) != TERMINATE_CEILING:
+                          continue
+                      # Whatever terminate() answers, the sweep below leaves this
+                      # instance alone: an instance over the ceiling gets no
+                      # optional write after EC2 has refused the required one.
+                      ceiling_instances.add(instance_id)
+                      if not terminate(instance_id, 'hard ceiling'):
+                          terminate_failed.append(instance_id)
+                          continue
+                      terminated.append(instance_id)
+                      over_age.append(instance_id)
+                      ceiling_terminated.append(
+                          (instance_id, (now - launch_time).total_seconds() / 3600))
+                  except Exception as e:
+                      broken = instance.get('InstanceId') if isinstance(instance, dict) else None
+                      print(f'UNREADABLE INSTANCE RECORD ({broken or "no InstanceId"}) in the '
+                            f'ceiling pass: {type(e).__name__}: {e}. Its age cannot be '
+                            f'computed, so there is no safe verdict and it is skipped - '
+                            f'this instance is NOT covered by the lifetime bound until its '
+                            f'record reads cleanly. Every other instance is still checked.')
+
+          # Every ceiling termination has been attempted. Only now is the PAT
+          # read and GitHub asked.
+          pat = get_github_pat()
+          print(f'PAT available: {bool(pat)}')
+          # `roster is None` means the answer never arrived: the call failed, the
+          # payload was unusable, the read was short of GitHub's own total_count,
+          # a record in it could not be represented, the roster changed between
+          # two reads, or there was no PAT to ask with. It is NOT the same as
+          # an empty roster, and every decision below that ends an instance on
+          # roster evidence goes through lease_verdict() or observed_idle(),
+          # both of which can tell the two apart. (The stuck-job phase ends
+          # instances too, but on per-job evidence, and it reaps nothing when
+          # GitHub does not answer.) `runners` is the same thing flattened for
+          # the phases that only iterate it.
+          roster = get_runners(pat) if pat else None
+          if roster is None:
+              print('ROSTER UNREAD this poll: no lease may lapse on the roster. A '
+                    'ddb-v1 instance with a registration row is still judged by its '
+                    'own by-id read; for everything else the age ceiling is the only '
+                    'bound still in force')
+          else:
+              print(f'Found {len(roster)} runners from GitHub')
+          runners = roster if roster is not None else {}
+
+          # Deregister the ceiling terminations and log what happened to each.
+          # Terminate ran BEFORE deregister on purpose. Deregistering first and
+          # then failing to terminate is the worst of both outcomes: GitHub
+          # documents that DELETE as forcing the runner out, which is how a job
+          # in flight dies, and the instance is still running afterwards. The
+          # next poll would then find no GitHub record for it, read it as
+          # unknown, drain it to the ceiling and finally report it as work we
+          # may have destroyed - all on our own doing.
+          ceiling_hours = MAX_INSTANCE_AGE_HOURS + DRAIN_GRACE_MINUTES / 60
+          for instance_id, age_hours in ceiling_terminated:
+              runner_info = runners.get(f'runner-{instance_id}', {})
+              if runner_info.get('id'):
+                  deregister_runner(runner_info['id'], pat)
+              if observed_idle(runner_info):
+                  print(f'Terminating over-age: {instance_id} (age={age_hours:.2f}h '
+                        f'>= ceiling {ceiling_hours:.2f}h, GitHub reports it idle)')
+              else:
+                  # LOUD on purpose. A running job just died here, and this
+                  # line is the only record that the loss was OURS. On GitHub
+                  # it renders exactly like an AWS spot reclaim, which cost a
+                  # night of misattributed reruns (ejc3/fcvm#884). Printed
+                  # after the terminate is accepted, so it never claims a job
+                  # is dead on a poll where the instance survived.
+                  hard_killed.append(instance_id)
+                  print(f'HARD-CEILING KILL: {instance_id} terminated at '
+                        f'age={age_hours:.2f}h (ceiling {ceiling_hours:.2f}h = '
+                        f'{MAX_INSTANCE_AGE_HOURS}h + {DRAIN_GRACE_MINUTES}m) without '
+                        f'ever being observed idle (github '
+                        f'busy={runner_info.get("busy")} '
+                        f'status={runner_info.get("status")}). Any job it was running '
+                        f'is now dead, and GitHub will report "The self-hosted runner '
+                        f'lost communication with the server" for it - that is THIS '
+                        f'termination, not an AWS spot reclaim.')
+
+          for reservation in response['Reservations']:
+              for instance in reservation['Instances']:
+                  # One unreadable record must cost that instance, not the sweep.
+                  # An exception raised part-way through this loop skips every
+                  # instance AFTER the failing one, so it is named and skipped
+                  # and the next poll retries it. The ceiling pass above has
+                  # already decided every instance it could read; the ones it
+                  # decided are not touched again here.
+                  try:
+                      instance_id = instance['InstanceId']
+                      if instance_id in ceiling_instances:
+                          continue
                       launch_time = instance['LaunchTime']
                       runner_name = f'runner-{instance_id}'
                       lease_expires_str = get_tag(instance, 'LeaseExpires')
@@ -1856,68 +2330,125 @@ data "archive_file" "runner_cleanup" {
                           continue
 
                       # Get runner status from GitHub
+                      protocol = get_tag(instance, PROTOCOL_TAG)
+                      registration = None
                       runner_info = runners.get(runner_name, {})
-                      # What that answer lets the lease phase do, and the one fact
-                      # a later poll cannot recover for itself: that some poll saw
-                      # this runner registered. Read from two places, because the
-                      # stamp is a write that can fail and a renewed lease is one
-                      # that already succeeded.
-                      registered_before = (get_tag(instance, SEEN_TAG) is not None
-                                           or lease_was_renewed(launch_time, lease_expires_str))
-                      verdict = lease_verdict(roster, runner_name, registered_before)
+                      if protocol == REGISTRATION_PROTOCOL:
+                          # This instance's bootstrap claims registration in
+                          # DynamoDB before it starts the runner service, so
+                          # the row is the registration evidence and the row's
+                          # runner id is what to ask GitHub about. A registered
+                          # row reads that one runner by id and checks the name
+                          # it comes back with, which no roster omission can
+                          # affect. No row, or a `reaping` row, is handled
+                          # below once the lease is parsed. Anything else about
+                          # the row is unread, and unread holds.
+                          registration = read_registration(instance_id)
+                          if (isinstance(registration, dict)
+                                  and registration['state'] == 'registered'):
+                              runner_info = exact_runner(registration['runner_id'],
+                                                         registration['runner_name'], pat) or {}
+                              verdict = lease_verdict(
+                                  {runner_name: runner_info} if runner_info else None,
+                                  runner_name, True)
+                          else:
+                              runner_info = {}
+                              verdict = HOLD
+                      else:
+                          # No protocol tag: launched before the handshake
+                          # existed. What the roster's answer lets the lease
+                          # phase do, and the one fact a later poll cannot
+                          # recover for itself: that some poll saw this runner
+                          # registered. Read from two places, because the stamp
+                          # is a write that can fail and a renewed lease is one
+                          # that already succeeded.
+                          registered_before = (get_tag(instance, SEEN_TAG) is not None
+                                               or lease_was_renewed(launch_time, lease_expires_str))
+                          verdict = lease_verdict(roster, runner_name, registered_before)
+
+                      # Parse the lease before the protocol branch below, which
+                      # acts only once the lease has expired.
+                      lease_expires = None
+                      if lease_expires_str:
+                          try:
+                              lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
+                          except Exception as e:
+                              print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
+                              lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
+
+                      # A ddb-v1 instance with no row has not registered, and a
+                      # box that booted and never joined cannot be holding a job
+                      # GitHub handed out. The lease is what reaps it, as it
+                      # always has: nothing else can see it, because it sits in
+                      # `running` where the stalled-launch phase (which walks
+                      # `pending`) does not look. What is new is the race with
+                      # a bootstrap that is about to register: cleanup first
+                      # creates the `reaping` row under the same condition
+                      # bootstrap needs, and terminates only once that row is
+                      # its. A `reaping` row from an earlier poll is a claim
+                      # already won and a terminate to retry.
+                      if protocol == REGISTRATION_PROTOCOL and (
+                              registration is None
+                              or (isinstance(registration, dict)
+                                  and registration['state'] == 'reaping')):
+                          if lease_expires is None or lease_expires > now:
+                              held.append(instance_id)
+                              print(f'{instance_id}: no registration row yet; holding '
+                                    f'until the lease at {lease_expires_str or "unset"}')
+                              continue
+                          # Absence of a row is proof of "never registered"
+                          # only while nothing contradicts it. Nothing in this
+                          # protocol deletes a row, so a row that is gone was
+                          # LOST (the table replaced, an item deleted), not
+                          # never written, and reaping on it terminates a
+                          # runner that may hold a job without deregistering
+                          # it. The evidence ejc3/aws#46 already collects says
+                          # which of the two it is: a roster listing this runner,
+                          # a RunnerSeenAt stamp, or a lease later than the
+                          # launcher's initial one all mean some poll saw it
+                          # registered. Hold on any of them and let the
+                          # ceiling bound the instance, as it bounds every
+                          # instance.
+                          registered_before = (
+                              get_tag(instance, SEEN_TAG) is not None
+                              or lease_was_renewed(launch_time, lease_expires_str))
+                          on_roster = roster is not None and runner_name in roster
+                          if registered_before or on_roster:
+                              held.append(instance_id)
+                              print(f'{instance_id}: REGISTRATION ROW MISSING for a runner '
+                                    f'that did register (roster lists it: {on_roster}, '
+                                    f'seen stamp or renewed lease: {registered_before}). '
+                                    f'Holding to the age ceiling rather than reaping it as '
+                                    f'never registered.')
+                              continue
+                          if registration is None and not claim_reaping(instance_id, now):
+                              held.append(instance_id)
+                              print(f'{instance_id}: bootstrap won the registration row, or '
+                                    f'the table could not be read; holding')
+                              continue
+                          minutes_until_expiry = (lease_expires - now).total_seconds() / 60
+                          if terminate(instance_id, 'never registered, lease expired'):
+                              print(f'Terminating never-registered: {instance_id} '
+                                    f'(lease expired {-minutes_until_expiry:.1f}m ago, '
+                                    f'reaping row claimed)')
+                              terminated.append(instance_id)
+                              expired.append(instance_id)
+                          else:
+                              terminate_failed.append(instance_id)
+                          continue
 
                       # Age policy: drain at MAX_INSTANCE_AGE_HOURS, hard ceiling
                       # DRAIN_GRACE_MINUTES later. Both are documented at those
                       # constants; age_policy() is the whole decision.
                       age_hours = (now - launch_time).total_seconds() / 3600
-                      ceiling_hours = MAX_INSTANCE_AGE_HOURS + DRAIN_GRACE_MINUTES / 60
                       action = age_policy(now, launch_time, runner_info)
 
-                      if action == TERMINATE_CEILING:
-                          # Terminate BEFORE deregistering, and log only what actually
-                          # happened. Deregistering first and then failing to terminate
-                          # is the worst of both outcomes: GitHub documents that DELETE
-                          # as forcing the runner out, which is how a job in flight
-                          # dies, and the instance is still running afterwards. The
-                          # next poll would then find no GitHub record for it, read it
-                          # as unknown, drain it to the ceiling and finally report it
-                          # as work we may have destroyed - all on our own doing.
-                          if not terminate(instance_id, 'hard ceiling'):
-                              terminate_failed.append(instance_id)
-                              continue
-                          if runner_info.get('id'):
-                              deregister_runner(runner_info['id'], pat)
-                          terminated.append(instance_id)
-                          over_age.append(instance_id)
-                          if observed_idle(runner_info):
-                              print(f'Terminating over-age: {instance_id} (age={age_hours:.2f}h '
-                                    f'>= ceiling {ceiling_hours:.2f}h, GitHub reports it idle)')
-                          else:
-                              # LOUD on purpose. A running job just died here, and this
-                              # line is the only record that the loss was OURS. On GitHub
-                              # it renders exactly like an AWS spot reclaim, which cost a
-                              # night of misattributed reruns (ejc3/fcvm#884). Printed
-                              # after the terminate is accepted, so it never claims a job
-                              # is dead on a poll where the instance survived.
-                              hard_killed.append(instance_id)
-                              print(f'HARD-CEILING KILL: {instance_id} terminated at '
-                                    f'age={age_hours:.2f}h (ceiling {ceiling_hours:.2f}h = '
-                                    f'{MAX_INSTANCE_AGE_HOURS}h + {DRAIN_GRACE_MINUTES}m) without '
-                                    f'ever being observed idle (github '
-                                    f'busy={runner_info.get("busy")} '
-                                    f'status={runner_info.get("status")}). Any job it was running '
-                                    f'is now dead, and GitHub will report "The self-hosted runner '
-                                    f'lost communication with the server" for it - that is THIS '
-                                    f'termination, not an AWS spot reclaim.')
-                          continue
-
-                      # Stamp the roster's answer only now. A CreateTags can stall
-                      # for the rest of the budget (boto3 retries a 60s read
-                      # timeout), a Lambda timeout is not catchable, and this
-                      # sweep is the only thing enforcing the lifetime bound, so
-                      # no write for an instance may run ahead of its ceiling
-                      # decision. A renewal below carries the same stamp; this
-                      # call covers every listed runner that is not renewed.
+                      # Stamp the roster's answer. Every write to EC2 sits after
+                      # the ceiling pass: a CreateTags can stall for the rest of
+                      # the budget (boto3 retries a 60s read timeout) and a
+                      # Lambda timeout is not catchable. A renewal below carries
+                      # the same stamp; this call covers every listed runner
+                      # that is not renewed.
                       if roster is not None and runner_name in roster:
                           mark_seen(instance_id, now)
 
@@ -1930,7 +2461,8 @@ data "archive_file" "runner_cleanup" {
                           # Confirmed against a FRESH read first, because the snapshot
                           # this decision came from is tens of seconds old by now and
                           # this path reports nothing as a possible loss.
-                          if runner_info.get('id') and not still_idle(runner_info['id'], pat):
+                          if (runner_info.get('id')
+                                  and not still_idle(runner_info['id'], runner_name, pat)):
                               print(f'Draining: {instance_id} (age={age_hours:.2f}h > '
                                     f'{MAX_INSTANCE_AGE_HOURS}h, idle in the poll snapshot but '
                                     f'not on re-read; leaving it alone)')
@@ -1989,32 +2521,60 @@ data "archive_file" "runner_cleanup" {
                                 f'at the age ceiling if the answer never comes back.')
                           continue
 
-                      # Parse lease expiry
-                      if lease_expires_str:
-                          try:
-                              lease_expires = datetime.fromisoformat(lease_expires_str.replace('Z', '+00:00'))
-                          except Exception as e:
-                              print(f'{instance_id}: failed to parse LeaseExpires={lease_expires_str}: {e}')
-                              lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                      else:
-                          # No lease tag - set one (legacy instance)
+                      if lease_expires is None:
+                          # No lease tag - set one (legacy instance). A runner
+                          # GitHub reports busy gets a real renewal, with the
+                          # seen stamp; anything else gets the initial lease
+                          # alone, which records nothing about registration.
                           print(f'{instance_id}: no lease tag, setting initial lease')
-                          lease_expires = now + timedelta(minutes=LEASE_DURATION_MINUTES)
-                          renew_lease(instance_id, now)
+                          if verdict == RENEW:
+                              new_expiry = renew_lease(instance_id, now, seen=True)
+                              if new_expiry is not None:
+                                  print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                                  renewed.append(instance_id)
+                              else:
+                                  held.append(instance_id)
+                                  print(f'{instance_id}: renewal failed; lease remains unset')
+                          elif renew_lease(instance_id, now) is None:
+                              held.append(instance_id)
                           continue
 
                       minutes_until_expiry = (lease_expires - now).total_seconds() / 60
 
                       if verdict == RENEW:
                           # Runner is working - RENEW the lease, and carry the seen
-                          # stamp in the same write.
+                          # stamp in the same write. Reported as renewed only when
+                          # EC2 accepted the write: a rejected CreateTags leaves
+                          # the lease where it was, and the poll must say so.
                           new_expiry = renew_lease(instance_id, now, seen=True)
-                          print(f'{instance_id}: busy, renewed lease until {new_expiry}')
-                          renewed.append(instance_id)
+                          if new_expiry is not None:
+                              print(f'{instance_id}: busy, renewed lease until {new_expiry}')
+                              renewed.append(instance_id)
+                          else:
+                              held.append(instance_id)
+                              print(f'{instance_id}: renewal failed; lease remains '
+                                    f'{lease_expires_str}')
                           continue
 
                       # Runner is idle - check if lease expired
                       if lease_expires <= now:
+                          # The record this verdict came from was read at the top
+                          # of the poll, and GitHub hands out jobs the whole time.
+                          # Before the lease ends the instance, re-read that one
+                          # runner by id and require the same verdict of the
+                          # fresh answer. An instance the roster never listed has
+                          # no id to re-read; the two roster passes are its
+                          # evidence.
+                          if runner_info.get('id'):
+                              fresh = exact_runner(runner_info['id'], runner_name, pat)
+                              fresh_verdict = lease_verdict(
+                                  {runner_name: fresh} if fresh else None, runner_name, True)
+                              if fresh_verdict != EXPIRE:
+                                  held.append(instance_id)
+                                  print(f'{instance_id}: lease expired, but the runner did '
+                                        f'not read as idle on a fresh read; holding')
+                                  continue
+                              runner_info = fresh
                           if terminate(instance_id, 'lease expired'):
                               if runner_info.get('id'):
                                   deregister_runner(runner_info['id'], pat)
@@ -2225,8 +2785,12 @@ resource "aws_lambda_function" "runner_cleanup" {
 
   environment {
     variables = {
-      WEBHOOK_FUNCTION = var.enable_github_runner ? aws_lambda_function.runner_webhook[0].function_name : ""
-      MAX_RUNNERS      = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
+      # The webhook function's name as a literal: the webhook now depends on
+      # this function (see its depends_on), so this one cannot reference it.
+      WEBHOOK_FUNCTION   = "github-runner-webhook"
+      MAX_RUNNERS        = tostring(local.runner_max_per_arch) # Bounds the queue scan and per-poll launches
+      REGISTRATION_TABLE = aws_dynamodb_table.runner_registration[0].name
+      RUNNER_ACCOUNT_ID  = data.aws_caller_identity.current.account_id
     }
   }
 
