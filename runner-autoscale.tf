@@ -1128,7 +1128,10 @@ if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
     '.accountId | select(type == "string" and test("^[0-9]{12}$"))')
   IDENTITY_REGION=$(printf '%s' "$IDENTITY_DOCUMENT" | jq -er \
     '.region | select(type == "string" and length > 0)')
-  [ "$IDENTITY_REGION" = "$REGION" ]
+  if [ "$IDENTITY_REGION" != "$REGION" ]; then
+    echo "FATAL: instance identity region $IDENTITY_REGION does not match $REGION; refusing to register this runner"
+    exit 1
+  fi
   INSTANCE_ARN="arn:aws:ec2:$REGION:$ACCOUNT_ID:instance/$INSTANCE_ID"
   REGISTRATION_TABLE="${local.runner_registration_table_name}"
   REGISTERED_AT=$(date --utc +%Y-%m-%dT%H:%M:%S.%NZ)

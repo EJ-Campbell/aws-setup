@@ -2070,14 +2070,22 @@ def case_a_registered_row_whose_lookup_names_another_runner_holds():
 def case_a_malformed_registration_row_holds():
     """A row that does not describe this instance decides nothing."""
     rows = []
-    bad_id = registered_item(); bad_id["RunnerId"] = {"N": "not-an-integer"}; rows.append(bad_id)
-    bad_name = registered_item(runner_name="runner-i-other"); rows.append(bad_name)
-    bad_state = registered_item(); bad_state["State"] = {"S": "pending"}; rows.append(bad_state)
-    other = registered_item("i-other"); other["InstanceArn"] = {"S": instance_arn("i-lease")}
+    bad_id = registered_item()
+    bad_id["RunnerId"] = {"N": "not-an-integer"}
+    rows.append(bad_id)
+    bad_name = registered_item(runner_name="runner-i-other")
+    rows.append(bad_name)
+    bad_state = registered_item()
+    bad_state["State"] = {"S": "pending"}
+    rows.append(bad_state)
+    other = registered_item("i-other")
+    other["InstanceArn"] = {"S": instance_arn("i-lease")}
     rows.append(other)
     # A `reaping` row is a claim, and a claim with no ReapingAt is not one this
     # Lambda can show it made. Read as a claim, it terminates the instance.
-    undated = reaping_item(); del undated["ReapingAt"]; rows.append(undated)
+    undated = reaping_item()
+    del undated["ReapingAt"]
+    rows.append(undated)
     for row in rows:
         dynamodb = FakeDynamoDB([row])
         result, ec2, _, _ = lease_poll(

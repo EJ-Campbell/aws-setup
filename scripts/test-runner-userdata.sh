@@ -138,6 +138,17 @@ gate_precedes_registration() {  # label, message
 gate_precedes_registration "IPv6 gate"  "no global IPv6 on"
 gate_precedes_registration "NVMe gate"  "no instance-store NVMe on this instance type"
 
+# A bare bracket test at statement level is a SILENT gate: under `set -e` it exits
+# 1 and writes nothing, and the console is the only diagnostic channel a metal
+# instance has. Every refusal must name itself first. This checks the shape, not
+# one message, so a new silent gate is caught wherever it is added.
+SILENT_GATES=$(grep -nE '^[[:space:]]*\[[[:space:]].*\][[:space:]]*$' "$USERDATA" || true)
+if [ -z "$SILENT_GATES" ]; then
+    ok "no bare bracket test stands alone as a gate"
+else
+    bad "silent gate(s) exit without a FATAL line: $(printf '%s' "$SILENT_GATES" | tr '\n' ' ')"
+fi
+
 # --- 5. Registration provenance must be persisted before the service can take
 #        work. Successful config reads the runner id GitHub assigned, atomically
 #        claims this instance ARN in DynamoDB, and only then starts the service.
