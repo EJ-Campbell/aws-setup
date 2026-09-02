@@ -116,11 +116,13 @@ data "archive_file" "runner_webhook" {
           pool that was already full. GitHub reports total_count beside the page,
           so short is detectable rather than silently partial.
 
-          A record with no name is skipped rather than raising. The set
-          comprehension used to sit outside the try, so one malformed entry took
-          KeyError out of get_capacity and out of the handler, and nothing was
-          launched - and GitHub delivers a workflow_job event once, without
-          redelivery.
+          A record with no usable name or status makes the answer unknown, and
+          does so inside the try. The set comprehension that read r['name']
+          used to sit outside it, so one malformed entry took KeyError out of
+          get_capacity and out of the handler, and nothing was launched - and
+          GitHub delivers a workflow_job event once, without redelivery. It was
+          then skipped instead, which took the runner it described out of the
+          count.
           """
           pat = get_github_pat()
           if not pat:
@@ -136,11 +138,29 @@ data "archive_file" "runner_webhook" {
                   if not isinstance(batch, list):
                       print('Runner list carries no runners array; runner health is unknown')
                       return None
-                  if data.get('total_count') is not None:
-                      total = data['total_count']
+                  reported = data.get('total_count')
+                  if reported is not None:
+                      if not isinstance(reported, int) or isinstance(reported, bool):
+                          print(f'Runner list reports total_count={reported!r}, which cannot be '
+                                f'compared with the pages read; runner health is unknown')
+                          return None
+                      total = reported
                   collected += len(batch)
-                  names.update(r['name'] for r in batch
-                               if isinstance(r.get('name'), str) and r.get('status') == 'online')
+                  # A record without a usable name or status makes the whole answer
+                  # unknown. Skipped, it is an online runner the cap cannot see: a
+                  # full pool of four reads as three, `counted` falls below the cap,
+                  # and metal is launched into it - the expensive mistake
+                  # get_capacity() is written to fail away from. A missing status is
+                  # not "offline" for the same reason; it is a field GitHub did not
+                  # send. Unknown health degrades to the instance count.
+                  for r in batch:
+                      if (not isinstance(r, dict) or not isinstance(r.get('name'), str)
+                              or not isinstance(r.get('status'), str)):
+                          print('Runner list has a record with no usable name or status; '
+                                'runner health is unknown')
+                          return None
+                      if r['status'] == 'online':
+                          names.add(r['name'])
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:
@@ -149,7 +169,7 @@ data "archive_file" "runner_webhook" {
           except Exception as e:
               print(f'Failed to list GitHub runners: {e}')
               return None
-          if isinstance(total, int) and collected < total:
+          if total is not None and collected < total:
               print(f'Runner list came back with {collected} of the {total} GitHub reports; '
                     f'runner health is unknown')
               return None
@@ -1258,13 +1278,20 @@ data "archive_file" "runner_cleanup" {
           any runner is idle, and reading it as one is what terminated runners
           mid-job under the soft cap during a GitHub outage (ejc3/aws#45).
 
-          Incomplete counts as unread, in three shapes. The call raises. The
-          payload carries no runners array. Or the pages come back short of the
+          Incomplete counts as unread, in four shapes. The call raises. The
+          payload carries no runners array. The pages come back short of the
           total_count GitHub reports beside them - which reads exactly like
           "that runner is not registered", the same fail-open arriving through
-          pagination instead of through an exception. per_page was already
+          pagination instead of through an exception; per_page was already
           raised from the default 30 to 100 for that reason, and a bigger page
-          is not a completeness check.
+          is not a completeness check. Or the answer holds something this
+          function cannot represent: a record without a usable name or id, or
+          a total_count that is not an integer, which is a completeness check
+          that cannot run. Such a record used to be dropped and the rest kept,
+          but it still counted toward total_count, so the read passed as
+          complete and simply did not list that runner - and a roster that
+          does not list a runner is what lease_verdict() reads as "never
+          registered" for an instance without RunnerSeenAt.
           """
           roster = {}
           collected = 0
@@ -1283,31 +1310,44 @@ data "archive_file" "runner_cleanup" {
                   if not isinstance(batch, list):
                       print('ROSTER UNREAD: the runners response carries no runners array')
                       return None
-                  if data.get('total_count') is not None:
-                      total = data['total_count']
+                  reported = data.get('total_count')
+                  if reported is not None:
+                      if not isinstance(reported, int) or isinstance(reported, bool):
+                          print(f'ROSTER UNREAD: total_count={reported!r} cannot be compared '
+                                f'with the pages read')
+                          return None
+                      total = reported
                   collected += len(batch)
-                  # status is preserved as-absent when GitHub omits it (fail CLOSED:
-                  # a missing status must never count as online, or a wedged busy
-                  # runner with a flaky API response is renewed forever again).
+                  # status is preserved as-absent when GitHub omits it: a missing
+                  # status must never count as online, or a wedged busy runner
+                  # with a flaky API response is renewed forever again.
+                  # lease_verdict() holds on it rather than expiring.
                   #
-                  # A record without a usable name or id is dropped here rather than
-                  # carried into the phases below.
+                  # A record without a usable name or id makes the WHOLE roster
+                  # unread. It used to be dropped and the rest kept, but a
+                  # dropped record still counted toward total_count, so the read
+                  # passed the completeness check and simply did not list that
+                  # runner. lease_verdict() reads a readable roster that omits a
+                  # runner as "never registered" for any instance without
+                  # RunnerSeenAt - every instance on the first poll after that
+                  # tag ships - and an expired lease then terminates a working
+                  # runner on a field GitHub did not send. Unread holds every
+                  # lease instead, and the age ceiling remains the bound.
                   #
-                  # Name: the orphan phase calls .startswith() on every key, so one
-                  # entry whose name is not a string raises out of the entire poll
-                  # and nothing is reaped that invocation. A runner we cannot name
-                  # is one we cannot match to an instance anyway.
-                  #
-                  # Id: every action taken on a runner needs it. Without one the
-                  # orphan phase would format None into a DELETE URL, and the idle
-                  # path would terminate on a snapshot it cannot re-confirm, because
-                  # the fresh re-read is keyed on the id. Dropping the record makes
-                  # the instance simply unknown, which drains and dies at the
-                  # ceiling: the safe verdict for evidence that cannot be acted on.
+                  # Name: the orphan phase calls .startswith() on every key, and
+                  # a nameless record could be any instance's. Id: every action
+                  # taken on a runner needs it - the orphan phase's DELETE URL,
+                  # the idle path's fresh re-read.
                   for r in batch:
-                      if isinstance(r.get('name'), str) and r.get('id') is not None:
-                          roster[r['name']] = {'id': r['id'], 'busy': r.get('busy'),
-                                               'status': r.get('status')}
+                      if not isinstance(r, dict):
+                          print(f'ROSTER UNREAD: a runner record is {type(r).__name__}, not an object')
+                          return None
+                      if not isinstance(r.get('name'), str) or r.get('id') is None:
+                          print(f'ROSTER UNREAD: a runner record has no usable name or id '
+                                f'(name={r.get("name")!r} id={r.get("id")!r})')
+                          return None
+                      roster[r['name']] = {'id': r['id'], 'busy': r.get('busy'),
+                                           'status': r.get('status')}
                   if len(batch) < ROSTER_PAGE_SIZE:
                       break
               else:
@@ -1316,7 +1356,7 @@ data "archive_file" "runner_cleanup" {
           except Exception as e:
               print(f'ROSTER UNREAD: {type(e).__name__}: {e}')
               return None
-          if isinstance(total, int) and collected < total:
+          if total is not None and collected < total:
               print(f'ROSTER UNREAD: read {collected} of the {total} registrations '
                     f'GitHub reports')
               return None
@@ -1563,11 +1603,14 @@ data "archive_file" "runner_cleanup" {
           longer than the remaining lease reaped runners that were executing
           jobs, up to 60 minutes in, while still under the soft cap.
 
-          The `status == 'online'` qualifier on a busy record is kept unchanged:
-          a host that wedges mid-job reports busy=true and goes offline, and
-          renewing on that made it immortal (ejc3/fcvm#871). Busy-but-offline
-          therefore still lets the lease lapse. That is GitHub telling us
-          something about the runner, not failing to.
+          The `status == 'online'` qualifier on a busy record is kept: a host
+          that wedges mid-job reports busy=true and goes offline, and renewing
+          on that made it immortal (ejc3/fcvm#871). Busy with an explicit
+          `offline` therefore still lets the lease lapse. That is GitHub
+          telling us something about the runner, not failing to. Busy with no
+          status, or one GitHub does not document, is the other kind, and is
+          held: nothing is renewed, so the ceiling still bounds a wedge, and
+          nothing expires on a field that did not arrive.
           """
           if roster is None:
               return HOLD
@@ -1582,7 +1625,12 @@ data "archive_file" "runner_cleanup" {
               return HOLD if seen_before else EXPIRE
           busy = record.get('busy')
           if busy is True:
-              return RENEW if record.get('status') == 'online' else EXPIRE
+              status = record.get('status')
+              if status == 'online':
+                  return RENEW
+              if status == 'offline':
+                  return EXPIRE
+              return HOLD
           if busy is False:
               return EXPIRE
           # A record with no usable busy flag. `.get('busy', False)` used to read
@@ -1691,13 +1739,14 @@ data "archive_file" "runner_cleanup" {
           print(f'PAT available: {bool(pat)}')
           # `roster is None` means the answer never arrived: the call failed, the
           # payload was unusable, the read was short of GitHub's own total_count,
-          # or there was no PAT to ask with. It is NOT the same as an empty
-          # roster, and every decision below that ends an instance on roster
-          # evidence goes through lease_verdict() or observed_idle(), both of
-          # which can tell the two apart. (The stuck-job phase ends instances
-          # too, but on per-job evidence, and it reaps nothing when GitHub does
-          # not answer.) `runners` is the same thing flattened for the phases
-          # that only iterate it.
+          # a record in it could not be represented, or there was no PAT to ask
+          # with. It is NOT the same as an empty roster, and every decision
+          # below that ends an instance on roster evidence goes through
+          # lease_verdict() or observed_idle(), both of which can tell the two
+          # apart. (The stuck-job phase ends instances too, but on per-job
+          # evidence, and it reaps nothing when GitHub does not answer.)
+          # `runners` is the same thing flattened for the phases that only
+          # iterate it.
           roster = get_runners(pat) if pat else None
           if roster is None:
               print('ROSTER UNREAD this poll: no lease may lapse on it, and the age '

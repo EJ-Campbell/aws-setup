@@ -1527,6 +1527,103 @@ def case_a_held_runner_is_still_terminated_at_the_ceiling():
     assert "HARD-CEILING KILL" in out, out
 
 
+def case_a_listed_runner_with_no_id_holds_its_lease():
+    """A record GitHub sent for THIS runner, minus its id, is not absence.
+
+    get_runners() dropped any record without a usable name or id and still
+    counted it toward total_count, so the read passed the completeness check
+    and simply did not list the runner. For an instance without RunnerSeenAt,
+    which is every instance on the first poll after that tag ships, that is
+    the never-registered EXPIRE verdict, and an expired lease terminates it:
+    a working runner destroyed on a field GitHub did not send. The roster is
+    unread instead, the lease is held, and the ceiling stays the bound.
+    """
+    result, ec2, _, out = lease_poll(
+        runners=[{"id": None, "name": "runner-i-lease", "busy": True, "status": "online"}])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert terminated_ids(ec2) == [], terminated_ids(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert result["expired"] == [], result
+    assert "ROSTER UNREAD" in out, out
+
+
+def case_a_nameless_runner_record_makes_the_roster_unread():
+    """A record with no name could be any instance's, so no runner is absent for sure.
+
+    Dropping it and keeping the rest is a roster that omits one runner without
+    saying which. Every instance without RunnerSeenAt then reads as never
+    registered, and the one whose lease has lapsed is terminated.
+    """
+    result, ec2, _, out = lease_poll(
+        runners=[{"id": 5, "name": None, "busy": True, "status": "online"},
+                 runner_record("i-other")])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert "ROSTER UNREAD" in out, out
+
+
+def case_a_malformed_roster_does_not_suppress_the_ceiling():
+    """Unread on a bad record must not become a way past 13h30m.
+
+    The same shape as case_a_held_runner_is_still_terminated_at_the_ceiling,
+    with the roster unread for a record it cannot represent rather than for
+    an exception. The ROSTER UNREAD line is asserted so this case is known to
+    have taken that path and not a readable roster.
+    """
+    result, ec2, _, out = age_poll(
+        HARD_CEILING_MINUTES + 5,
+        runners=[{"id": None, "name": "runner-i-aged", "busy": True, "status": "online"}])
+    assert "ROSTER UNREAD" in out, out
+    assert terminated_ids(ec2) == ["i-aged"], terminated_ids(ec2)
+    assert still_running(ec2) == [], still_running(ec2)
+    assert result["hard_killed"] == ["i-aged"], result
+    assert result["held"] == [], result
+    assert "HARD-CEILING KILL" in out, out
+
+
+def case_a_busy_record_with_no_status_holds_its_lease():
+    """busy=true with no status is a missing field, not the wedged host.
+
+    The online qualifier on a busy record exists for a host that wedges
+    mid-job: it keeps its job, reports busy=true and goes OFFLINE, and
+    renewing on that made it immortal (ejc3/fcvm#871). A record with no
+    status at all took that same EXPIRE path, so a working runner whose
+    record arrived without the field was terminated at its lease. Held
+    instead: not renewed, so the ceiling still bounds a wedge, and not
+    expired on a field GitHub did not send.
+    """
+    result, ec2, _, _ = lease_poll(
+        runners=[{"id": 5, "name": "runner-i-lease", "busy": True}])
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert result["renewed"] == [], result
+    lease_writes = [kw for kw in ec2.ops("create_tags")
+                    if any(t["Key"] == "LeaseExpires" for t in kw["Tags"])]
+    assert lease_writes == [], lease_writes
+
+
+def case_a_busy_but_offline_runner_still_expires():
+    """The wedged host of ejc3/fcvm#871: an explicit offline still lets the lease lapse."""
+    result, ec2, _, _ = lease_poll(
+        runners=[runner_record("i-lease", busy=True, status="offline")])
+    assert terminated_ids(ec2) == ["i-lease"], terminated_ids(ec2)
+    assert result["expired"] == ["i-lease"], result
+    assert result["held"] == [], result
+
+
+def case_an_unreadable_total_count_makes_the_roster_unread():
+    """A total_count the completeness check cannot compare must block, not pass.
+
+    The check was `isinstance(total, int) and collected < total`, so a
+    total_count GitHub sent as anything but an integer skipped the comparison
+    and the read was accepted as complete on the page-size heuristic alone.
+    """
+    result, ec2, _, out = lease_poll(runners=[runner_record("i-other")], runners_total="7")
+    assert still_running(ec2) == ["i-lease"], still_running(ec2)
+    assert result["held"] == ["i-lease"], result
+    assert "ROSTER UNREAD" in out, out
+
+
 def case_a_truncated_runner_list_degrades_to_the_instance_count():
     """The webhook Lambda, same defect class: a short page is not four dead runners.
 
@@ -1552,10 +1649,12 @@ def case_a_truncated_runner_list_degrades_to_the_instance_count():
 def case_a_nameless_runner_record_cannot_stop_a_launch():
     """One malformed record must not take scale-up down with it.
 
-    The set comprehension that reads r['name'] sits outside the try in
+    The set comprehension that read r['name'] sat outside the try in
     get_online_runner_names, so a record without a name raised KeyError out of
     get_capacity and out of the handler. GitHub delivers a workflow_job event
     once and never redelivers it, so the queued job waits for the next poll.
+    The record now makes runner health unknown, which degrades the cap to the
+    instance count: one instance of four, so the launch still goes ahead.
     """
     ec2 = FakeEC2([instance("i-live", "c5d.metal", "running", 60)])
     github = FakeGitHub(runners=[{"id": 1, "status": "online", "busy": False}])
@@ -1566,6 +1665,57 @@ def case_a_nameless_runner_record_cannot_stop_a_launch():
     result = webhook(ec2, github=github)["handler"](event, None)
     assert len(launched_types(ec2)) == 1, launched_types(ec2)
     assert result["body"].startswith("Launched 1 x86_64 runner"), result
+
+def webhook_capacity_poll(roster, live=4, runners_total=None):
+    """One queued x86 event against `live` running instances and this roster."""
+    ec2 = FakeEC2([instance(f"i-live{n}", "c5d.metal", "running", 60) for n in range(live)])
+    event = {"body": json.dumps({
+        "action": "queued",
+        "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
+    })}
+    github = FakeGitHub(runners=roster, runners_total=runners_total)
+    result = webhook(ec2, github=github)["handler"](event, None)
+    return result, ec2
+
+
+def full_x86_roster(first):
+    """Four online runners for the four instances webhook_capacity_poll() creates,
+    with the first record replaced by `first`."""
+    return [first] + [{"id": n, "name": f"runner-i-live{n}", "status": "online", "busy": True}
+                      for n in range(1, 4)]
+
+
+def case_a_nameless_runner_record_degrades_the_webhook_to_the_instance_count():
+    """A record with no name is an online runner the cap cannot see.
+
+    Skipping it kept the launcher up (the case above) and quietly took one
+    runner out of `counted`: a full pool of four read as three online and the
+    launcher added metal to it. Unknown health already has a defined answer
+    here, the instance count, and a roster holding a record it cannot place
+    is unknown health.
+    """
+    result, ec2 = webhook_capacity_poll(full_x86_roster({"id": 0, "status": "online", "busy": True}))
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_a_record_with_no_status_degrades_the_webhook_to_the_instance_count():
+    """A record with no status is not offline; it is a field GitHub did not send.
+
+    Read as offline it under-counts the pool by one, which is the expensive
+    mistake this Lambda is documented to fail away from.
+    """
+    result, ec2 = webhook_capacity_poll(full_x86_roster({"id": 0, "name": "runner-i-live0", "busy": True}))
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
+
+
+def case_an_unreadable_total_count_degrades_the_webhook_to_the_instance_count():
+    """The webhook's completeness check, disabled by a non-integer total_count."""
+    roster = full_x86_roster({"id": 0, "name": "runner-i-live0", "status": "online", "busy": True})
+    result, ec2 = webhook_capacity_poll(roster[:1], runners_total="4")
+    assert launched_types(ec2) == [], launched_types(ec2)
+    assert result["body"] == "Max x86_64 runners (4) reached", result
 
 
 def poll(github, env=None):

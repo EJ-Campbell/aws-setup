@@ -107,7 +107,11 @@ A second ceiling, `MAX_RUNNERS + LAUNCH_HEADROOM (2)` **instances** per architec
 regardless of health, caps the blast radius if the health signal is ever wrong in the
 "nothing is healthy" direction. If GitHub cannot be reached the Lambda **degrades to the
 plain instance count**: over-counting only delays CI and self-heals next poll, while
-under-counting launches metal spot instances on data it could not verify.
+under-counting launches metal spot instances on data it could not verify. A roster it
+cannot fully read is the same case: a page short of `total_count`, a `total_count` that is
+not an integer, or a record without a usable `name` or `status`. Skipping such a record
+kept the launcher up and quietly took one online runner out of the count, so a full pool
+read as one short and metal was launched into it.
 
 **Scale-up is observable.** Every decision prints one CloudWatch Embedded Metric Format
 line (`event: runner_scale_decision`) carrying `QueuedJobs`, `HealthyRunners`,
@@ -195,11 +199,13 @@ whose scheduler is the thing that failed.
 **A lease moves only on an answer.** The lease phase reads GitHub's runner roster and takes
 one of three verdicts per instance. `RENEW` when GitHub reports the runner online and busy.
 `EXPIRE` when GitHub answered with something that cannot mean "working" — `busy=false`, or
-`busy=true` with the runner offline (that is the wedged host below), or no record at all for
-an instance no poll has ever seen registered. `HOLD` for everything else: the roster could
-not be read, or it could be read and omits a runner that some earlier poll did see. A held
-lease is not renewed and not allowed to expire into a termination, so the instance keeps
-whatever expiry it already had and the age ceiling remains the bound on it.
+`busy=true` with the runner explicitly `offline` (that is the wedged host below), or no
+record at all for an instance no poll has ever seen registered. `HOLD` for everything else:
+the roster could not be read, or it could be read and omits a runner that some earlier poll
+did see, or the record is `busy=true` with no `status` at all, which is a field GitHub did
+not send rather than the wedged host. A held lease is not renewed and not allowed to expire
+into a termination, so the instance keeps whatever expiry it already had and the age
+ceiling remains the bound on it.
 
 The distinction is the whole point (`ejc3/aws#45`). A missing runner record used to read as
 `busy=false`, which is survivable for one blip — the lease gives 60 minutes of grace — and
@@ -210,9 +216,15 @@ self-hosted runner lost communication with the server", indistinguishable from a
 reclaim, which is the same misattributed failure `ejc3/fcvm#884` cost a night of reruns to.
 
 A read counts as unread unless it is **complete**: the call has to succeed, the payload has
-to carry a `runners` array, and the pages collected have to reach the `total_count` GitHub
-reports beside them. A short page reads exactly like "that runner is not registered", so
-truncation is the same fail-open arriving through pagination.
+to carry a `runners` array, the pages collected have to reach the `total_count` GitHub
+reports beside them, that `total_count` has to be an integer the check can compare, and
+every record has to carry a usable `name` and `id`. A short page reads exactly like "that
+runner is not registered", so truncation is the same fail-open arriving through pagination.
+A record that cannot be represented is not dropped, for the same reason: dropped, it still
+counted toward `total_count`, so the read passed as complete and simply did not list that
+runner, which is the never-registered `EXPIRE` for any instance without `RunnerSeenAt` (every
+instance, on the first poll after that tag ships). One such record makes the whole roster
+unread.
 
 `RunnerSeenAt` is stamped on an instance on every poll whose roster listed its runner. It
 separates "GitHub answered and does not list this runner" (ambiguous: a real deregistration
@@ -225,8 +237,8 @@ unobserved, so a blip and a three-hour outage are different lines rather than th
 repeated.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
-only while GitHub explicitly reports it `online` (a missing `status` fails closed to
-not-busy), and no instance outlives the hard ceiling below. Both exist because `busy` means
+only while GitHub explicitly reports it `online` (a missing `status` renews nothing; the
+lease is held), and no instance outlives the hard ceiling below. Both exist because `busy` means
 "holds a job", not "makes progress": on 2026-08-07 two ARM runners wedged with ~490 leaked
 `firecracker` processes and load averages of 389 and 523 (disk was fine at 46%/67%). They
 kept their assigned jobs, so GitHub kept reporting `busy=true`, so the lease was renewed
