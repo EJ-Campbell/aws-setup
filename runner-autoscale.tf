@@ -114,7 +114,9 @@ data "archive_file" "runner_webhook" {
           the whole roster, so an online runner past the page boundary counted as
           absent, `counted` fell below the cap and the launcher added metal to a
           pool that was already full. GitHub reports total_count beside the page,
-          so short is detectable rather than silently partial.
+          so short is detectable rather than silently partial - and a page that
+          omits it, or carries it in a shape that cannot be compared, is a read
+          whose completeness cannot be checked at all, which is unknown too.
 
           A record with no usable name or status makes the answer unknown, and
           does so inside the try. The set comprehension that read r['name']
@@ -139,12 +141,11 @@ data "archive_file" "runner_webhook" {
                       print('Runner list carries no runners array; runner health is unknown')
                       return None
                   reported = data.get('total_count')
-                  if reported is not None:
-                      if not isinstance(reported, int) or isinstance(reported, bool):
-                          print(f'Runner list reports total_count={reported!r}, which cannot be '
-                                f'compared with the pages read; runner health is unknown')
-                          return None
-                      total = reported
+                  if not isinstance(reported, int) or isinstance(reported, bool):
+                      print(f'Runner list reports total_count={reported!r}, which cannot be '
+                            f'compared with the pages read; runner health is unknown')
+                      return None
+                  total = reported
                   collected += len(batch)
                   # A record without a usable name or status makes the whole answer
                   # unknown. Skipped, it is an online runner the cap cannot see: a
@@ -169,7 +170,7 @@ data "archive_file" "runner_webhook" {
           except Exception as e:
               print(f'Failed to list GitHub runners: {e}')
               return None
-          if total is not None and collected < total:
+          if total is None or collected < total:
               print(f'Runner list came back with {collected} of the {total} GitHub reports; '
                     f'runner health is unknown')
               return None
@@ -1286,8 +1287,10 @@ data "archive_file" "runner_cleanup" {
           raised from the default 30 to 100 for that reason, and a bigger page
           is not a completeness check. Or the answer holds something this
           function cannot represent: a record without a usable name or id, or
-          a total_count that is not an integer, which is a completeness check
-          that cannot run. Such a record used to be dropped and the rest kept,
+          a total_count that is missing or not an integer, which is a
+          completeness check that cannot run - a page-size heuristic on its
+          own accepts any short array as the whole roster. Such a record used
+          to be dropped and the rest kept,
           but it still counted toward total_count, so the read passed as
           complete and simply did not list that runner - and a roster that
           does not list a runner is what lease_verdict() reads as "never
@@ -1311,12 +1314,11 @@ data "archive_file" "runner_cleanup" {
                       print('ROSTER UNREAD: the runners response carries no runners array')
                       return None
                   reported = data.get('total_count')
-                  if reported is not None:
-                      if not isinstance(reported, int) or isinstance(reported, bool):
-                          print(f'ROSTER UNREAD: total_count={reported!r} cannot be compared '
-                                f'with the pages read')
-                          return None
-                      total = reported
+                  if not isinstance(reported, int) or isinstance(reported, bool):
+                      print(f'ROSTER UNREAD: total_count={reported!r} cannot be compared '
+                            f'with the pages read')
+                      return None
+                  total = reported
                   collected += len(batch)
                   # status is preserved as-absent when GitHub omits it: a missing
                   # status must never count as online, or a wedged busy runner
@@ -1356,7 +1358,7 @@ data "archive_file" "runner_cleanup" {
           except Exception as e:
               print(f'ROSTER UNREAD: {type(e).__name__}: {e}')
               return None
-          if total is not None and collected < total:
+          if total is None or collected < total:
               print(f'ROSTER UNREAD: read {collected} of the {total} registrations '
                     f'GitHub reports')
               return None
@@ -1490,14 +1492,22 @@ data "archive_file" "runner_cleanup" {
                     f'{type(e).__name__}: {e}. Retried on the next poll.')
           return False
 
-      def renew_lease(instance_id, now):
-          """Extend the lease by LEASE_DURATION_MINUTES"""
+      def renew_lease(instance_id, now, seen=False):
+          """Extend the lease by LEASE_DURATION_MINUTES.
+
+          With seen=True the same write carries RunnerSeenAt, so a runner
+          whose lease was ever renewed is marked seen by construction: one
+          CreateTags call, one fate. The lease phase renews only on a roster
+          that listed the runner online and busy, which is exactly the fact
+          the stamp records. The legacy path that gives an untagged instance
+          its first lease has not seen anything and leaves seen=False.
+          """
           new_expiry = (now + timedelta(minutes=LEASE_DURATION_MINUTES)).isoformat()
+          tags = [{'Key': 'LeaseExpires', 'Value': new_expiry}]
+          if seen:
+              tags.append({'Key': SEEN_TAG, 'Value': now.isoformat()})
           try:
-              ec2.create_tags(
-                  Resources=[instance_id],
-                  Tags=[{'Key': 'LeaseExpires', 'Value': new_expiry}]
-              )
+              ec2.create_tags(Resources=[instance_id], Tags=tags)
               return new_expiry
           except Exception as e:
               print(f'Failed to renew lease on {instance_id}: {e}')
@@ -1572,9 +1582,20 @@ data "archive_file" "runner_cleanup" {
       #    minutes, so without a timestamp a held lease logs the same line
       #    forever and a blip is indistinguishable from a three-hour outage.
       #
-      # A failed CreateTags costs nothing on any poll where the roster is
-      # unread or does list the runner; the tag is consulted only when the
-      # roster is readable AND omits it.
+      # The stamp is a write, and a write can fail. A failed standalone
+      # CreateTags used to be swallowed with nothing else recording the fact,
+      # so an instance whose stamp never landed was indistinguishable from a
+      # box that never joined: the next readable roster that omitted it, once
+      # its lease had lapsed, took the never-registered EXPIRE and terminated
+      # a runner that had been working. Two things keep a single failed write
+      # from deciding that. The lease renewal carries the stamp in the same
+      # CreateTags call (renew_lease), so a runner whose lease was ever
+      # renewed is marked seen by construction. And lease_was_renewed() reads
+      # registration off LeaseExpires itself, evidence that needs no separate
+      # write at all and that every busy runner has, including the ones that
+      # were busy before this tag shipped. What remains is an instance whose
+      # every CreateTags failed since it registered: it has no renewed lease
+      # either, so it reads as never registered, and dies at its lease.
       SEEN_TAG = 'RunnerSeenAt'
 
       def mark_seen(instance_id, now):
@@ -1585,7 +1606,25 @@ data "archive_file" "runner_cleanup" {
           except Exception as e:
               print(f'Failed to stamp {SEEN_TAG} on {instance_id}: {e}')
 
-      def lease_verdict(roster, runner_name, seen_before):
+      def lease_was_renewed(launch_time, lease_expires_str):
+          """Whether LeaseExpires has moved past the launcher's initial expiry.
+
+          The launcher computes the initial expiry at request time plus
+          LEASE_DURATION_MINUTES, before RunInstances, so it is always earlier
+          than launch_time plus that duration. Anything later was written by
+          renew_lease(), which the lease phase calls only when GitHub listed
+          the runner online and busy. That is registration evidence which
+          does not depend on the RunnerSeenAt write having succeeded, and
+          which every instance busy before that tag existed already carries.
+          An instance that arrived with no lease tag is given one dated from
+          the poll and reads as renewed from then on; those are not launcher
+          instances, and holding one to the ceiling costs an idle box.
+          """
+          lease_expires = parse_ts(lease_expires_str)
+          return (lease_expires is not None
+                  and lease_expires > launch_time + timedelta(minutes=LEASE_DURATION_MINUTES))
+
+      def lease_verdict(roster, runner_name, registered_before):
           """What GitHub's answer lets the lease phase do with one runner. Pure.
 
           RENEW  GitHub reports the runner online and holding a job, so the
@@ -1621,8 +1660,9 @@ data "archive_file" "runner_cleanup" {
               # be holding a job GitHub handed out, so the lease reaps it as it
               # always has. If it listed the runner before and does not now, the
               # two explanations are not separable here, so hold and let the
-              # ceiling bound it.
-              return HOLD if seen_before else EXPIRE
+              # ceiling bound it. `registered_before` is either the RunnerSeenAt
+              # stamp or a renewed lease; see lease_was_renewed().
+              return HOLD if registered_before else EXPIRE
           busy = record.get('busy')
           if busy is True:
               status = record.get('status')
@@ -1819,11 +1859,12 @@ data "archive_file" "runner_cleanup" {
                       runner_info = runners.get(runner_name, {})
                       # What that answer lets the lease phase do, and the one fact
                       # a later poll cannot recover for itself: that some poll saw
-                      # this runner registered.
-                      verdict = lease_verdict(roster, runner_name,
-                                              get_tag(instance, SEEN_TAG) is not None)
-                      if roster is not None and runner_name in roster:
-                          mark_seen(instance_id, now)
+                      # this runner registered. Read from two places, because the
+                      # stamp is a write that can fail and a renewed lease is one
+                      # that already succeeded.
+                      registered_before = (get_tag(instance, SEEN_TAG) is not None
+                                           or lease_was_renewed(launch_time, lease_expires_str))
+                      verdict = lease_verdict(roster, runner_name, registered_before)
 
                       # Age policy: drain at MAX_INSTANCE_AGE_HOURS, hard ceiling
                       # DRAIN_GRACE_MINUTES later. Both are documented at those
@@ -1869,6 +1910,16 @@ data "archive_file" "runner_cleanup" {
                                     f'lost communication with the server" for it - that is THIS '
                                     f'termination, not an AWS spot reclaim.')
                           continue
+
+                      # Stamp the roster's answer only now. A CreateTags can stall
+                      # for the rest of the budget (boto3 retries a 60s read
+                      # timeout), a Lambda timeout is not catchable, and this
+                      # sweep is the only thing enforcing the lifetime bound, so
+                      # no write for an instance may run ahead of its ceiling
+                      # decision. A renewal below carries the same stamp; this
+                      # call covers every listed runner that is not renewed.
+                      if roster is not None and runner_name in roster:
+                          mark_seen(instance_id, now)
 
                       if action == TERMINATE_IDLE:
                           # Past the soft cap and holding nothing: go now, before GitHub
@@ -1955,8 +2006,9 @@ data "archive_file" "runner_cleanup" {
                       minutes_until_expiry = (lease_expires - now).total_seconds() / 60
 
                       if verdict == RENEW:
-                          # Runner is working - RENEW the lease
-                          new_expiry = renew_lease(instance_id, now)
+                          # Runner is working - RENEW the lease, and carry the seen
+                          # stamp in the same write.
+                          new_expiry = renew_lease(instance_id, now, seen=True)
                           print(f'{instance_id}: busy, renewed lease until {new_expiry}')
                           renewed.append(instance_id)
                           continue

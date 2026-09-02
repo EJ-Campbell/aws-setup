@@ -109,7 +109,7 @@ regardless of health, caps the blast radius if the health signal is ever wrong i
 plain instance count**: over-counting only delays CI and self-heals next poll, while
 under-counting launches metal spot instances on data it could not verify. A roster it
 cannot fully read is the same case: a page short of `total_count`, a `total_count` that is
-not an integer, or a record without a usable `name` or `status`. Skipping such a record
+missing or not an integer, or a record without a usable `name` or `status`. Skipping such a record
 kept the launcher up and quietly took one online runner out of the count, so a full pool
 read as one short and metal was launched into it.
 
@@ -217,7 +217,8 @@ reclaim, which is the same misattributed failure `ejc3/fcvm#884` cost a night of
 
 A read counts as unread unless it is **complete**: the call has to succeed, the payload has
 to carry a `runners` array, the pages collected have to reach the `total_count` GitHub
-reports beside them, that `total_count` has to be an integer the check can compare, and
+reports beside them, that `total_count` has to be present and an integer the check can
+compare (without it a page-size heuristic accepts any short array as the whole roster), and
 every record has to carry a usable `name` and `id`. A short page reads exactly like "that
 runner is not registered", so truncation is the same fail-open arriving through pagination.
 A record that cannot be represented is not dropped, for the same reason: dropped, it still
@@ -235,6 +236,19 @@ would reap it: it sits in `running`, where the stalled-launch phase (which walks
 cannot see it. The tag also dates an outage: a held lease logs how long the runner has gone
 unobserved, so a blip and a three-hour outage are different lines rather than the same one
 repeated.
+
+The stamp is a write, and a failed write must not make a later absence look like "never
+joined". Two things keep one rejected `CreateTags` from deciding that. The lease renewal
+carries `RunnerSeenAt` in the same call as `LeaseExpires`, so a runner whose lease was ever
+renewed is marked seen by construction. And a `LeaseExpires` later than the instance's launch
+time plus the 60-minute lease is itself proof: the launcher stamps the initial expiry before
+`RunInstances`, so only `renew_lease()` writes a later one, and it runs only when GitHub
+listed the runner online and busy. That second proof needs no separate write and covers
+every runner that was busy before the tag shipped. What remains is an instance whose every
+`CreateTags` failed since it registered; it has no renewed lease either, reads as never
+registered, and dies at its lease. The stamp is also written only after the ceiling decision
+for that instance, because a stalled `CreateTags` ahead of it would defer the one bound that
+must run.
 
 **Two bounds keep a broken runner from becoming immortal.** Renewal treats a runner as busy
 only while GitHub explicitly reports it `online` (a missing `status` renews nothing; the
