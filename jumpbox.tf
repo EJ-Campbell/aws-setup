@@ -191,7 +191,7 @@ resource "aws_backup_plan" "jumpbox" {
 resource "aws_backup_selection" "jumpbox" {
   count        = local.jumpbox_admin_iam_needed ? 1 : 0
   name         = "jumpbox-home-volume"
-  plan_id      = aws_backup_plan.jumpbox[0].id
+  plan_id      = local.backup_recovery_cutover_enabled ? aws_backup_plan.processing["jumpbox"].id : aws_backup_plan.jumpbox[0].id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
   resources = compact([

@@ -657,7 +657,7 @@ resource "aws_backup_plan" "dev_servers" {
 
 resource "aws_backup_selection" "dev_servers" {
   name         = "dev-server-persistent-volumes"
-  plan_id      = aws_backup_plan.dev_servers.id
+  plan_id      = local.backup_recovery_cutover_enabled ? aws_backup_plan.processing["dev"].id : aws_backup_plan.dev_servers.id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
   # compact() drops the Next.js entry when that box is disabled, rather than passing an
