@@ -41,5 +41,5 @@ jobs:
         with:
           terraform_version: 1.10.3
       - run: terraform fmt -check browser-manager.tf
-      - run: terraform init -backend=false
+      - run: terraform init -backend=false -lockfile=readonly
       - run: terraform validate

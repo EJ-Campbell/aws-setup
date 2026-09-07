@@ -814,14 +814,24 @@ only in AWS Secrets Manager as `browser-manager-openclaw-access`.
 The local Mac uses its existing AWS SSO login to assume
 `browser-manager-openclaw-client`. That role can read only the viewer secret; it has no
 Cloudflare administration, tunnel, or other Secrets Manager access. Configure the local
-profile after apply (these commands contain no credential value):
+profile after apply. Obtain `browser_manager_openclaw_client_role_arn` with Terraform
+on the administration jumpbox and hand that public ARN to the Mac operator; do not
+run Terraform on the Mac. For this account the commands are (no credential value):
 
 ```bash
 aws configure set profile.browser-manager-openclaw role_arn \
-  "$(terraform output -raw browser_manager_openclaw_client_role_arn)"
+  arn:aws:iam::928413605543:role/browser-manager-openclaw-client
 aws configure set profile.browser-manager-openclaw source_profile default
 aws configure set profile.browser-manager-openclaw region us-west-1
 ```
+
+The service-token resource has `prevent_destroy`: replacing it changes the client ID
+pinned in the browser-manager environment. Do not remove the guard for an ordinary
+apply. A deliberate replacement requires a coordinated maintenance deployment: save
+the new `browser_manager_env` output, reinstall/restart the origin with that environment,
+refresh the local viewer session, and verify both machine access and unauthenticated
+denial. The existing owner-login policy stays attached throughout. A stale origin must
+fail closed, not accept an arbitrary replacement service identity.
 
 ### 2. Install on the browser host
 
@@ -876,22 +886,27 @@ Labels are trimmed and saved; the dashboard and desktop title show them. Renamin
 the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
 and does not restart the browser. Older browsers initially display their stable name as the label.
 
-For a machine-controlled viewer, keep Cloudflare headers in a dedicated OpenClaw browser
-profile so they are never sent during ordinary web browsing. Create the profile and an empty
-tab once, then stream the AWS secret directly into the checked-in helper. The secret is not
-placed in argv, a file, the repository, or command output:
+For a machine-controlled viewer, create a dedicated OpenClaw browser profile and an
+empty tab once. Install the helper's existing dependencies on the Mac, then stream the
+AWS secret directly into it. The helper exchanges the service credential over HTTPS
+with only the fixed browser-manager hostname, refuses redirects, verifies the returned
+Access JWT, and installs a host-scoped cookie. It never installs the long-lived service
+secret as profile-wide browser headers or puts it in argv, a file, or command output:
 
 ```bash
 openclaw browser create-profile --name secure-browser-viewer --color '#6B5BFF'
 openclaw browser --browser-profile secure-browser-viewer open about:blank
+npm --prefix browser-manager ci --ignore-scripts
 aws --profile browser-manager-openclaw secretsmanager get-secret-value \
   --secret-id browser-manager-openclaw-access --query SecretString --output text \
   | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-browser-viewer
 ```
 
-Use `secure-browser-viewer` only for `browsers.cc-games.dev`. The helper applies the Access
-headers to that in-memory browser context and navigates it to the dashboard. Run it again
-after the local viewer browser process restarts. Website passwords entered inside a remote
+Use `secure-browser-viewer` for `browsers.cc-games.dev`. The helper clears any legacy
+profile-wide headers, sets only the short-lived host-scoped Access cookie, and navigates
+to the dashboard. Browser cookies are credentials and may be persisted in that local
+profile; the one-year service-token secret never enters it. Run the helper again when
+the Access session expires. Website passwords entered inside a remote
 desktop stay in that remote desktop's persistent host-side profile; they are not copied to
 the local viewer.
 

@@ -16,6 +16,9 @@ resource "cloudflare_zero_trust_access_service_token" "browser_manager_openclaw"
 
   lifecycle {
     create_before_destroy = true
+    # A replacement changes the client ID pinned by the origin. Require an
+    # explicitly coordinated origin deployment before replacing this identity.
+    prevent_destroy = true
   }
 }
 
@@ -158,6 +161,9 @@ resource "aws_secretsmanager_secret_version" "browser_manager_openclaw_access" {
   secret_string = jsonencode({
     client_id     = cloudflare_zero_trust_access_service_token.browser_manager_openclaw.client_id
     client_secret = cloudflare_zero_trust_access_service_token.browser_manager_openclaw.client_secret
+    audience      = cloudflare_zero_trust_access_application.browser_manager.aud
+    issuer        = local.browser_manager_issuer
+    base_url      = "https://${local.browser_manager_hostname}"
   })
 }
 
