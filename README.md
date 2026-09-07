@@ -726,14 +726,42 @@ Terraform.
 - The parallel box's persistent `/mnt/work` volume is protected from Terraform destroy but
   is **not backed up**. `prevent_destroy` is not a backup; keep important results elsewhere.
 - The primary backup vault uses governance Vault Lock.
-- Weekly/monthly recovery points copy to `us-east-1`; a second copy target lives in the
-  isolated `dev-staging` account.
+- Existing weekly/monthly recovery points copy to the original `us-east-1` vault.
+  Its AWS-managed encryption key cannot support the old direct staging copy path;
+  September's five cross-account copies failed. The new recovery pipeline below
+  repairs that path without replacing live disks or removing existing backups.
 - Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
   `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
   through SNS/email.
 - The original jumpbox's protected home volume and the fully reproducible `jumpbox-2`
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
+
+`backup-security.tf` adds `ejc3-backup-dr-cmk` in `us-east-1` and the
+`ejc3-backup-recovery` logically air-gapped vault in `dev-staging`. The hourly
+`fleet-backup-recovery` controller copies only the five configured fleet volumes:
+local recovery point → customer-key-encrypted DR copy → AWS-owned-key-encrypted
+staging copy. Job events accelerate the hourly reconciliation. Initial copies
+retain 30 days; annual scheduled copies retain 365 days. The new staging vault is
+immediately compliance-locked. Ordinary vault locks and existing backup schedules
+remain unchanged during this additive stage.
+
+Before switching the two existing plans to the new DR destination, require recent
+COMPLETED points for all five exact source ARNs in local, new DR, and staging vaults;
+verify the DR key ARN and zero recovery gaps. Preserve all old points and the
+unmanaged `fcvm-backups` vault, including its indefinitely retained snapshots.
+Ordinary compliance locks are a separate reviewed apply with a three-day grace.
+Do not describe this as absolute protection against AWS account closure.
+
+The staging plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
+restores encrypted, detached test volumes only: no instance launch, volume attach,
+or administrator role. Validation checks metadata/isolation, not filesystem contents
+or bootability. AWS Backup cleans up after the two-hour validation window; the
+controller checks expected per-volume jobs and backs up cleanup after four hours.
+Require a real successful restore/validation/cleanup cycle before claiming recovery
+testing is proven. Five tests cost about $9 plus roughly $0.11 per hour retaining
+all restored volumes; the new air-gapped storage starts around $44/month for the
+current written snapshot baseline, plus retained changed blocks and API usage.
 
 The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive searches across
 `/home/ubuntu` or `/tmp`; one such scan saturated both disks and made SSH unusable. Scope

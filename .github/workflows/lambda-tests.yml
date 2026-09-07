@@ -25,5 +25,8 @@ jobs:
       - name: Runner Lambda logic
         run: python3 scripts/test-runner-lambdas.py
 
+      - name: Backup copy and restore safety
+        run: python3 -S -B scripts/test-backup-recovery.py
+
       - name: Runner user_data IPv6 gate
         run: bash scripts/test-runner-userdata.sh
