@@ -871,6 +871,9 @@ the size follows the viewer's available width and height when tapped (bounded to
 480–900 pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
 the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
 viewers of that same browser also see the change; separate browser instances are unaffected.
+The Phone button follows the actual shared framebuffer in every connected viewer, not a cached
+metadata response. A second viewer can toggle the current mode without refreshing or reconnecting;
+local Fit scaling and viewer-window resizing do not change the shared mode.
 Tabs, page state, and logins remain in place: switching modes does not restart or reload the
 browser. The mode survives viewer reconnects, but a browser/service restart starts in Desktop
 mode. Phone changes the viewport, not the browser's user agent; it is not an iOS emulator.
