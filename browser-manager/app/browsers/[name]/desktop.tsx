@@ -48,19 +48,20 @@ export default function Desktop({ name }: { name: string }) {
 
   useEffect(() => {
     const target = screen.current;
-    if (!target) return;
+    const container = target?.parentElement;
+    if (!target || !container) return;
     const changed = () => {
-      setFrame(readFrameViewport(target));
-      const canvas = target.querySelector("canvas");
-      const bounds = target.getBoundingClientRect();
-      setCanFit(canFitViewport(canvas?.width, canvas?.height, bounds.width, bounds.height));
+      const logical = readFrameViewport(target);
+      setFrame(logical);
+      const bounds = container.getBoundingClientRect();
+      setCanFit(canFitViewport(logical?.width, logical?.height, bounds.width, bounds.height));
     };
     // Shared resizes arrive over VNC before (and independently of) metadata requests.
     // Observe only the actual framebuffer; fitting/scaling this viewer changes CSS, not these attributes.
     const observer = new MutationObserver(changed);
     observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height"] });
     const resize = new ResizeObserver(changed);
-    resize.observe(target);
+    resize.observe(container);
     changed();
     return () => { observer.disconnect(); resize.disconnect(); };
   }, [name]);
@@ -148,6 +149,8 @@ export default function Desktop({ name }: { name: string }) {
         const next = new RFBClient(screen.current, url.href, { shared: true });
         rfb = next;
         stopQuality = watchVncQuality(next);
+        // Keep noVNC responsible for both rendering and pointer scaling. The target fills the
+        // viewer for Fit, or is sized to logical CSS pixels for natural-size HiDPI rendering.
         next.scaleViewport = true;
         // Scaling is local: one viewer must not resize another viewer's desktop.
         next.resizeSession = false;
@@ -208,7 +211,6 @@ export default function Desktop({ name }: { name: string }) {
     };
   }, [name]);
 
-  useEffect(() => { if (client.current) client.current.scaleViewport = fit; }, [fit, connection]);
   useEffect(() => {
     setCanFullscreen(Boolean(document.fullscreenEnabled && workspace.current?.requestFullscreen));
     const changed = () => setFullscreen(document.fullscreenElement === workspace.current);
@@ -327,7 +329,7 @@ export default function Desktop({ name }: { name: string }) {
       {(viewportError || metadataError) && <p className="viewport-error" role="alert">{viewportError || metadataError}</p>}
 
       <section className="desktop-display" aria-label={`${label} remote desktop`}>
-        <div ref={screen} className="vnc-screen" />
+        <div ref={screen} className="vnc-screen" style={!fit && currentViewport ? { width: currentViewport.width, height: currentViewport.height } : undefined} />
         {!connected && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}
           <h2>{connection === "connecting" ? "Connecting to your desktop" : "Desktop disconnected"}</h2>
