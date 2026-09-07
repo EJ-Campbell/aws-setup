@@ -410,8 +410,11 @@ resource "aws_lambda_function" "backup_recovery" {
         canary_plan          = try(aws_backup_restore_testing_plan.initial[0].name, null)
         canary_plan_arn      = try(aws_backup_restore_testing_plan.initial[0].arn, null)
         canary_start_at      = local.backup_initial_restore_at
-        volumes              = local.backup_protected_volume_arns
-        topic                = aws_sns_topic.cost_alerts.arn
+        # Verified cutover retires one-off health checks before AWS job history
+        # ages out. Monthly recovery tests and old test-volume cleanup continue.
+        canary_accepted = local.backup_recovery_cutover_enabled
+        volumes         = local.backup_protected_volume_arns
+        topic           = aws_sns_topic.cost_alerts.arn
       })
     }
   }

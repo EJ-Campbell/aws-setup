@@ -237,6 +237,56 @@ def canary_test_start(config):
     return scheduled
 
 
+def canary_restore_health(stage, config, now):
+    """A retry only clears each source's failure after that source fully passes.
+
+    Attribute jobs with the per-resource API supported by the Lambda SDK. Do not
+    filter by recovery-point age: moving the retry date must not hide old failures.
+    The initial untried wave gets its one-hour start window plus one hour of
+    propagation grace, but a known failure never receives that grace again.
+    """
+    scheduled = canary_test_start(config)
+    accepted = config.get("canary_accepted", False)
+    if not isinstance(accepted, bool):
+        raise ValueError("Invalid initial restore canary acceptance")
+    # Only the reviewed production cutover retires this one-off health check.
+    # AWS eventually expires job history; age alone must never count as success.
+    # The handler still validates/cleans old jobs and enforces monthly health.
+    if scheduled is None or accepted is True:
+        return []
+    errors = []
+    for resource in sorted(set(config["volumes"])):
+        jobs = pages(stage, "list_restore_jobs_by_protected_resource", "RestoreJobs",
+                     ResourceArn=resource)
+        matching = [job for job in jobs
+                    if job.get("IamRoleArn") == config["restore_role"]
+                    and job.get("ResourceType") == "EBS"
+                    and job.get("CreatedBy", {}).get("RestoreTestingPlanArn") == config["canary_plan_arn"]]
+        current = max((job for job in matching if job["CreationDate"] >= scheduled),
+                      key=lambda item: item["CreationDate"], default=None)
+        if (current is not None and current.get("Status") == "COMPLETED"
+                and current.get("ValidationStatus") == "SUCCESSFUL"
+                and current.get("DeletionStatus") == "SUCCESSFUL"):
+            continue
+        failed = max((job for job in matching
+                      if job.get("Status") in {"FAILED", "ABORTED"}
+                      or job.get("ValidationStatus") in {"FAILED", "TIMED_OUT"}
+                      or job.get("DeletionStatus") == "FAILED"),
+                     key=lambda item: item["CreationDate"], default=None)
+        if failed is not None:
+            errors.append("Initial restore canary failed; no successful current-wave replacement: "
+                          + resource + " (" + failed["RestoreJobId"] + ")")
+        elif now >= scheduled + timedelta(hours=2):
+            if current is None:
+                errors.append("Initial restore canary missing since " + scheduled.isoformat() + ": " + resource)
+            else:
+                errors.append("Initial restore canary incomplete after 2h: " + resource
+                              + " (" + current["RestoreJobId"] + "; restore=" + str(current.get("Status"))
+                              + ", validation=" + str(current.get("ValidationStatus"))
+                              + ", deletion=" + str(current.get("DeletionStatus")) + ")")
+    return errors
+
+
 def reconcile(primary, dr, stage, config, now):
     allowed = set(config["volumes"])
     hop_volumes = set(config["cmk_hop_volumes"])
@@ -381,7 +431,7 @@ def handler(event, context):
         sns.publish(TopicArn=config["topic"], Subject="AWS Backup job requires attention",
                     Message=json.dumps(event, default=str))
     try:
-        canary_start = canary_test_start(config)
+        canary_test_start(config)
         missing, errors = reconcile(primary, dr, stage, config, now)
         # The periodic pass also handles a missed restore-completed event.
         restore_jobs = []
@@ -395,14 +445,8 @@ def handler(event, context):
                                 if job.get("CreatedBy", {}).get("RestoreTestingPlanArn") == plan)
         for job in restore_jobs:
             if job.get("IamRoleArn") == config["restore_role"]:
-                if (canary_start is not None
-                        and job.get("CreatedBy", {}).get("RestoreTestingPlanArn") == config.get("canary_plan_arn")
-                        and job["CreationDate"] >= canary_start):
-                    if (job.get("Status") in {"FAILED", "ABORTED"}
-                            or job.get("ValidationStatus") in {"FAILED", "TIMED_OUT"}):
-                        restore_errors.append("Initial restore canary failed: " + job["RestoreJobId"])
                 # Prior attempts remain in AWS job history and still receive safe
-                # validation/cleanup; only the current wave decides canary health.
+                # validation/cleanup, independently of current-wave health.
                 recent = job.get("CompletionDate", now) > now - timedelta(hours=4)
                 try:
                     if recent and job.get("DeletionStatus") != "SUCCESSFUL":
@@ -417,6 +461,7 @@ def handler(event, context):
                     errors.append(str(error))
         # Query current metadata after validation so a just-validated job can count
         # as healthy. Missing/failed monthly tests remain visible if events vanish.
+        restore_errors.extend(canary_restore_health(stage, config, now))
         restore_errors.extend(monthly_restore_health(stage, config, now))
         errors.extend(restore_errors)
         boto3.client("cloudwatch", region_name=config["primary_region"]).put_metric_data(

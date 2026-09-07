@@ -816,8 +816,11 @@ Roll out with fresh full Terraform plans in this order:
    success from Terraform apply.
    If a restore attempt fails, repair the evidenced cause, retain its job history,
    and set a new future `backup_initial_restore_at` for the same one-off plan.
-   The controller uses that configured UTC minute to assess the current attempt;
-   older jobs still receive validation/cleanup, and their failures remain in AWS
+   The controller checks a current-attempt job for every configured source volume.
+   Rescheduling does not clear a preceding failure: the new job must complete,
+   validate, and delete its test resource first. Missing or unfinished current jobs
+   alarm after the one-hour start window plus one hour of propagation grace.
+   Older jobs still receive validation/cleanup, and their failures remain in AWS
    job history and logs. Require all five jobs from the new attempt to pass.
 5. Set only `backup_recovery_cleanup_enabled=true` and apply the two temporary-vault
    cleanup grants and controller update. Existing selections must remain unchanged.
@@ -825,8 +828,11 @@ Roll out with fresh full Terraform plans in this order:
    not merely that deletion returned HTTP 200; keep each newest checkpoint. A permission
    failure must retain data, not lead to a broad identity-policy deletion grant.
 6. Only after that cleanup acceptance succeeds, set `backup_recovery_cutover_enabled=true`
-   and apply the two changed selections. Their preconditions reject cutover while cleanup
-   is disabled; replacement creates the new selection before removing the old one.
+   and apply the two changed selections plus the controller's acceptance handoff.
+   Their preconditions reject cutover while cleanup is disabled; replacement creates
+   the new selection before removing the old one. This verified handoff retires the
+   one-off health check so eventual AWS job-history expiration cannot create a false
+   alarm; monthly per-volume restore checks and historical test-volume cleanup continue.
    Verify an EBS `copySnapshot` event reports incremental copying on a
    subsequent cycle before claiming measured incremental-transfer savings. Keep the
    past one-off capture and restore definitions for audit; their explicit years prevent

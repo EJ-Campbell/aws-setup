@@ -153,6 +153,8 @@ class BackupTopologyTests(unittest.TestCase):
             "processing_vault": "aws_backup_vault.processing.name",
             "stage_vault_arn": "aws_backup_logically_air_gapped_vault.staging_recovery_dr.arn",
             "restore_plan_arn": "aws_backup_restore_testing_plan.fleet_dr.arn",
+            "canary_start_at": "local.backup_initial_restore_at",
+            "canary_accepted": "local.backup_recovery_cutover_enabled",
             "volumes": "local.backup_protected_volume_arns",
         }.items():
             self.assertRegex(function, r"\b" + field + r"\s*=\s*" + re.escape(value))
