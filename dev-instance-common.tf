@@ -667,4 +667,11 @@ resource "aws_backup_selection" "dev_servers" {
     local.x86_persistent_volume_arn,
     local.nextjs_root_volume_arn,
   ])
+  lifecycle {
+    create_before_destroy = true
+    precondition {
+      condition     = !local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled
+      error_message = "Verify temporary-copy cleanup before switching the dev backup selection."
+    }
+  }
 }

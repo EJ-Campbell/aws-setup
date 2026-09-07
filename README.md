@@ -198,7 +198,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 400 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 100 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
@@ -789,25 +789,37 @@ Cleanup permissions come only from those two temporary-vault policies; the contr
 cannot delete legacy history or final recovery points. Copy failures retain pending
 data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
 
-The checked-in `backup_recovery_cutover_enabled` gate is initially false. Bootstrap
+The checked-in cleanup and selection-cutover gates are initially false. Bootstrap
 leaves the existing daily/weekly/monthly plans and their selections unchanged; it seeds
 from their latest recovery points and has no recovery-point deletion permission.
 Roll out with fresh full Terraform plans in this order:
 
-1. Apply the new destination/controller with the cutover gate false. Require recent
+1. Apply the new destination/controller with both gates false. Require recent
    COMPLETED final points for all five exact source ARNs, both required CMK checkpoints
    encrypted with `alias/fleet-backup-dr`, and completed job-to-point lineage.
-2. Set `backup_initial_restore_at` in `backup-restore-canary.tf` to a UTC minute at
+2. Set `backup_initial_capture_at` in `backup-restore-canary.tf` to a future UTC minute
+   and apply the one-off processing capture. It backs up the same five volumes into
+   the processing vault with no expiration and the required provenance tag, without
+   moving either existing backup selection. Require its five new source points and
+   their exact completed final copies, including both CMK successor checkpoints.
+3. Set `backup_initial_restore_at` in `backup-restore-canary.tf` to a UTC minute at
    least 30 minutes in the future. Apply its one-off plan only after all copies exist.
    This is a date/year cron, not a recurring test. Keep the completed plan for audit.
-3. Require all five initial restore jobs COMPLETED, validation SUCCESSFUL, and test
+4. Require all five initial restore jobs COMPLETED, validation SUCCESSFUL, and test
    resources successfully deleted. Metadata verification does not prove guest data or
    boot integrity. Inspect copy/restore logs; do not infer success from Terraform apply.
-4. Only then set `backup_recovery_cutover_enabled=true`, review the changed selections
-   and the two temporary-vault cleanup grants, and apply. Verify new processing points,
-   final copies and source cleanup on a real daily cycle. Verify an EBS `copySnapshot`
-   event reports incremental copying on a subsequent cycle before claiming measured
-   incremental-transfer savings.
+5. Set only `backup_recovery_cleanup_enabled=true` and apply the two temporary-vault
+   cleanup grants and controller update. Existing selections must remain unchanged.
+   Verify the five processing captures and superseded CMK checkpoints actually disappear,
+   not merely that deletion returned HTTP 200; keep each newest checkpoint. A permission
+   failure must retain data, not lead to a broad identity-policy deletion grant.
+6. Only after that cleanup acceptance succeeds, set `backup_recovery_cutover_enabled=true`
+   and apply the two changed selections. Their preconditions reject cutover while cleanup
+   is disabled; replacement creates the new selection before removing the old one.
+   Verify an EBS `copySnapshot` event reports incremental copying on a
+   subsequent cycle before claiming measured incremental-transfer savings. Keep the
+   past one-off capture and restore definitions for audit; their explicit years prevent
+   recurring test jobs.
 
 Existing recovery points keep their original lifecycles and age out normally; switching
 selections does not shorten them. Never bulk-delete old history. Preserve the unmanaged
