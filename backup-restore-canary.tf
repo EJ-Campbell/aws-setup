@@ -17,7 +17,7 @@ locals {
 
   # Separate, one-off source capture proves processing-copy-cleanup behavior before
   # moving either existing backup selection. A null timestamp creates no resources.
-  backup_initial_capture_at = "2026-09-07T20:15:00Z"
+  backup_initial_capture_at = "2026-09-07T20:30:00Z"
   backup_initial_capture_cron = try(
     "cron(${formatdate("m h D M ? YYYY", local.backup_initial_capture_at)})", "cron(0 0 1 1 ? 1970)"
   )
