@@ -201,6 +201,24 @@ class BackupTopologyTests(unittest.TestCase):
         for forbidden in ("backup:StartRestoreJob", "backup:StartCopyJob", "ec2:AttachVolume"):
             self.assertNotIn(forbidden, observer)
 
+    def test_restore_reencrypts_only_from_the_exact_managed_lag_key(self):
+        # Provider 5.100's standard-vault data source explicitly rejects LAGs.
+        self.assertNotIn('data "aws_backup_vault" "staging_recovery_dr"', SECURITY)
+        source_key = "arn:aws:kms:us-east-1:792761027311:key/74da7bec-f50b-45aa-9602-2666a665a785"
+        self.assertRegex(SECURITY, r'backup_recovery_source_key_arn\s*=\s*"' + re.escape(source_key) + '"')
+        vault = resource("aws_backup_logically_air_gapped_vault", "staging_recovery_dr")
+        self.assertRegex(vault, r"prevent_destroy\s*=\s*true")
+        role = resource("aws_iam_role_policy", "backup_restore_test")
+        grant = re.search(r'Sid\s*=\s*"ReEncryptFromExactRecoveryVaultKey"(.*?)\n      \},', role, re.S)
+        self.assertIsNotNone(grant)
+        statement = grant.group(1)
+        self.assertRegex(statement, r'Effect\s*=\s*"Allow"')
+        self.assertRegex(statement, r'Action\s*=\s*"kms:ReEncryptFrom"\s*\n')
+        self.assertRegex(statement, r"Resource\s*=\s*local\.backup_recovery_source_key_arn\s*\n")
+        self.assertIn('StringEquals = { "kms:ViaService" = "ec2.${local.backup_recovery_region}.amazonaws.com" }', statement)
+        self.assertNotIn("*", statement)
+        self.assertEqual(role.count("local.backup_recovery_source_key_arn"), 1)
+
     def test_canary_is_explicit_minute_date_year_and_null_gated(self):
         self.assertRegex(CANARY, r'backup_initial_restore_at\s*=\s*(?:null|"[^"]+")')
         self.assertIn('formatdate("m h D M ? YYYY", local.backup_initial_restore_at)', CANARY)

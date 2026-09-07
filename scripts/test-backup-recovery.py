@@ -489,7 +489,8 @@ class HandlerTests(unittest.TestCase):
                 patch.object(module.boto3, "client", side_effect=lambda service, **kwargs: clients[service]), \
                 patch.object(module.boto3, "Session", return_value=stage_session), \
                 patch.object(module, "reconcile", return_value=([], [])), \
-                patch.object(module, "datetime", SimpleNamespace(now=lambda tz: SCHEDULED + timedelta(hours=3))):
+                patch.object(module, "datetime", SimpleNamespace(
+                    now=lambda tz: SCHEDULED + timedelta(hours=3), strptime=datetime.strptime)):
             if expected_error:
                 with self.assertRaisesRegex(RuntimeError, expected_error):
                     module.handler(event or {}, None)
@@ -525,7 +526,8 @@ class HandlerTests(unittest.TestCase):
         with patch.object(module, "validate_restore") as validate, \
                 patch.object(module, "cleanup_expired_test") as cleanup:
             clients = self.run_handler([], listed_jobs={"canary-arn": [canary]},
-                                       config_changes={"canary_plan": "initial", "canary_plan_arn": "canary-arn"},
+                                       config_changes={"canary_plan": "initial", "canary_plan_arn": "canary-arn",
+                                                       "canary_start_at": "2026-09-08T12:00:00Z"},
                                        expected_error="monthly restore test missing")
             validate.assert_called_once()
             cleanup.assert_called_once()
@@ -538,8 +540,52 @@ class HandlerTests(unittest.TestCase):
                       CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
         with patch.object(module, "cleanup_expired_test"):
             self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [canary]},
-                             config_changes={"canary_plan_arn": "canary-arn"},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"},
                              expected_error="Initial restore canary failed")
+
+    def test_prior_failed_canary_does_not_poison_retry_but_still_gets_cleanup(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-failed", Status="FAILED",
+                     CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        retry = dict(RESTORE_JOB, RestoreJobId="successful-retry",
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "cleanup_expired_test") as cleanup:
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [prior, retry]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"})
+            self.assertEqual([call.args[1]["RestoreJobId"] for call in cleanup.call_args_list],
+                             ["prior-failed", "successful-retry"])
+
+    def test_canary_failure_at_retry_start_is_not_ignored(self):
+        retry = dict(RESTORE_JOB, RestoreJobId="failed-retry", Status="FAILED",
+                     CreationDate=SCHEDULED, CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "cleanup_expired_test"):
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [retry]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"},
+                             expected_error="Initial restore canary failed")
+
+    def test_prior_canary_still_receives_validation(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-unvalidated", ValidationStatus="VALIDATING",
+                     DeletionStatus="DELETING", CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "validate_restore") as validate, \
+                patch.object(module, "cleanup_expired_test") as cleanup:
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [prior]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"})
+            self.assertEqual(validate.call_args.args[2], "prior-unvalidated")
+            self.assertEqual(cleanup.call_args.args[1]["RestoreJobId"], "prior-unvalidated")
+
+    def test_canary_start_is_strict_and_missing_configuration_fails_closed(self):
+        self.assertIsNone(module.canary_test_start({"canary_plan_arn": None}))
+        for value in (None, "", "2026-09-08T12:00:01Z", "2026-09-08T12:00:00+00:00",
+                      "2026-02-30T12:00:00Z", "2026-9-8T12:00:00Z"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Invalid initial restore"):
+                module.canary_test_start({"canary_plan_arn": "canary-arn", "canary_start_at": value})
+        self.assertEqual(module.canary_test_start({"canary_plan_arn": "canary-arn",
+                                                  "canary_start_at": "2026-09-08T12:00:00Z"}), SCHEDULED)
 
     def test_null_canary_does_not_query_any_extra_plan(self):
         clients = self.run_handler([RESTORE_JOB], config_changes={"canary_plan_arn": None})
