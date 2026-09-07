@@ -805,6 +805,24 @@ The connector token and saved Terraform plan are sensitive. Do not print or chec
 The application receives the public Access settings; only `cloudflared` receives the token
 file path. A public URL cannot work until both this apply and the host installation are done.
 
+Terraform also creates a second, dedicated Cloudflare Access service token for the local
+OpenClaw viewer. It is accepted only by the exact browser-manager Access application, and
+the origin independently verifies that the signed JWT's `common_name` equals that token's
+client ID. The client ID is public application configuration; the client secret is stored
+only in AWS Secrets Manager as `browser-manager-openclaw-access`.
+
+The local Mac uses its existing AWS SSO login to assume
+`browser-manager-openclaw-client`. That role can read only the viewer secret; it has no
+Cloudflare administration, tunnel, or other Secrets Manager access. Configure the local
+profile after apply (these commands contain no credential value):
+
+```bash
+aws configure set profile.browser-manager-openclaw role_arn \
+  "$(terraform output -raw browser_manager_openclaw_client_role_arn)"
+aws configure set profile.browser-manager-openclaw source_profile default
+aws configure set profile.browser-manager-openclaw region us-west-1
+```
+
 ### 2. Install on the browser host
 
 Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
@@ -857,6 +875,25 @@ Use **Rename** on a browser card to edit its display label (1–80 characters, n
 Labels are trimmed and saved; the dashboard and desktop title show them. Renaming never changes
 the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
 and does not restart the browser. Older browsers initially display their stable name as the label.
+
+For a machine-controlled viewer, keep Cloudflare headers in a dedicated OpenClaw browser
+profile so they are never sent during ordinary web browsing. Create the profile and an empty
+tab once, then stream the AWS secret directly into the checked-in helper. The secret is not
+placed in argv, a file, the repository, or command output:
+
+```bash
+openclaw browser create-profile --name secure-browser-viewer --color '#6B5BFF'
+openclaw browser --browser-profile secure-browser-viewer open about:blank
+aws --profile browser-manager-openclaw secretsmanager get-secret-value \
+  --secret-id browser-manager-openclaw-access --query SecretString --output text \
+  | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-browser-viewer
+```
+
+Use `secure-browser-viewer` only for `browsers.cc-games.dev`. The helper applies the Access
+headers to that in-memory browser context and navigates it to the dashboard. Run it again
+after the local viewer browser process restarts. Website passwords entered inside a remote
+desktop stay in that remote desktop's persistent host-side profile; they are not copied to
+the local viewer.
 
 Use **Back** beside the desktop title to go back in the remote browser's history. The separate
 top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.

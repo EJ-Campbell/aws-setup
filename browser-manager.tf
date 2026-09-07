@@ -6,6 +6,32 @@ locals {
   browser_manager_issuer   = "https://ejc3.cloudflareaccess.com"
 }
 
+# Dedicated machine credential for the local OpenClaw viewer. Do not reuse the broad
+# cc-games automation token: this credential reaches only the browser-manager app and can
+# be revoked without affecting any other service.
+resource "cloudflare_zero_trust_access_service_token" "browser_manager_openclaw" {
+  account_id = var.cloudflare_account_id
+  name       = "browser-manager-openclaw"
+  duration   = "8760h"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "browser_manager_openclaw" {
+  account_id       = var.cloudflare_account_id
+  name             = "browser-manager OpenClaw client"
+  decision         = "non_identity"
+  session_duration = "12h"
+
+  include = [{
+    service_token = {
+      token_id = cloudflare_zero_trust_access_service_token.browser_manager_openclaw.id
+    }
+  }]
+}
+
 resource "cloudflare_zero_trust_access_policy" "browser_manager_owner" {
   account_id       = var.cloudflare_account_id
   name             = "browser-manager owner only"
@@ -24,10 +50,16 @@ resource "cloudflare_zero_trust_access_application" "browser_manager" {
     cloudflare_zero_trust_access_identity_provider.google[*].id,
     [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
   )
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.browser_manager_owner.id
-    precedence = 1
-  }]
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.browser_manager_owner.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.browser_manager_openclaw.id
+      precedence = 2
+    },
+  ]
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared" "browser_manager" {
@@ -109,9 +141,73 @@ resource "aws_iam_role_policy" "dev_server_browser_manager" {
   })
 }
 
+# Cloudflare returns a service-token secret only at creation. Keep the pair in Secrets
+# Manager and give the local operator a narrow role instead of creating a long-lived IAM
+# access key for the Mac. The existing AWS SSO AdministratorAccess session may assume this
+# role; the role itself can read only this one secret.
+resource "aws_secretsmanager_secret" "browser_manager_openclaw_access" {
+  name                    = "browser-manager-openclaw-access"
+  description             = "Cloudflare Access service token for the local OpenClaw browser viewer"
+  recovery_window_in_days = 7
+
+  tags = { Name = "browser-manager-openclaw-access", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "browser_manager_openclaw_access" {
+  secret_id = aws_secretsmanager_secret.browser_manager_openclaw_access.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.browser_manager_openclaw.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.browser_manager_openclaw.client_secret
+  })
+}
+
+resource "aws_iam_role" "browser_manager_openclaw_client" {
+  name = "browser-manager-openclaw-client"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+      Condition = {
+        ArnLike = {
+          "aws:PrincipalArn" = [
+            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AdministratorAccess_*",
+            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*",
+          ]
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "browser_manager_openclaw_client" {
+  name = "read-browser-manager-openclaw-access"
+  role = aws_iam_role.browser_manager_openclaw_client.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.browser_manager_openclaw_access.arn
+    }]
+  })
+}
+
 output "browser_manager_tunnel_secret_name" {
   description = "Secrets Manager name for the connector token, readable by ARM/x86 dev hosts"
   value       = aws_secretsmanager_secret.browser_manager_tunnel_token.name
+}
+
+output "browser_manager_openclaw_access_secret_name" {
+  description = "Secrets Manager name for the local OpenClaw viewer's Cloudflare Access token"
+  value       = aws_secretsmanager_secret.browser_manager_openclaw_access.name
+}
+
+output "browser_manager_openclaw_client_role_arn" {
+  description = "Narrow AWS role the local SSO profile assumes to read the OpenClaw viewer token"
+  value       = aws_iam_role.browser_manager_openclaw_client.arn
 }
 
 # Retained for apply-host compatibility. Dev hosts fetch the Secrets Manager value;
@@ -128,6 +224,7 @@ output "browser_manager_env" {
     BM_BASE_URL=https://${local.browser_manager_hostname}
     BM_ACCESS_AUD=${cloudflare_zero_trust_access_application.browser_manager.aud}
     BM_ACCESS_ISSUER=${local.browser_manager_issuer}
+    BM_ACCESS_SERVICE_TOKEN_ID=${cloudflare_zero_trust_access_service_token.browser_manager_openclaw.client_id}
     BM_OWNER_EMAIL=${local.browser_manager_owner}
     BM_PORT=3210
   ENV

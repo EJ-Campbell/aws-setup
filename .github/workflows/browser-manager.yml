@@ -29,3 +29,17 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: bash -n scripts/install.sh
+      - run: node --check scripts/configure-openclaw-viewer.mjs
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.10.3
+      - run: terraform fmt -check browser-manager.tf
+      - run: terraform init -backend=false
+      - run: terraform validate
