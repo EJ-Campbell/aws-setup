@@ -180,6 +180,7 @@ try {
       ['profile', 'location', 'input'].includes(event.kind)).length;
     const beforeResize = untouchedEvents();
     const phoneMode = page.getByRole('button', { name: 'Phone mode', exact: true });
+    const fitMode = page.getByRole('button', { name: 'Fit to screen', exact: true });
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
     await expectPhoneSelection(phoneMode, false);
     let peerPage, peerConnections = 0, primaryReconnects = 0;
@@ -220,6 +221,11 @@ try {
     // Geometry and DOM reflow can arrive before their new VNC pixels; capture the painted mode.
     await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
       .toEqual([139, 92, 246, 255]);
+    if (label === 'phone') {
+      await expect(fitMode).toBeVisible();
+      await expect(fitMode).toBeDisabled();
+      await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
+    }
     await page.screenshot({ path: join(shots, `${label}-phone-mode.png`), fullPage: true });
     if (peerPage) {
       activePage = peerPage;
@@ -270,6 +276,10 @@ try {
     // Phone mode must leave Chrome's real address bar and navigation usable.
     const phoneLocation = `/${selected}?phone-navigation=${label}`;
     await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
+    if (label === 'phone') {
+      await expect(fitMode).toBeEnabled();
+      await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
+    }
     await page.getByRole('button', { name: 'Address bar', exact: true }).click();
     await page.getByRole('textbox', { name: 'Text for the remote desktop' }).fill(`${fixtureOrigin}${phoneLocation}`);
     await page.getByRole('button', { name: 'Type text', exact: true }).click();
@@ -277,6 +287,11 @@ try {
     await expect.poll(() => remoteViewport(selected)?.url).toBe(phoneLocation);
     assert.equal(remoteViewport(selected).width, 390);
     await page.getByRole('button', { name: 'Close keyboard controls' }).click();
+    if (label === 'phone') {
+      await expect(fitMode).toBeVisible();
+      await expect(fitMode).toBeDisabled();
+      await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
+    }
     await expect(back).toBeEnabled();
     await back.click();
     await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
@@ -288,6 +303,8 @@ try {
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
     await expectPhoneSelection(phoneMode, false);
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
+    await expect(fitMode).toBeEnabled();
+    await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(() => {
       const { height, ...content } = remoteViewport(selected) ?? {};
       return content;
@@ -328,6 +345,7 @@ try {
       'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone',
       'native-back-availability', 'fullscreen-supported-and-unsupported',
       'native-phone-reflow-desktop-and-phone', 'phone-selected-style-with-touch-taps', 'shared-phone-toggle-without-reconnect',
+      'fit-disabled-only-when-no-visible-effect',
       'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
