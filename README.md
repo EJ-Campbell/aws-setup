@@ -775,10 +775,9 @@ terraform output -raw browser_manager_env > "$bm_handoff/browser-manager.env"
 terraform output -raw browser_manager_tunnel_token > "$bm_handoff/tunnel-token"
 ```
 
-The default hostname is `browsers.cc-games.dev`; `browser_manager_hostname` can select another
-single subdomain of `cc-games.dev`. Terraform creates a dedicated tunnel, DNS record, and
-owner-only Access application using the existing Google/one-time-PIN providers. It does not
-reuse the kids' family policy or Dolphin's GitHub policy. The browser host needs no Terraform,
+The hostname is fixed at `browsers.cc-games.dev`. Terraform creates a dedicated tunnel,
+DNS record, and owner-only Access application using the existing Google/one-time-PIN providers.
+It does not reuse the kids' family policy or Dolphin's GitHub policy. The browser host needs no Terraform,
 AWS administration credentials, or Cloudflare account API token.
 
 Transfer the two output files privately to the browser host, owned by the browser user with

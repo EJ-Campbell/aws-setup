@@ -1,19 +1,9 @@
 # A separate single-owner application; do not attach the cc-games family/service policies
 # or the Dolphin GitHub organization policy. An exact hostname wins over *.cc-games.dev.
-variable "browser_manager_hostname" {
-  description = "Dedicated browser-manager hostname within the existing cc-games.dev zone"
-  type        = string
-  default     = "browsers.cc-games.dev"
-
-  validation {
-    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.cc-games\\.dev$", var.browser_manager_hostname))
-    error_message = "Use one concrete subdomain of cc-games.dev (no wildcard or path)."
-  }
-}
-
 locals {
-  browser_manager_owner  = "ej.campbell@gmail.com"
-  browser_manager_issuer = "https://ejc3.cloudflareaccess.com"
+  browser_manager_hostname = "browsers.cc-games.dev"
+  browser_manager_owner    = "ej.campbell@gmail.com"
+  browser_manager_issuer   = "https://ejc3.cloudflareaccess.com"
 }
 
 resource "cloudflare_zero_trust_access_policy" "browser_manager_owner" {
@@ -27,7 +17,7 @@ resource "cloudflare_zero_trust_access_policy" "browser_manager_owner" {
 resource "cloudflare_zero_trust_access_application" "browser_manager" {
   account_id       = var.cloudflare_account_id
   name             = "Private browser manager"
-  domain           = var.browser_manager_hostname
+  domain           = local.browser_manager_hostname
   type             = "self_hosted"
   session_duration = "12h"
   allowed_idps = concat(
@@ -52,7 +42,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "browser_manager" {
   config = {
     ingress = [
       {
-        hostname = var.browser_manager_hostname
+        hostname = local.browser_manager_hostname
         service  = "http://127.0.0.1:3210"
         origin_request = {
           access = {
@@ -72,7 +62,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "browser_manager" {
 
 resource "cloudflare_dns_record" "browser_manager" {
   zone_id = var.cc_games_zone_id
-  name    = var.browser_manager_hostname
+  name    = local.browser_manager_hostname
   type    = "CNAME"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.browser_manager.id}.cfargotunnel.com"
   proxied = true
@@ -102,7 +92,7 @@ output "browser_manager_tunnel_token" {
 output "browser_manager_env" {
   description = "Public application settings for the installer's private EnvironmentFile"
   value       = <<-ENV
-    BM_BASE_URL=https://${var.browser_manager_hostname}
+    BM_BASE_URL=https://${local.browser_manager_hostname}
     BM_ACCESS_AUD=${cloudflare_zero_trust_access_application.browser_manager.aud}
     BM_ACCESS_ISSUER=${local.browser_manager_issuer}
     BM_OWNER_EMAIL=${local.browser_manager_owner}
