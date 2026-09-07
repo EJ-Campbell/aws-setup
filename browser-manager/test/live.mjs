@@ -45,7 +45,9 @@ const fixture = createServer((req, res) => {
     <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
-    document.querySelector('input').addEventListener('input',e=>report('input',e.target.value));
+    document.querySelector('input').addEventListener('input',e=>{
+      document.body.style.background='#d5f4e6';report('input',e.target.value);
+    });
     document.addEventListener('pointerdown',()=>report('pointer','received'));</script></body></html>`);
 });
 const fixtureAddress = await listen(fixture, { host: '127.0.0.1', port: 0 });
@@ -105,6 +107,9 @@ try {
     await page.getByRole('button', { name: 'Type text', exact: true }).click();
     await expect.poll(() => events.some(e => e.name === (label === 'phone' ? 'beta' : 'alpha') &&
       e.kind === 'input' && e.value === `typed-from-${label}`)).toBe(true);
+    // Input reaching Chrome is insufficient: its resulting paint must return through VNC.
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
+      .toEqual([213, 244, 230, 255]);
     await page.screenshot({ path: join(shots, `${label}-keyboard.png`), fullPage: true });
     await page.getByRole('button', { name: 'Close keyboard controls' }).click();
     const rect = await canvas.boundingBox();
