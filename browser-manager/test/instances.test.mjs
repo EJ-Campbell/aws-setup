@@ -12,6 +12,7 @@ async function fixture(t, launch) {
     launch: launch ?? (async (options) => {
       const ended = Promise.withResolvers();
       const handle = { socketPath: join(options.runtimeDir, 'vnc.sock'), closed: ended.promise,
+        resizes: [], resize: async viewport => { handle.resizes.push(viewport); },
         close: async () => { handle.stopped = true; ended.resolve(); } };
       launches.push({ ...options, handle });
       return handle;
@@ -32,6 +33,68 @@ async function failStateSync(t, stateDir, directory = false) {
     return sync.call(this);
   });
 }
+
+test('Phone mode resizes only the selected live desktop, without saving state or restarting its browser', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  const desktop = { mode: 'desktop', width: 1440, height: 900 };
+  const phone = { mode: 'phone', width: 390, height: 680 };
+  await manager.start('alpha'); await manager.start('beta');
+  const socket = manager.getSocket('alpha');
+  const saved = await readFile(join(stateDir, 'instances.json'), 'utf8');
+  const resized = await manager.setViewport('alpha', phone);
+  assert.deepEqual(resized.viewport, phone);
+  assert.deepEqual(manager.list()[1].viewport, desktop);
+  assert.deepEqual(launches[0].handle.resizes, [phone]);
+  assert.deepEqual(launches[1].handle.resizes, []);
+  assert.equal(manager.getSocket('alpha'), socket);
+  assert.equal(launches.length, 2);
+  assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), saved);
+  // Public results cannot mutate geometry; explicit requests can recover uncertain native state.
+  resized.viewport.width = 500;
+  assert.deepEqual((await manager.setViewport('alpha', phone)).viewport, phone);
+  assert.equal(launches[0].handle.resizes.length, 2);
+  assert.deepEqual((await manager.setViewport('alpha', { mode: 'desktop' })).viewport, desktop);
+  assert.deepEqual(launches[0].handle.resizes, [phone, phone, desktop]);
+  await manager.setViewport('alpha', phone);
+  await manager.stop('alpha'); await manager.start('alpha');
+  assert.deepEqual(manager.list()[0].viewport, desktop);
+});
+
+test('resize validation and native failures cannot claim a mode change or restart the browser', async (t) => {
+  const { manager, launches } = await fixture(t);
+  const phone = { mode: 'phone', width: 390, height: 680 };
+  for (const input of [null, {}, [], { ...phone, width: '390' }, { ...phone, width: 319 },
+    { ...phone, width: 501 }, { ...phone, height: 479 }, { ...phone, height: 901 },
+    { ...phone, height: 500.5 }, { ...phone, display: ':0' }, { mode: 'desktop', width: 500 },
+    { mode: 'phone', width: 390 }, { ...phone, mode: 'arbitrary' }]) {
+    assert.throws(() => manager.setViewport('alpha', input), error => error.status === 400);
+  }
+  await assert.rejects(manager.setViewport('missing', phone), error => error.status === 404);
+  await manager.start('alpha');
+  const before = manager.list()[0];
+  launches[0].handle.resize = async () => { throw new Error('Native resize failed'); };
+  await assert.rejects(manager.setViewport('alpha', phone), /Native resize failed/);
+  assert.deepEqual(manager.list()[0], before);
+  assert.equal(launches.length, 1);
+  await manager.stop('alpha');
+  await assert.rejects(manager.setViewport('alpha', phone), error => error.status === 409);
+});
+
+test('queued resize completes before stop closes its exact desktop', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('alpha');
+  const started = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  launches[0].handle.resize = async () => { started.resolve(); await finish.promise; };
+  const resizing = manager.setViewport('alpha', { mode: 'phone', width: 390, height: 680 });
+  await started.promise;
+  const stopping = manager.stop('alpha');
+  assert.equal(launches[0].handle.stopped, undefined);
+  finish.resolve();
+  assert.equal((await resizing).viewport.mode, 'phone');
+  await stopping;
+  assert.equal(launches[0].handle.stopped, true);
+});
 
 test('named desktops have isolated profiles and sockets; stopping preserves only the chosen profile', async (t) => {
   const { manager, stateDir, launches } = await fixture(t);

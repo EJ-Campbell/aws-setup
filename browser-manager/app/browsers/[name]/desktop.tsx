@@ -15,6 +15,7 @@ export default function Desktop({ name }: { name: string }) {
   const client = useRef<RFB | null>(null);
   const reconnect = useRef<() => void>(() => {});
   const textInput = useRef<HTMLTextAreaElement>(null);
+  const viewportRequest = useRef<AbortController | null>(null);
   const [connection, setConnection] = useState<Connection>("connecting");
   const [detail, setDetail] = useState("");
   const [retryDelay, setRetryDelay] = useState<number | null>(null);
@@ -26,20 +27,40 @@ export default function Desktop({ name }: { name: string }) {
   const [fullscreen, setFullscreen] = useState(false);
   const [canFullscreen, setCanFullscreen] = useState(false);
   const [label, setLabel] = useState(name);
+  const [viewport, setViewport] = useState<BrowserInstance["viewport"] | null>(null);
+  const [viewportPending, setViewportPending] = useState(false);
+  const [metadataLoading, setMetadataLoading] = useState(true);
+  const [metadataError, setMetadataError] = useState("");
+  const [viewportError, setViewportError] = useState("");
   const connected = connection === "connected";
+  const phoneMode = viewport?.mode === "phone";
 
   useEffect(() => {
-    const abort = new AbortController();
     setLabel(name);
+    setViewport(null);
+    setViewportError("");
+    setMetadataError("");
+    setViewportPending(false);
+    return () => { viewportRequest.current?.abort(); viewportRequest.current = null; };
+  }, [name]);
+
+  useEffect(() => {
+    if (!connected || viewportPending) return;
+    const abort = new AbortController();
+    setMetadataLoading(true);
+    setMetadataError("");
     void fetch("/api/browsers", { cache: "no-store", signal: abort.signal })
       .then(async (response) => {
-        if (!response.ok) return;
+        if (!response.ok) throw new Error("Could not read the display mode. Reconnect to retry, or reload to renew your sign-in.");
         const data: { browsers: BrowserInstance[] } = await response.json();
         const browser = data.browsers.find((entry) => entry.name === name);
-        if (!abort.signal.aborted && browser) setLabel(browser.label ?? name);
-      }).catch(() => {});
+        if (!browser) throw new Error("This browser is no longer available.");
+        if (!abort.signal.aborted) { setLabel(browser.label ?? name); setViewport(browser.viewport); }
+      }).catch((error) => {
+        if (!abort.signal.aborted) { setViewport(null); setMetadataError(error instanceof Error ? error.message : "Could not read the display mode. Reconnect to retry."); }
+      }).finally(() => { if (!abort.signal.aborted) setMetadataLoading(false); });
     return () => abort.abort();
-  }, [name]);
+  }, [name, connected, viewportPending]);
 
   useEffect(() => {
     let disposed = false;
@@ -157,6 +178,42 @@ export default function Desktop({ name }: { name: string }) {
     } catch { setFeedback("Fullscreen is unavailable here. Fit to screen still works."); }
   }
 
+  async function togglePhoneMode() {
+    if (!connected || !viewport || metadataLoading || viewportRequest.current) return;
+    const abort = new AbortController();
+    viewportRequest.current = abort;
+    setViewportPending(true);
+    setViewportError("");
+    const bounds = screen.current?.parentElement?.getBoundingClientRect();
+    const mobile = window.innerWidth <= 700;
+    const requested = phoneMode ? { mode: "desktop" } : {
+      mode: "phone",
+      width: mobile ? Math.max(320, Math.min(500, Math.round(bounds?.width ?? window.innerWidth))) : 390,
+      height: mobile ? Math.max(480, Math.min(900, Math.round(bounds?.height ?? 844))) : 844,
+    };
+    try {
+      const response = await fetch(`/api/browsers/${encodeURIComponent(name)}/viewport`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(requested), signal: abort.signal,
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || "Could not change the display mode. Try again, or reload to renew your sign-in.");
+      }
+      const data: { browser: BrowserInstance } = await response.json();
+      if (abort.signal.aborted) return;
+      setViewport(data.browser.viewport);
+      if (data.browser.viewport.mode === "phone") setFit(true);
+      setFeedback(data.browser.viewport.mode === "phone"
+        ? "Phone mode is shared with all viewers. Tap Phone to restore Desktop."
+        : "Desktop restored for all viewers.");
+    } catch (error) {
+      if (!abort.signal.aborted) setViewportError(error instanceof Error ? error.message : "Could not change the display mode. Try again.");
+    } finally {
+      if (viewportRequest.current === abort) { viewportRequest.current = null; setViewportPending(false); }
+    }
+  }
+
   function sendKey(key: number, code: string) {
     if (!connected) return;
     client.current?.sendKey(key, code);
@@ -207,14 +264,17 @@ export default function Desktop({ name }: { name: string }) {
       <header className="desktop-header">
         <a href="/" className="icon-button back-button" aria-label="Back to your browsers"><Icon name="back" /></a>
         <div className="desktop-title"><h1>{label}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
-        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="browserBack" size={20} /><span>Back</span></button>
+        <button className="button phone-mode" aria-label="Phone mode" aria-pressed={phoneMode} aria-describedby="phone-mode-help" disabled={!connected || viewportPending || metadataLoading || !viewport} onClick={() => void togglePhoneMode()} title={phoneMode ? "Restore Desktop for all viewers" : "Use a phone-sized display for all viewers"}><Icon name="phone" size={19} /><span>{viewportPending ? "Changing…" : "Phone"}</span></button>
+        <span id="phone-mode-help" className="sr-only">Changes the shared display for all viewers. Turn Phone mode off to restore Desktop.</span>
+        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="browserBack" size={20} /><span className="remote-back-label">Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
-          <button className="button quiet" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit to screen</span></button>
+          <button className="button quiet" aria-label="Fit to screen" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit<span className="fit-label-extra"> to screen</span></span></button>
           <button className="button quiet" aria-pressed={keyboard} aria-controls="keyboard-panel" onClick={() => setKeyboard(!keyboard)}><Icon name="keyboard" size={18} /><span>Keyboard</span></button>
           <button className="button quiet" disabled={!canFullscreen} onClick={() => void toggleFullscreen()} title={canFullscreen ? "Toggle fullscreen" : "Fullscreen is not supported in this browser"} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><Icon name="expand" size={18} /><span className="fullscreen-label">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span></button>
           <button className="button quiet" onClick={() => reconnect.current()} disabled={connection === "connecting"} aria-label="Reconnect desktop"><Icon name="refresh" size={18} /><span>Reconnect</span></button>
         </div>
       </header>
+      {(viewportError || metadataError) && <p className="viewport-error" role="alert">{viewportError || metadataError}</p>}
 
       <section className="desktop-display" aria-label={`${label} remote desktop`}>
         <div ref={screen} className="vnc-screen" />

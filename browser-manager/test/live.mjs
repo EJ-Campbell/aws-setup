@@ -2,7 +2,7 @@
 // No production auth bypass, browser debugging port, or existing profile is used.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +31,10 @@ const closeServer = server => new Promise(resolve => {
   if (server) server.close(resolve); else resolve();
 });
 const events = [];
+const remoteViewport = name => {
+  const event = events.findLast(event => event.name === name && event.kind === 'viewport');
+  return event ? JSON.parse(event.value) : null;
+};
 const fixture = createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname === '/event') {
@@ -41,11 +45,17 @@ const fixture = createServer((req, res) => {
   res.end(`<!doctype html><html><head><title>${name} isolated browser</title><style>
     body{margin:48px;background:#f1f5f9;color:#172033;font:24px system-ui}h1{font-size:52px}
     input{padding:20px;width:80%;font:28px system-ui}button{margin-top:32px;padding:32px;font:24px system-ui}
+    @media(max-width:500px){body{margin:20px;font-size:18px}h1{font-size:30px}input{box-sizing:border-box;width:100%;padding:14px;font-size:18px}}
     </style></head><body><h1>${name}: private desktop</h1><p>This browser has its own persistent profile.</p>
     <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
-    addEventListener('pageshow',()=>report('location',location.pathname+location.search));
+    const reportViewport=()=>report('viewport',JSON.stringify({width:innerWidth,height:innerHeight,
+      phone:matchMedia('(max-width:500px)').matches,font:getComputedStyle(document.querySelector('h1')).fontSize,
+      value:document.querySelector('input').value,url:location.pathname+location.search,
+      profile:localStorage.getItem('owner'),overflow:document.documentElement.scrollWidth>innerWidth}));
+    addEventListener('resize',reportViewport);
+    addEventListener('pageshow',()=>{report('location',location.pathname+location.search);reportViewport();});
     document.querySelector('input').addEventListener('input',e=>{
       document.body.style.background='#d5f4e6';report('input',e.target.value);
     });
@@ -140,6 +150,81 @@ try {
     await back.click();
     await expect.poll(() => events.slice(beforeBack).some(e => e.name === selected && e.kind === 'location' && e.value === `/${selected}`)).toBe(true);
     await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
+    await expect.poll(() => remoteViewport(selected)?.value).toBe(`typed-from-${label}`);
+    const baseline = remoteViewport(selected);
+    const otherName = selected === 'alpha' ? 'beta' : 'alpha';
+    const otherBrowser = manager.list().find(row => row.name === otherName);
+    const originalSocket = manager.getSocket(selected), otherSocket = manager.getSocket(otherName);
+    const persistedState = await readFile(join(stateDir, 'instances.json'), 'utf8');
+    const untouchedEvents = () => events.filter(event => event.name === selected &&
+      ['profile', 'location', 'input'].includes(event.kind)).length;
+    const beforeResize = untouchedEvents();
+    const phoneMode = page.getByRole('button', { name: 'Phone mode', exact: true });
+    await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+    await phoneMode.click();
+    await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
+    const phoneViewport = manager.list().find(row => row.name === selected).viewport;
+    assert.equal(phoneViewport.mode, 'phone');
+    assert.equal(phoneViewport.width, 390);
+    if (label === 'desktop') assert.equal(phoneViewport.height, 844);
+    else assert.ok(phoneViewport.height >= 480 && phoneViewport.height <= 900);
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
+      .toEqual([phoneViewport.width, phoneViewport.height]);
+    await expect.poll(() => {
+      const { height, ...content } = remoteViewport(selected) ?? {};
+      return content;
+    }).toEqual({
+      width: 390, phone: true, font: '30px',
+      value: baseline.value, url: baseline.url, profile: baseline.profile, overflow: false,
+    });
+    const phoneContent = remoteViewport(selected);
+    assert.ok(phoneContent.height > 0 && phoneContent.height <= phoneViewport.height);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${label} Phone mode overflow`);
+    await page.screenshot({ path: join(shots, `${label}-phone-mode.png`), fullPage: true });
+    // A new VNC connection must retain the native viewport, not merely redraw a scaled desktop.
+    const phoneSocket = page.waitForEvent('websocket', {
+      predicate: socket => new URL(socket.url()).pathname === `/browsers/${selected}/vnc`, timeout: 15000,
+    });
+    await page.getByRole('button', { name: 'Reconnect desktop' }).click();
+    await phoneSocket;
+    await expect(page.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
+    await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
+    assert.deepEqual(manager.list().find(row => row.name === selected).viewport, phoneViewport);
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
+      .toEqual([390, phoneViewport.height]);
+    assert.equal(remoteViewport(selected).value, baseline.value);
+    assert.equal(untouchedEvents(), beforeResize, 'Resize/reconnect must not reload, navigate, or replay input');
+    // Phone mode must leave Chrome's real address bar and navigation usable.
+    const phoneLocation = `/${selected}?phone-navigation=${label}`;
+    await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
+    await page.getByRole('button', { name: 'Address bar', exact: true }).click();
+    await page.getByRole('textbox', { name: 'Text for the remote desktop' }).fill(`${fixtureOrigin}${phoneLocation}`);
+    await page.getByRole('button', { name: 'Type text', exact: true }).click();
+    await page.getByRole('button', { name: 'Enter ↵', exact: true }).click();
+    await expect.poll(() => remoteViewport(selected)?.url).toBe(phoneLocation);
+    assert.equal(remoteViewport(selected).width, 390);
+    await page.getByRole('button', { name: 'Close keyboard controls' }).click();
+    await back.click();
+    await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
+      .toEqual([390, phoneViewport.height]);
+    const afterPhoneNavigation = untouchedEvents();
+    await phoneMode.click();
+    await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
+    await expect.poll(() => {
+      const { height, ...content } = remoteViewport(selected) ?? {};
+      return content;
+    }).toEqual({ width: 1440, phone: false, font: '52px', value: baseline.value,
+      url: baseline.url, profile: baseline.profile, overflow: false });
+    assert.ok(remoteViewport(selected).height > 0 && remoteViewport(selected).height < 900,
+      'Desktop restores browser chrome outside fullscreen');
+    assert.equal(untouchedEvents(), afterPhoneNavigation, 'Restoring Desktop must not reload, navigate, or replay input');
+    assert.equal(manager.getSocket(selected), originalSocket);
+    assert.equal(manager.getSocket(otherName), otherSocket);
+    assert.deepEqual(manager.list().find(row => row.name === otherName), otherBrowser);
+    assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), persistedState);
+    await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     const rect = await canvas.boundingBox();
     await page.mouse.click(rect.x + rect.width * 0.5, rect.y + rect.height * 0.65);
     await expect.poll(() => events.some(e => e.name === (label === 'phone' ? 'beta' : 'alpha') && e.kind === 'pointer')).toBe(true);
@@ -150,16 +235,21 @@ try {
     await context.close();
   }
   assert.deepEqual(errors, []);
+  await manager.setViewport('alpha', { mode: 'phone', width: 390, height: 844 });
+  assert.equal(manager.list().find(row => row.name === 'alpha').viewport.mode, 'phone');
+  const beforeRestart = events.filter(e => e.name === 'alpha' && e.kind === 'profile').length;
   await cli('stop', 'alpha');
   assert.equal(manager.list().find(row => row.name === 'beta').state, 'running');
   await cli('start', 'alpha');
-  await expect.poll(() => events.filter(e => e.name === 'alpha' && e.kind === 'profile').length).toBeGreaterThanOrEqual(2);
+  assert.deepEqual(manager.list().find(row => row.name === 'alpha').viewport, { mode: 'desktop', width: 1440, height: 900 });
+  await expect.poll(() => events.filter(e => e.name === 'alpha' && e.kind === 'profile').length).toBeGreaterThan(beforeRestart);
   // Chrome may restore a saved tab as well as opening the requested start URL.
   assert.ok(events.filter(e => e.name === 'alpha' && e.kind === 'profile').slice(1).every(e => e.value === 'alpha'));
   await writeFile(join(shots, 'acceptance.json'), JSON.stringify({ passed: true, browserBin,
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
-      'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
-  console.log(`PASS: desktop + phone VNC, input, automatic reconnect, remote-browser Back, and retained profile data. Screenshots: ${shots}`);
+      'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone',
+      'native-phone-reflow-desktop-and-phone', 'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
+  console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
   // Next installs an uncaught-exception listener; preserve a failing exit status explicitly.
   console.error(error);

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createServer as createSocketServer } from 'node:net';
 import { WebSocket } from 'ws';
 import { generateKeyPair, SignJWT } from 'jose';
-import { createAuthorizer } from '../lib/auth.mjs';
+import { browserViewport, createAuthorizer } from '../lib/auth.mjs';
 import { createHttpServer } from '../lib/http.mjs';
 
 const keys = await generateKeyPair('RS256');
@@ -18,6 +18,42 @@ const token = await new SignJWT({ email: config.owner }).setProtectedHeader({ al
 const headers = { 'cf-access-jwt-assertion': token, Origin: config.baseUrl, 'Content-Type': 'application/json' };
 const bind = async server => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return `http://127.0.0.1:${server.address().port}`; };
 const close = async server => { server.closeVnc?.(); server.closeAllConnections?.(); await new Promise(done => server.close(done)); };
+
+test('viewport mutations require owner + exact Origin and bounded dimensions without command fields', async () => {
+  const calls = [];
+  const row = { name: 'stable', state: 'running' };
+  const manager = { setViewport: async (name, value) => {
+    calls.push([name, value]); return { ...row, viewport: browserViewport(value) };
+  } };
+  const server = createHttpServer({ manager, config, authorize: createAuthorizer(config, keys.publicKey), nextHandler: () => {} });
+  const base = await bind(server);
+  const phone = { mode: 'phone', width: 390, height: 680 };
+  try {
+    for (const [body, sentHeaders, status] of [
+      [phone, { 'Content-Type': 'application/json' }, 401],
+      [phone, { ...headers, Origin: 'https://evil.test' }, 403],
+      [phone, { ...headers, Origin: '' }, 403],
+      [{ ...phone, width: 10000 }, headers, 400],
+      [{ ...phone, height: '680' }, headers, 400],
+      [{ ...phone, command: 'arbitrary' }, headers, 400],
+      [{ ...phone, display: ':0' }, headers, 400],
+      [{ ...phone, profile: '/private' }, headers, 400],
+      [{ mode: 'desktop', width: 10000 }, headers, 400],
+    ]) {
+      const response = await fetch(`${base}/api/browsers/stable/viewport`, {
+        method: 'POST', headers: sentHeaders, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, status);
+    }
+    assert.deepEqual(calls, []);
+    for (const value of [phone, { mode: 'desktop' }]) {
+      const response = await fetch(`${base}/api/browsers/stable/viewport`, { method: 'POST', headers, body: JSON.stringify(value) });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { browser: { ...row, viewport: browserViewport(value) } });
+    }
+    assert.deepEqual(calls, [['stable', phone], ['stable', { mode: 'desktop' }]]);
+  } finally { await close(server); }
+});
 
 test('HTTP denies unauthenticated/forged identity, cross-origin mutations, unknown paths, and profile injection', async () => {
   const calls = [];
