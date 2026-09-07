@@ -740,6 +740,130 @@ The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive sear
 searches to the repository, prefer `rg`, and move large scans/builds to ARM or the parallel
 box.
 
+## Private browser manager
+
+`browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
+multiple named browser desktops on one host. One dedicated Cloudflare Tunnel hostname routes
+`/browsers/<name>` to that exact desktop; it does not modify Dolphin Labs or its tunnel.
+The dashboard can create/start/stop browsers; the CLI prints the same shareable desktop URLs.
+It is single-owner, not a multi-tenant service: separate profiles isolate browser sessions,
+but are not separate OS security boundaries. These browsers have the host user's normal
+network and filesystem access. Only that owner should have Cloudflare Access permission.
+
+The dashboard and VNC WebSocket both require a verified Cloudflare Access
+JWT for the configured audience and owner. Mutations require the expected Origin. The local
+CLI uses an owner-only Unix socket, not a public bearer token. VNC uses private Unix sockets,
+not public ports; unknown instance names cannot become arbitrary network or filesystem targets.
+Every managed desktop has its own display and persistent browser profile. Stopping a desktop
+retains its profile. There is no profile-deletion command, arbitrary executable launcher,
+or remote CDP endpoint. Browser processes remain sandboxed. An expired Access session loses
+its live desktop connection and must sign in again before reconnecting.
+
+### 1. Apply on your administration host
+
+Use this repository's Terraform 1.10.3 and existing backend/provider setup. Review the plan
+for the whole stack; do not use `-target` to bypass unrelated changes. No Terraform plan or
+apply runs on the browser/dev host, and it does not delegate one to a jumpbox.
+
+```bash
+umask 077
+bm_handoff=$(mktemp -d)
+terraform init -lockfile=readonly
+terraform plan -out="$bm_handoff/plan"
+terraform apply "$bm_handoff/plan"
+terraform output -raw browser_manager_env > "$bm_handoff/browser-manager.env"
+terraform output -raw browser_manager_tunnel_token > "$bm_handoff/tunnel-token"
+```
+
+The default hostname is `browsers.cc-games.dev`; `browser_manager_hostname` can select another
+single subdomain of `cc-games.dev`. Terraform creates a dedicated tunnel, DNS record, and
+owner-only Access application using the existing Google/one-time-PIN providers. It does not
+reuse the kids' family policy or Dolphin's GitHub policy. The browser host needs no Terraform,
+AWS administration credentials, or Cloudflare account API token.
+
+Transfer the two output files privately to the browser host, owned by the browser user with
+mode `0600`. The connector token and saved Terraform plan are sensitive. Do not check them in.
+The application receives the public Access settings; only `cloudflared` receives the token
+file path. A public URL cannot work until both this apply and the host installation are done.
+
+### 2. Install on the browser host
+
+Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
+desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox`) and a current
+[`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
+with `--token-file` support. Do not disable the Chrome sandbox to make installation pass.
+
+In the transferred environment file, add `BM_BROWSER_BIN=/absolute/path/to/chrome` if Chrome
+is not installed at a standard `/usr/bin/chromium`, `/usr/bin/chromium-browser`, or
+`/usr/bin/google-chrome` path. The installer never downloads/replaces a browser or imports
+any browser's credentials. Then, from this checkout:
+
+```bash
+cd browser-manager
+npm ci --ignore-scripts
+npm run build
+./scripts/install.sh /absolute/path/browser-manager.env /absolute/path/tunnel-token
+```
+
+Run the installer as the browser owner, not root. It installs two **user** systemd units,
+`browser-manager.service` and `browser-manager-tunnel.service`, and `~/.local/bin/browserctl`.
+Only these units are restarted. Existing browser services and Dolphin remain untouched.
+The checkout must stay at the same path; to update it, rebuild and rerun the installer.
+If prompted, an administrator can enable logout/reboot persistence with
+`loginctl enable-linger <browser-user>`.
+
+State and profiles live under `~/.local/state/browser-manager` (private to the owner).
+Configuration and token files live under `~/.config/browser-manager`. The supported installer
+uses that fixed state location so the CLI and service always agree. The application listens
+only on `127.0.0.1:3210`; raw VNC and local CLI traffic use private Unix sockets.
+
+### 3. Use it
+
+```bash
+browserctl start claude --url https://claude.ai
+browserctl start research --url https://example.com
+browserctl list
+browserctl url claude
+browserctl stop research
+```
+
+Open `https://browsers.cc-games.dev`, sign in through Google as the configured owner, then
+open either desktop (for example `/browsers/claude`). Log in to websites within that desktop;
+those logins stay in its host-side profile. Closing a viewer tab does not stop the browser.
+Up to 32 names can be registered. Stop retains a name and its profile, and Start reuses it.
+On service restart, previously running managed desktops are restored from saved desired state.
+
+On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
+**Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
+input also work directly. Each viewer scales independently instead of resizing other viewers'
+desktop. Fullscreen is available where the viewing browser supports it. This is a remote
+desktop, so the website inside it keeps the host desktop layout rather than becoming mobile.
+
+To reuse an existing login profile without copying it, first close its existing browser using
+that browser's normal service controls, then run
+`browserctl start <name> --profile /absolute/profile/path` on this host. The CLI alone permits
+explicit profiles; public API requests cannot select a filesystem path. External profiles with
+Chrome locks are refused. Do not remove locks while another browser could be running. Reusing
+a profile starts a new managed desktop; it does not attach VNC to an already-running display.
+
+For service diagnostics use `systemctl --user status browser-manager browser-manager-tunnel`
+and `journalctl --user -u browser-manager -u browser-manager-tunnel`. If the shell has no user
+bus address, prefix these with `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus`.
+Cloudflare errors before sign-in usually mean the apply/connector is not ready; a stopped
+desktop can be started from the dashboard. A profile remains on disk even if startup fails.
+
+### Development and acceptance
+
+`npm test`, `npm run typecheck`, and `npm run build` are the focused CI gate. They cover
+signed Access identities, Origin enforcement, exact socket routing, expiry, and lifecycle
+without needing a Cloudflare account. After building,
+`BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
+on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
+It checks desktop/phone layout, real VNC input, reconnect, and profile retention. Screenshots
+go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
+printed temporary directory and all test desktops are stopped. New E2E findings should get
+the smallest practical regression at the layer responsible, not a new proof framework.
+
 ## File map
 
 | Area | Main files |
@@ -752,6 +876,7 @@ box.
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Private browser desktops | `browser-manager/`, `browser-manager.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 
