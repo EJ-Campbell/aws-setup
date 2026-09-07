@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createAuthorizer, readConfig, instanceName, startUrl, requireOrigin } from '../lib/auth.mjs';
 
-const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', owner: 'owner@example.test' };
+const serviceTokenId = '0123456789abcdef0123456789abcdef.access';
+const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', serviceTokenId, owner: 'owner@example.test' };
 const keys = await generateKeyPair('RS256');
 const signed = (claims = {}, options = {}) => new SignJWT({ email: config.owner, ...claims })
   .setProtectedHeader({ alg: 'RS256' }).setIssuedAt().setSubject('owner')
@@ -24,6 +25,17 @@ test('Access validates signature, owner, audience, issuer and expiry on every re
   await assert.rejects(authorize({ headers: { 'cf-access-authenticated-user-email': config.owner } }));
 });
 
+test('Access accepts only the configured signed service-token principal', async () => {
+  const authorize = createAuthorizer(config, keys.publicKey);
+  const service = claims => new SignJWT({ type: 'app', common_name: serviceTokenId, ...claims })
+    .setProtectedHeader({ alg: 'RS256' }).setIssuedAt().setSubject('')
+    .setIssuer(config.issuer).setAudience(config.audience).setExpirationTime('5m').sign(keys.privateKey);
+  assert.ok((await authorize(request(await service({})))).expiresAt > Date.now());
+  await assert.rejects(authorize(request(await service({ common_name: 'ffffffffffffffffffffffffffffffff.access' }))));
+  await assert.rejects(authorize(request(await service({ type: 'org' }))));
+  await assert.rejects(authorize(request(await signed({ email: undefined, common_name: serviceTokenId, type: 'app' }))));
+});
+
 test('mutation Origin must match exactly; absent and lookalike origins are refused', () => {
   requireOrigin({ headers: { origin: config.baseUrl } }, config.baseUrl);
   for (const origin of [undefined, 'null', 'https://browsers.example.test.evil', `${config.baseUrl}/`, 'http://browsers.example.test']) {
@@ -41,10 +53,11 @@ test('instance names and start URLs cannot select filesystem, socket, or executa
 
 test('production config refuses missing audience and unsafe origins', () => {
   assert.throws(() => readConfig({}));
-  const env = { BM_ACCESS_AUD: config.audience };
+  const env = { BM_ACCESS_AUD: config.audience, BM_ACCESS_SERVICE_TOKEN_ID: serviceTokenId };
   assert.equal(readConfig(env).port, 3210);
   for (const change of [{ BM_BASE_URL: 'http://public.example.test' }, { BM_BASE_URL: 'https://x.test/path' },
-    { BM_ACCESS_ISSUER: 'http://team.cloudflareaccess.com' }, { BM_ACCESS_ISSUER: 'https://attacker.test' }, { BM_PORT: '0' }]) {
+    { BM_ACCESS_ISSUER: 'http://team.cloudflareaccess.com' }, { BM_ACCESS_ISSUER: 'https://attacker.test' },
+    { BM_ACCESS_SERVICE_TOKEN_ID: 'not-a-client-id' }, { BM_PORT: '0' }]) {
     assert.throws(() => readConfig({ ...env, ...change }));
   }
 });

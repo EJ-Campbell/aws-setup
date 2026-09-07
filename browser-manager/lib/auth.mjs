@@ -8,16 +8,18 @@ export function readConfig(env = process.env) {
   const baseUrl = new URL(env.BM_BASE_URL || 'https://browsers.cc-games.dev');
   const issuer = new URL(env.BM_ACCESS_ISSUER || 'https://ejc3.cloudflareaccess.com');
   const audience = env.BM_ACCESS_AUD || '';
+  const serviceTokenId = env.BM_ACCESS_SERVICE_TOKEN_ID || '';
   const owner = (env.BM_OWNER_EMAIL || 'ej.campbell@gmail.com').toLowerCase();
   const port = Number(env.BM_PORT || 3210);
   if (baseUrl.protocol !== 'https:' || baseUrl.pathname !== '/' || baseUrl.search ||
       baseUrl.hash || baseUrl.username || baseUrl.password ||
       issuer.protocol !== 'https:' || !issuer.hostname.endsWith('.cloudflareaccess.com') ||
       issuer.pathname !== '/' || issuer.search || issuer.hash || issuer.username || issuer.password ||
-      !audience || !owner.includes('@') || !Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error('Set BM_BASE_URL, BM_ACCESS_AUD, BM_ACCESS_ISSUER, and BM_OWNER_EMAIL to the Terraform outputs');
+      !audience || (serviceTokenId && !/^[a-f0-9]{32}\.access$/.test(serviceTokenId)) ||
+      !owner.includes('@') || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('Set BM_BASE_URL, BM_ACCESS_AUD, BM_ACCESS_ISSUER, BM_ACCESS_SERVICE_TOKEN_ID, and BM_OWNER_EMAIL to the Terraform outputs');
   }
-  return { baseUrl: baseUrl.origin, issuer: issuer.origin, audience, owner, port };
+  return { baseUrl: baseUrl.origin, issuer: issuer.origin, audience, serviceTokenId, owner, port };
 }
 
 /** Trust the signed identity, never the unverified email header. No token/session cache. */
@@ -30,9 +32,12 @@ export function createAuthorizer(config, key = createRemoteJWKSet(
     try {
       const { payload } = await jwtVerify(token, key, {
         issuer: config.issuer, audience: config.audience, algorithms: ['RS256'],
-        requiredClaims: ['exp', 'iat', 'sub', 'email'],
+        requiredClaims: ['exp', 'iat'],
       });
-      if (typeof payload.email !== 'string' || payload.email.toLowerCase() !== config.owner) throw new Error('owner mismatch');
+      const owner = typeof payload.email === 'string' && payload.email.toLowerCase() === config.owner;
+      const service = Boolean(config.serviceTokenId) && payload.type === 'app' && payload.sub === '' &&
+        payload.common_name === config.serviceTokenId;
+      if (!owner && !service) throw new Error('principal mismatch');
       return { expiresAt: payload.exp * 1000 };
     } catch {
       throw new HttpError(403, 'Cloudflare Access session is invalid or expired');

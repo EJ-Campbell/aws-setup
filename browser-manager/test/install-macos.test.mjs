@@ -10,6 +10,9 @@ import { installMacOS, requireNode, stableExecutable, readPrivate, parseConfigur
 
 const execute = promisify(execFile);
 const uid = process.getuid();
+// These fixtures model a private owner installation, regardless of the dev shell's
+// default group-writable umask. Individual unsafe-permission cases chmod explicitly.
+process.umask(0o077);
 const validateConfig = env => {
   if (!env.BM_ACCESS_AUD || !env.BM_BASE_URL?.startsWith('https://') ||
       !env.BM_ACCESS_ISSUER?.endsWith('.cloudflareaccess.com') || !env.BM_OWNER_EMAIL?.includes('@')) throw new Error('auth rejected');

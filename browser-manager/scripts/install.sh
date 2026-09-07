@@ -59,7 +59,7 @@ import { pathToFileURL } from 'node:url';
 const [major, minor] = process.versions.node.split('.').map(Number);
 if (major < 22 || (major === 22 && minor < 13)) throw new Error('Node.js 22.13 or newer is required');
 const env = parseEnv(readFileSync(process.argv[2], 'utf8'));
-const allowed = new Set(['BM_BASE_URL', 'BM_ACCESS_AUD', 'BM_ACCESS_ISSUER', 'BM_OWNER_EMAIL', 'BM_PORT', 'BM_BROWSER_BIN']);
+const allowed = new Set(['BM_BASE_URL', 'BM_ACCESS_AUD', 'BM_ACCESS_ISSUER', 'BM_ACCESS_SERVICE_TOKEN_ID', 'BM_OWNER_EMAIL', 'BM_PORT', 'BM_BROWSER_BIN']);
 if (Object.keys(env).some((key) => !allowed.has(key))) throw new Error('Configuration may contain only documented BM_* settings');
 const { readConfig } = await import(pathToFileURL(`${process.argv[3]}/lib/auth.mjs`));
 const config = readConfig(env);

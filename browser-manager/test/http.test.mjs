@@ -11,7 +11,7 @@ import { browserViewport, createAuthorizer } from '../lib/auth.mjs';
 import { createHttpServer } from '../lib/http.mjs';
 
 const keys = await generateKeyPair('RS256');
-const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', owner: 'owner@example.test' };
+const config = { baseUrl: 'https://browsers.example.test', issuer: 'https://team.cloudflareaccess.com', audience: 'browser-audience', serviceTokenId: '', owner: 'owner@example.test' };
 const token = await new SignJWT({ email: config.owner }).setProtectedHeader({ alg: 'RS256' })
   .setIssuedAt().setSubject('owner').setIssuer(config.issuer).setAudience(config.audience)
   .setExpirationTime('5m').sign(keys.privateKey);
