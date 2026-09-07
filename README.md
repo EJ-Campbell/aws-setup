@@ -767,31 +767,68 @@ Terraform.
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
 
-`backup-security.tf` adds `ejc3-backup-dr-cmk` in `us-east-1` and the
-`ejc3-backup-recovery` logically air-gapped vault in `dev-staging`. The hourly
-`fleet-backup-recovery` controller copies only the five configured fleet volumes:
-local recovery point → customer-key-encrypted DR copy → AWS-owned-key-encrypted
-staging copy. Job events accelerate the hourly reconciliation. Initial copies
-retain 30 days; annual scheduled copies retain 365 days. The new staging vault is
-immediately compliance-locked. Ordinary vault locks and existing backup schedules
-remain unchanged during this additive stage.
+The intended steady state has **one long-term history**, in the recovery account's
+`ejc3-backup-recovery` logically air-gapped vault in **us-east-1**, separate from the
+source account and region. It is immediately compliance-locked and uses an AWS-owned
+key. The already-created empty west1 air-gapped vault remains untouched and receives
+no new copies. Empty vaults have no backup-storage charge.
 
-Before switching the two existing plans to the new DR destination, require recent
-COMPLETED points for all five exact source ARNs in local, new DR, and staging vaults;
-verify the DR key ARN and zero recovery gaps. Preserve all old points and the
-unmanaged `fcvm-backups` vault, including its indefinitely retained snapshots.
-Ordinary compliance locks are a separate reviewed apply with a three-day grace.
-Do not describe this as absolute protection against AWS account closure.
+`fleet-backup-recovery` copies only the five configured fleet volumes. Unencrypted
+ARM, x86 and jumpbox-home snapshots go directly to the final vault. The aws/ebs-encrypted
+Next.js and jumpbox-2 roots first copy to `ejc3-backup-dr-cmk` in the main account's
+us-east-1 region, then across accounts within that region. Live disks are not migrated.
+Final retention uses the original UTC backup date: the first of a month gets 365 days,
+other Sundays 30 days, and other days 7 days. This does not depend on temporary-copy TTLs.
 
-The staging plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
+After cutover, daily backup plans write to the unlocked `ejc3-backup-processing` vault
+with **no expiration while a copy is pending**. Only confirmed final copies permit
+source cleanup. The controller keeps the latest CMK checkpoint for each encrypted root
+until a verified successor exists: deleting every checkpoint would force expensive
+full transfers again. Older checkpoints are removed only with complete copy lineage.
+Cleanup permissions come only from those two temporary-vault policies; the controller
+cannot delete legacy history or final recovery points. Copy failures retain pending
+data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
+
+The checked-in `backup_recovery_cutover_enabled` gate is initially false. Bootstrap
+leaves the existing daily/weekly/monthly plans and their selections unchanged; it seeds
+from their latest recovery points and has no recovery-point deletion permission.
+Roll out with fresh full Terraform plans in this order:
+
+1. Apply the new destination/controller with the cutover gate false. Require recent
+   COMPLETED final points for all five exact source ARNs, both required CMK checkpoints
+   encrypted with `alias/fleet-backup-dr`, and completed job-to-point lineage.
+2. Set `backup_initial_restore_at` in `backup-restore-canary.tf` to a UTC minute at
+   least 30 minutes in the future. Apply its one-off plan only after all copies exist.
+   This is a date/year cron, not a recurring test. Keep the completed plan for audit.
+3. Require all five initial restore jobs COMPLETED, validation SUCCESSFUL, and test
+   resources successfully deleted. Metadata verification does not prove guest data or
+   boot integrity. Inspect copy/restore logs; do not infer success from Terraform apply.
+4. Only then set `backup_recovery_cutover_enabled=true`, review the changed selections
+   and the two temporary-vault cleanup grants, and apply. Verify new processing points,
+   final copies and source cleanup on a real daily cycle. Verify an EBS `copySnapshot`
+   event reports incremental copying on a subsequent cycle before claiming measured
+   incremental-transfer savings.
+
+Existing recovery points keep their original lifecycles and age out normally; switching
+selections does not shorten them. Never bulk-delete old history. Preserve the unmanaged
+`fcvm-backups` vault's two indefinitely retained snapshots. Do not add compliance locks
+to the temporary processing/checkpoint vaults. Final-vault immutability is not absolute
+protection against AWS account closure.
+
+The recovery plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
 restores encrypted, detached test volumes only: no instance launch, volume attach,
 or administrator role. Validation checks metadata/isolation, not filesystem contents
 or bootability. AWS Backup cleans up after the two-hour validation window; the
 controller checks expected per-volume jobs and backs up cleanup after four hours.
 Require a real successful restore/validation/cleanup cycle before claiming recovery
-testing is proven. Five tests cost about $9 plus roughly $0.11 per hour retaining
-all restored volumes; the new air-gapped storage starts around $44/month for the
-current written snapshot baseline, plus retained changed blocks and API usage.
+testing is proven. Five east1 tests cost $7.50 plus roughly $0.094 per hour retaining
+all restored volumes. At September 7 pricing and measured written snapshot sizes,
+east1 air-gapped storage starts around $39.85/month (693 GiB at $0.0575), plus roughly
+$5.78 for the two rolling CMK checkpoints (115.5 GiB at $0.05). These are baseline
+estimates, not a fixed bill: changed blocks, temporary-source lifetime, old history
+aging out, transfer, KMS/API usage and restore tests add cost. A one-day source TTL
+would retain nearly a continuous extra baseline; cleanup after verified completion
+avoids that steady-state design, but slow or failed copies still accrue storage.
 
 The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive searches across
 `/home/ubuntu` or `/tmp`; one such scan saturated both disks and made SSH unusable. Scope
