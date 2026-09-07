@@ -92,6 +92,8 @@ class BackupTopologyTests(unittest.TestCase):
                         'aws_backup_plan.processing["' + key + '"]' + '.id : ' + legacy)
             self.assertIn(re.sub(r"\s+", " ", expected), re.sub(r"\s+", " ", selection))
             self.assertNotIn('resources = ["*"]', re.sub(r"\s+", " ", selection))
+            self.assertIn("!local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled", selection)
+            self.assertRegex(selection, r"create_before_destroy\s*=\s*true")
 
     def test_controller_and_selections_protect_the_same_five_volumes(self):
         protected = compact_list(SECURITY, "backup_protected_volume_arns")
@@ -120,7 +122,7 @@ class BackupTopologyTests(unittest.TestCase):
         for policy_name, vault in (("processing_cleanup", "processing"),
                                    ("checkpoint_cleanup", "ejc3_backup_dr_cmk")):
             policy = resource("aws_backup_vault_policy", policy_name)
-            self.assertRegex(policy, r"count\s*=\s*local\.backup_recovery_cutover_enabled\s*\?\s*1\s*:\s*0")
+            self.assertRegex(policy, r"count\s*=\s*local\.backup_recovery_cleanup_enabled\s*\?\s*1\s*:\s*0")
             self.assertRegex(policy, r"backup_vault_name\s*=\s*aws_backup_vault\." + vault + r"\.name")
             self.assertIn("AWS = aws_iam_role.backup_recovery.arn", policy)
             self.assertIn('Action = "backup:DeleteRecoveryPoint"', re.sub(r"\s+", " ", policy))
@@ -146,7 +148,7 @@ class BackupTopologyTests(unittest.TestCase):
         function = resource("aws_lambda_function", "backup_recovery")
         for field, value in {
             "primary_region": "var.aws_region", "stage_region": "local.backup_recovery_region",
-            "cleanup_enabled": "local.backup_recovery_cutover_enabled",
+            "cleanup_enabled": "local.backup_recovery_cleanup_enabled",
             "cmk_hop_volumes": "local.backup_cmk_hop_volume_arns",
             "processing_vault": "aws_backup_vault.processing.name",
             "stage_vault_arn": "aws_backup_logically_air_gapped_vault.staging_recovery_dr.arn",
@@ -198,6 +200,23 @@ class BackupTopologyTests(unittest.TestCase):
         self.assertIn(":00Z$", plan)
         self.assertNotRegex(plan, r"\b(?:timestamp|plantimestamp)\(")
         self.assertRegex(plan, r'schedule_expression_timezone\s*=\s*"Etc/UTC"')
+
+    def test_oneoff_capture_exercises_processing_without_moving_legacy_selections(self):
+        self.assertRegex(CANARY, r'backup_initial_capture_at\s*=\s*(?:null|"[^"]+")')
+        self.assertIn('formatdate("m h D M ? YYYY", local.backup_initial_capture_at)', CANARY)
+        plan = resource("aws_backup_plan", "initial_capture", CANARY)
+        selection = resource("aws_backup_selection", "initial_capture", CANARY)
+        for config in (plan, selection):
+            self.assertRegex(config, r"count\s*=\s*local\.backup_initial_capture_at\s*==\s*null\s*\?\s*0\s*:\s*1")
+        self.assertIn("aws_backup_vault.processing.name", plan)
+        self.assertIn('BackupPipeline = "fleet-processing-v2"', plan)
+        self.assertNotRegex(plan, r"\b(?:delete_after|cold_storage_after|copy_action)\b")
+        self.assertRegex(plan, r"start_window\s*=\s*60\b")
+        self.assertRegex(plan, r"completion_window\s*=\s*300\b")
+        self.assertRegex(selection, r"resources\s*=\s*local\.backup_protected_volume_arns")
+        self.assertRegex(selection, r"iam_role_arn\s*=\s*local\.backup_service_role_arn")
+        self.assertNotIn("backup_recovery_cutover_enabled", selection)
+        self.assertNotRegex(plan, r"\b(?:timestamp|plantimestamp)\(")
 
     def test_periodic_scan_and_lambda_are_bounded(self):
         rule = resource("aws_cloudwatch_event_rule", "backup_reconcile")

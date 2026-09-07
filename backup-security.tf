@@ -6,8 +6,10 @@
 # https://aws.amazon.com/blogs/storage/protecting-amazon-rds-db-instances-encrypted-using-kms-aws-managed-key-with-cross-account-and-cross-region-backups/
 
 locals {
-  # Permanent cutover gate, not an operator option. Set true only after the documented
-  # five-volume copy + initial restore/validation/cleanup evidence has been recorded.
+  # Permanent rollout gates, not operator options. Verify five final copies and
+  # restores, then enable cleanup against disposable processing captures while the
+  # legacy selections remain active. Switch selections only after cleanup succeeds.
+  backup_recovery_cleanup_enabled = false
   backup_recovery_cutover_enabled = false
   backup_recovery_region          = "us-east-1"
   backup_service_role_arn         = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/AWSBackupDefaultServiceRole"
@@ -204,7 +206,7 @@ resource "aws_iam_role" "backup_recovery" {
 # history and the final immutable vault outside the deletion authority. The policies
 # themselves remain absent until the copy/restore gate has passed.
 resource "aws_backup_vault_policy" "processing_cleanup" {
-  count             = local.backup_recovery_cutover_enabled ? 1 : 0
+  count             = local.backup_recovery_cleanup_enabled ? 1 : 0
   backup_vault_name = aws_backup_vault.processing.name
   policy = jsonencode({
     Version = "2012-10-17"
@@ -220,7 +222,7 @@ resource "aws_backup_vault_policy" "processing_cleanup" {
 }
 
 resource "aws_backup_vault_policy" "checkpoint_cleanup" {
-  count             = local.backup_recovery_cutover_enabled ? 1 : 0
+  count             = local.backup_recovery_cleanup_enabled ? 1 : 0
   provider          = aws.dr
   backup_vault_name = aws_backup_vault.ejc3_backup_dr_cmk.name
   policy = jsonencode({
@@ -385,7 +387,7 @@ resource "aws_lambda_function" "backup_recovery" {
         primary_vault_arn    = aws_backup_vault.ejc3_backup.arn
         processing_vault     = aws_backup_vault.processing.name
         processing_vault_arn = aws_backup_vault.processing.arn
-        cleanup_enabled      = local.backup_recovery_cutover_enabled
+        cleanup_enabled      = local.backup_recovery_cleanup_enabled
         cmk_hop_volumes      = local.backup_cmk_hop_volume_arns
         dr_vault             = aws_backup_vault.ejc3_backup_dr_cmk.name
         dr_vault_arn         = aws_backup_vault.ejc3_backup_dr_cmk.arn

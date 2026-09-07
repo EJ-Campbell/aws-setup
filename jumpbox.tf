@@ -202,6 +202,13 @@ resource "aws_backup_selection" "jumpbox" {
     var.enable_jumpbox ? aws_ebs_volume.jumpbox_home[0].arn : "",
     var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
   ])
+  lifecycle {
+    create_before_destroy = true
+    precondition {
+      condition     = !local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled
+      error_message = "Verify temporary-copy cleanup before switching the jumpbox backup selection."
+    }
+  }
 }
 
 # ============================================
