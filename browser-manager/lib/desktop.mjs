@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { VNC_PIXEL_RATIO } from './frame-viewport.mjs';
 
 const execute = promisify(execFile);
+const desktopMode = `${1440 * VNC_PIXEL_RATIO}x${900 * VNC_PIXEL_RATIO}`;
 const navigationHelper = fileURLToPath(new URL('./native-navigation.py', import.meta.url));
 // xprop can read these numeric hints, but writes them as CARDINAL instead of WM_SIZE_HINTS.
 // This fixed native call preserves the original type and every field; no script comes from callers.
@@ -106,7 +108,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
   try {
     await writeFile(authFile, authority('0', cookie), { mode: 0o600, flag: 'wx' });
     const x = launch('Xvfb', '/usr/bin/Xvfb', [
-      '-displayfd', '3', '-screen', '0', '1440x900x24', '-nolisten', 'tcp',
+      '-displayfd', '3', '-screen', '0', `${desktopMode}x24`, '-nolisten', 'tcp',
       '-auth', authFile, '-noreset',
     ], process.env, true);
     const display = await Promise.race([
@@ -150,6 +152,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
     const browser = launch('Browser', browserBin, [
       `--user-data-dir=${profile}`, '--ozone-platform=x11', '--no-first-run',
       '--no-default-browser-check', '--force-renderer-accessibility=basic',
+      `--force-device-scale-factor=${VNC_PIXEL_RATIO}`,
       '--start-maximized', '--window-size=1440,900', url,
     ], env);
     const getNavigation = () => {
@@ -162,7 +165,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       }).catch(() => ({ canGoBack: null })).finally(() => { navigationRead = undefined; });
       return navigationRead;
     };
-    let activeMode = '1440x900';
+    let activeMode = desktopMode;
     const modes = new Map();
     const originalHints = new Map();
     async function resizeDesktop(viewport) {
@@ -202,7 +205,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       const previousMode = activeMode;
       const savedBefore = new Map(originalHints);
       try {
-        let nextMode = '1440x900';
+        let nextMode = desktopMode;
         if (mode === 'phone') {
           // At most two custom modes exist. Prepare the inactive slot so rollback retains the old one.
           nextMode = [...modes].find(([, entry]) => entry.size === `${width}x${height}`)?.[0]
@@ -216,8 +219,10 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
               await command('/usr/bin/xrandr', ['--rmmode', nextMode]);
               modes.delete(nextMode);
             }
-            await command('/usr/bin/xrandr', ['--newmode', nextMode, '30',
-              ...[width, width + 10, width + 50, width + 90, height, height + 6, height + 16, height + 56].map(String)]);
+            // API sizes remain logical; scale the raster/timings together to retain refresh rate.
+            await command('/usr/bin/xrandr', ['--newmode', nextMode, String(30 * VNC_PIXEL_RATIO ** 2),
+              ...[width, width + 10, width + 50, width + 90, height, height + 6, height + 16, height + 56]
+                .map(value => String(value * VNC_PIXEL_RATIO))]);
             modes.set(nextMode, { size: `${width}x${height}`, attached: false });
           }
           if (!modes.get(nextMode).attached) {
