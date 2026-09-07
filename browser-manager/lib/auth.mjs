@@ -51,6 +51,14 @@ export function instanceName(value) {
   return value;
 }
 
+export function instanceLabel(value) {
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f-\u009f]/u.test(value) ||
+      !value.trim() || value.trim().length > 80) {
+    throw new HttpError(400, 'Use a label of 1–80 characters without control characters');
+  }
+  return value.trim();
+}
+
 export function startUrl(value) {
   if (value === undefined) return undefined;
   try {

@@ -72,6 +72,16 @@ input::placeholder, textarea::placeholder { color: #77828d; opacity: 1; }
 .state[data-state="starting"] { background: #fff4dd; color: #895611; }
 .state[data-state="error"] { background: #fbeeea; color: #994b36; }
 .browser-card h3 { font-size: 18px; font-weight: 650; overflow-wrap: anywhere; }
+.card-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.card-heading h3 { min-width: 0; }
+.rename-trigger { flex-shrink: 0; padding: 10px 8px; font-size: 12px; }
+.rename-form { margin: 12px 0 6px; padding-top: 14px; border-top: 1px solid var(--line); }
+.rename-form input { margin-top: 6px; }
+.rename-hint, .rename-error { font-size: 12px; line-height: 1.5; margin-top: 8px; }
+.rename-hint { color: var(--muted); }
+.rename-error { color: #994b36; overflow-wrap: anywhere; }
+.rename-actions { display: flex; gap: 8px; margin-top: 12px; }
+.rename-actions .button { flex: 1; }
 .browser-url { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 7px 0 24px; }
 .card-error { color: #994b36; font-size: 12px; margin: -10px 0 16px; overflow-wrap: anywhere; }
 .card-actions { display: flex; gap: 8px; margin-top: auto; align-items: center; }

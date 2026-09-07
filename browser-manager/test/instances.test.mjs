@@ -253,3 +253,61 @@ test('limits accidental process fanout to 32 named desktops', async (t) => {
   await assert.rejects(manager.start('too-many'), /limit reached/);
   assert.equal(launches.length, 32);
 });
+
+test('rename persists only a display label while a running desktop keeps its identity and profile', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  const before = await manager.start('stable-name');
+  assert.equal(before.label, 'stable-name');
+  const stateFile = join(stateDir, 'instances.json');
+  const original = JSON.parse(await readFile(stateFile, 'utf8'))[0];
+  assert.equal(Object.hasOwn(original, 'label'), false, 'old metadata does not need a label');
+  const socket = manager.getSocket('stable-name');
+  const renamed = await manager.rename('stable-name', '  Claude · Personal  ');
+  assert.deepEqual(renamed, { ...before, label: 'Claude · Personal' });
+  assert.equal(manager.getSocket('stable-name'), socket);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].handle.stopped, undefined);
+  assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8'))[0], { ...original, label: 'Claude · Personal' });
+  await manager.close();
+  const restored = createInstanceManager({ stateDir, browserBin: '/test/chrome', baseUrl: 'https://browsers.example' }, {
+    launch: async ({ profile }) => {
+      assert.equal(profile, original.profile);
+      return { socketPath: '/restored/socket', close: async () => {}, closed: new Promise(() => {}) };
+    },
+  });
+  t.after(() => restored.close());
+  await restored.initialize();
+  assert.deepEqual(restored.list(), [{ ...before, label: 'Claude · Personal' }]);
+});
+
+test('rename rejects invalid labels and rolls back failed saves without replacing the desktop record', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  await manager.start('alpha');
+  for (const label of [undefined, null, 1, '', '   ', 'x'.repeat(81), 'line\nbreak', '\ttrim', 'nul\0', 'delete\x7f', 'control\x85']) {
+    assert.throws(() => manager.rename('alpha', label), /label/);
+  }
+  await assert.rejects(manager.rename('missing', 'Good label'), /Unknown browser/);
+  for (const label of ['alpha', 'Kept label']) {
+    if (label !== 'alpha') await manager.rename('alpha', label);
+    const before = manager.list();
+    const disk = await readFile(join(stateDir, 'instances.json'), 'utf8');
+    const failure = await failStateSync(t, stateDir);
+    await assert.rejects(manager.rename('alpha', 'Lost label'), /Could not save/);
+    failure.mock.restore();
+    assert.deepEqual(manager.list(), before);
+    assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), disk);
+  }
+  await launches[0].handle.close();
+  await manager.start('beta');
+  assert.equal(manager.list().find(({ name }) => name === 'alpha').state, 'error');
+});
+
+test('rename preserves the replaced label when directory sync fails after rename', async (t) => {
+  const { manager, stateDir } = await fixture(t);
+  await manager.start('alpha');
+  const failure = await failStateSync(t, stateDir, true);
+  await assert.rejects(manager.rename('alpha', 'Replaced label'), /durability could not be confirmed/);
+  failure.mock.restore();
+  assert.equal(manager.list()[0].label, 'Replaced label');
+  assert.equal(JSON.parse(await readFile(join(stateDir, 'instances.json'), 'utf8'))[0].label, 'Replaced label');
+});

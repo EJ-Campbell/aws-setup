@@ -138,3 +138,32 @@ test('requests during startup or teardown cannot reach the manager', async () =>
   try { assert.equal((await fetch(`${base}/api/browsers`)).status, 503); }
   finally { await close(server); }
 });
+
+test('rename requires owner auth and exact Origin, accepts only a valid label, and preserves the stable route', async () => {
+  const calls = [];
+  const row = { name: 'stable', label: 'stable', url: `${config.baseUrl}/browsers/stable`, state: 'running' };
+  const manager = { list: () => [row], rename: async (name, label) => { calls.push([name, label]); return { ...row, label }; } };
+  const server = createHttpServer({ manager, config, authorize: createAuthorizer(config, keys.publicKey), nextHandler: () => {} });
+  const base = await bind(server);
+  try {
+    for (const [path, body, sentHeaders, status] of [
+      ['/api/browsers/stable/rename', { label: 'New label' }, { 'Content-Type': 'application/json' }, 401],
+      ['/api/browsers/stable/rename', { label: 'New label' }, { ...headers, Origin: 'https://evil.test' }, 403],
+      ['/api/browsers/stable/rename', { label: 'New label' }, { ...headers, Origin: '' }, 403],
+      ['/api/browsers/stable/rename', { label: 'New label', name: 'different' }, headers, 400],
+      ['/api/browsers/stable/rename', { label: 'New label', profile: '/private' }, headers, 400],
+      ['/api/browsers/stable/rename', {}, headers, 400],
+      ['/api/browsers/stable/rename', { label: 'bad\nlabel' }, headers, 400],
+      ['/api/browsers/stable/rename', { label: 'x'.repeat(81) }, headers, 400],
+      ['/api/browsers/missing/rename', { label: 'New label' }, headers, 404],
+    ]) {
+      const response = await fetch(base + path, { method: 'POST', headers: sentHeaders, body: JSON.stringify(body) });
+      assert.equal(response.status, status);
+    }
+    assert.deepEqual(calls, []);
+    const response = await fetch(`${base}/api/browsers/stable/rename`, { method: 'POST', headers, body: JSON.stringify({ label: '  Personal browser  ' }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { browser: { ...row, label: 'Personal browser' } });
+    assert.deepEqual(calls, [['stable', 'Personal browser']]);
+  } finally { await close(server); }
+});

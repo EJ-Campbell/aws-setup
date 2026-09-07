@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promi
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { launchDesktop } from './desktop.mjs';
+import { instanceLabel } from './auth.mjs';
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const MAX_INSTANCES = 32;
@@ -64,7 +65,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
   let tail = Promise.resolve();
   const stateFile = join(stateDir, 'instances.json');
   const publicRow = (r) => ({
-    name: r.name, url: `${origin.origin}/browsers/${r.name}`, state: r.state,
+    name: r.name, label: r.label ?? r.name, url: `${origin.origin}/browsers/${r.name}`, state: r.state,
     createdAt: r.createdAt, ...(r.error ? { error: r.error } : {}),
   });
   const enqueue = (operation) => {
@@ -86,6 +87,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
       created = true;
       await file.writeFile(JSON.stringify([...records.values()].map((r) => ({
         name: r.name, profile: r.profile, startUrl: r.startUrl, createdAt: r.createdAt, desired: r.desired,
+        ...(r.label === undefined ? {} : { label: r.label }),
       }))));
       await file.sync();
       await file.close();
@@ -175,6 +177,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
         const name = checkedName(entry.name);
         if (records.has(name)) throw new Error('Duplicate browser name in state');
         records.set(name, { name, profile: entry.profile, startUrl: checkedUrl(entry.startUrl),
+          ...(entry.label === undefined ? {} : { label: instanceLabel(entry.label) }),
           createdAt: entry.createdAt, desired: entry.desired, state: 'stopped' });
       }
       initialized = true;
@@ -237,6 +240,26 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
         if (record.runtimeDir) await rm(record.runtimeDir, { recursive: true, force: true });
         record.state = 'stopped';
         record.error = undefined;
+        return publicRow(record);
+      });
+    },
+    rename(name, value) {
+      checkedName(name);
+      const label = instanceLabel(value);
+      return enqueue(async () => {
+        assertOpen();
+        const record = records.get(name);
+        if (!record) throw new Error('Unknown browser');
+        const previous = record.label;
+        record.label = label;
+        try { await save(); }
+        catch (error) {
+          if (!error.stateReplaced) {
+            if (previous === undefined) delete record.label;
+            else record.label = previous;
+          }
+          throw error;
+        }
         return publicRow(record);
       });
     },

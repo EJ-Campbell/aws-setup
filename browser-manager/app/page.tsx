@@ -24,8 +24,16 @@ export default function Dashboard() {
   const [pending, setPending] = useState("");
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  const [editing, setEditing] = useState("");
+  const [label, setLabel] = useState("");
+  const [renameError, setRenameError] = useState("");
   const mutation = useRef(false);
   const formName = useRef<HTMLInputElement>(null);
+  const renameTrigger = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!editing) renameTrigger.current?.focus();
+  }, [editing]);
 
   const refresh = useCallback(async () => {
     try {
@@ -82,6 +90,32 @@ export default function Dashboard() {
     }
   }
 
+  async function rename(event: FormEvent, browserName: string) {
+    event.preventDefault();
+    const trimmed = label.trim();
+    if (!trimmed || trimmed.length > 80 || /[\u0000-\u001f\u007f-\u009f]/u.test(label)) {
+      setRenameError("Use 1–80 characters without control characters.");
+      return;
+    }
+    if (mutation.current) return;
+    mutation.current = true;
+    setPending(`rename:${browserName}`);
+    setRenameError("");
+    try {
+      const { browser } = await request<{ browser: BrowserInstance }>(`/api/browsers/${encodeURIComponent(browserName)}/rename`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ label: trimmed }),
+      });
+      setBrowsers(current => current.map(item => item.name === browserName ? browser : item));
+      setNotice(`Renamed to ${browser.label}. Its URL and profile are unchanged.`);
+      setEditing("");
+    } catch (cause) {
+      setRenameError(cause instanceof Error ? cause.message : "Unable to rename this browser. Try again.");
+    } finally {
+      mutation.current = false;
+      setPending("");
+    }
+  }
+
   const running = browsers.filter((item) => item.state === "running").length;
   return (
     <main className="dashboard">
@@ -118,7 +152,20 @@ export default function Dashboard() {
             {browsers.map((browser) => (
               <li className="browser-card" key={browser.name}>
                 <div className="card-top"><span className="browser-icon"><Icon name="browser" size={23} /></span><span className="state" data-state={browser.state}><span />{browser.state}</span></div>
-                <h3>{browser.name}</h3><p className="browser-url" title={browser.url}>{browser.url || "Blank start page"}</p>
+                <div className="card-heading"><h3>{browser.label}</h3><button className="button quiet rename-trigger" disabled={!!pending || !!editing} aria-label={`Rename ${browser.label}`} aria-controls={`rename-${browser.name}`} aria-expanded={editing === browser.name} onClick={event => {
+                  renameTrigger.current = event.currentTarget;
+                  setEditing(browser.name); setLabel(browser.label); setRenameError("");
+                }}>Rename</button></div>
+                {editing === browser.name && <form className="rename-form" id={`rename-${browser.name}`} onSubmit={event => void rename(event, browser.name)} onKeyDown={event => {
+                  if (event.key === "Escape" && !pending) { event.preventDefault(); setEditing(""); }
+                }}>
+                  <label htmlFor={`label-${browser.name}`}>Browser label</label>
+                  <input id={`label-${browser.name}`} name="label" autoFocus value={label} maxLength={80} required disabled={!!pending} aria-invalid={!!renameError} aria-describedby={`label-hint-${browser.name}${renameError ? ` label-error-${browser.name}` : ""}`} onChange={event => { setLabel(event.target.value); setRenameError(""); }} />
+                  <p id={`label-hint-${browser.name}`} className="rename-hint">Display label only. Your URL and profile stay the same.</p>
+                  {renameError && <p className="rename-error" id={`label-error-${browser.name}`} role="alert">{renameError}</p>}
+                  <div className="rename-actions"><button className="button primary" disabled={!!pending || !label.trim()}>{pending === `rename:${browser.name}` ? "Saving…" : "Save"}</button><button className="button" type="button" disabled={!!pending} onClick={() => setEditing("")}>Cancel</button></div>
+                </form>}
+                <p className="browser-url" title={browser.url}>{browser.url || "Blank start page"}</p>
                 {browser.error && <p className="card-error">{browser.error}</p>}
                 <div className="card-actions">
                   {browser.state === "running" ? <a className="button primary" href={`/browsers/${encodeURIComponent(browser.name)}`}>Open desktop<Icon name="arrow" size={17} /></a> : <button className="button primary" disabled={!!pending || browser.state === "starting"} onClick={() => void mutate(`/api/browsers/${encodeURIComponent(browser.name)}/start`, `start:${browser.name}`, {})}>{browser.state === "starting" || pending === `start:${browser.name}` ? "Starting…" : "Start browser"}</button>}
