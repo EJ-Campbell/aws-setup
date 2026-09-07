@@ -743,6 +743,9 @@ resource "aws_backup_restore_testing_selection" "fleet_ebs_dr" {
   restore_metadata_overrides = {
     availabilityZone = data.aws_availability_zones.backup_restore_staging_dr.names[0]
     volumeType       = "gp3"
+    # Copied metadata can retain the original source-account/region KMS key. Use
+    # this recovery account's EBS key, not a key needed only by the old live disk.
+    kmsKeyId = "arn:aws:kms:${local.backup_recovery_region}:${data.aws_caller_identity.staging.account_id}:alias/aws/ebs"
   }
   depends_on = [aws_iam_role_policy.backup_restore_test]
 }

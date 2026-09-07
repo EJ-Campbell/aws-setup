@@ -800,14 +800,20 @@ Roll out with fresh full Terraform plans in this order:
 2. Set `backup_initial_capture_at` in `backup-restore-canary.tf` to a future UTC minute
    and apply the one-off processing capture. It backs up the same five volumes into
    the processing vault with no expiration and the required provenance tag, without
-   moving either existing backup selection. Require its five new source points and
-   their exact completed final copies, including both CMK successor checkpoints.
+   moving either existing backup selection. Keep both cleanup and cutover gates false.
 3. Set `backup_initial_restore_at` in `backup-restore-canary.tf` to a UTC minute at
-   least 30 minutes in the future. Apply its one-off plan only after all copies exist.
-   This is a date/year cron, not a recurring test. Keep the completed plan for audit.
-4. Require all five initial restore jobs COMPLETED, validation SUCCESSFUL, and test
-   resources successfully deleted. Metadata verification does not prove guest data or
-   boot integrity. Inspect copy/restore logs; do not infer success from Terraform apply.
+   least 30 minutes in the future. Once step 1 has verified all five initial final
+   copies, steps 2 and 3 may be applied together and run in parallel: restoring from
+   the final vault does not depend on the new processing capture finishing. These
+   are date/year crons, not recurring tests. The restore plan selects the latest
+   completed point per volume, which may be a newer copy arriving during capture;
+   record the actual recovery-point ARNs used by its jobs and verify their copy lineage.
+4. Before enabling any recovery-point cleanup, require both independent checks:
+   the five new processing captures have exact COMPLETED final copies and both CMK
+   successor checkpoints; and all five initial restore jobs are COMPLETED, validation
+   SUCCESSFUL, with test resources successfully deleted. Metadata verification does
+   not prove guest data or boot integrity. Inspect copy/restore logs; do not infer
+   success from Terraform apply.
 5. Set only `backup_recovery_cleanup_enabled=true` and apply the two temporary-vault
    cleanup grants and controller update. Existing selections must remain unchanged.
    Verify the five processing captures and superseded CMK checkpoints actually disappear,
@@ -829,9 +835,12 @@ protection against AWS account closure.
 
 The recovery plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
 restores encrypted, detached test volumes only: no instance launch, volume attach,
-or administrator role. Validation checks metadata/isolation, not filesystem contents
-or bootability. AWS Backup cleans up after the two-hour validation window; the
-controller checks expected per-volume jobs and backs up cleanup after four hours.
+or administrator role. Both initial and monthly tests explicitly use the recovery
+account's us-east-1 `alias/aws/ebs` key: copied restore metadata can still reference
+the original source-account key. This changes only test volumes, not live disks or
+the final vault's AWS-owned encryption. Validation checks metadata/isolation, not
+filesystem contents or bootability. AWS Backup cleans up after the two-hour validation
+window; the controller checks expected per-volume jobs and backs up cleanup after four hours.
 Require a real successful restore/validation/cleanup cycle before claiming recovery
 testing is proven. Five east1 tests cost $7.50 plus roughly $0.094 per hour retaining
 all restored volumes. At September 7 pricing and measured written snapshot sizes,

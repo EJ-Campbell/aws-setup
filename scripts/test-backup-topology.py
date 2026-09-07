@@ -175,6 +175,18 @@ class BackupTopologyTests(unittest.TestCase):
             self.assertRegex(selection, r'volumeType\s*=\s*"gp3"')
             self.assertNotRegex(selection, re.compile(r"^\s*encrypted\s*=", re.M))
 
+    def test_restore_selections_override_inherited_source_encryption_key(self):
+        # LAG copies can retain an original aws/ebs source key in restore metadata.
+        # Both paths must select the recovery account/region's key explicitly.
+        destination_key = ('"arn:aws:kms:${local.backup_recovery_region}:'
+                           '${data.aws_caller_identity.staging.account_id}:alias/aws/ebs"')
+        for source, selection_name in ((SECURITY, "fleet_ebs_dr"), (CANARY, "initial_ebs")):
+            with self.subTest(selection=selection_name):
+                selection = resource("aws_backup_restore_testing_selection", selection_name, source)
+                metadata = re.search(r"restore_metadata_overrides\s*=\s*\{(.*?)\n  \}", selection, re.S)
+                self.assertIsNotNone(metadata)
+                self.assertRegex(metadata.group(1), r"\bkmsKeyId\s*=\s*" + re.escape(destination_key))
+
     def test_restore_role_cannot_boot_attach_or_use_source_region(self):
         role = resource("aws_iam_role_policy", "backup_restore_test")
         observer = resource("aws_iam_role_policy", "backup_recovery_observer")
