@@ -112,6 +112,18 @@ try {
     await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
       .toEqual([213, 244, 230, 255]);
     await page.screenshot({ path: join(shots, `${label}-keyboard.png`), fullPage: true });
+    await page.bringToFront();
+    // Require a fresh transport after the drop; a stale Connected label cannot satisfy this.
+    const automaticSocket = page.waitForEvent('websocket', {
+      predicate: socket => new URL(socket.url()).pathname === `/browsers/${selected}/vnc`, timeout: 15000,
+    });
+    server.closeVnc();
+    await automaticSocket;
+    await expect(page.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
+      .toEqual([213, 244, 230, 255]);
+    await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
+    await page.screenshot({ path: join(shots, `${label}-auto-reconnected.png`), fullPage: true });
     // Navigate the actual remote Chrome, then use the viewer toolbar to go back. pageshow
     // reports both a network reload and a back/forward-cache restore without using CDP.
     const nextLocation = `/${selected}?history=next-${label}`;
@@ -146,8 +158,8 @@ try {
   assert.ok(events.filter(e => e.name === 'alpha' && e.kind === 'profile').slice(1).every(e => e.value === 'alpha'));
   await writeFile(join(shots, 'acceptance.json'), JSON.stringify({ passed: true, browserBin,
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
-      'desktop-and-phone-layout', 'remote-browser-back-desktop-and-phone', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
-  console.log(`PASS: desktop + phone VNC, input, remote-browser Back, reconnect, and retained profile data. Screenshots: ${shots}`);
+      'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
+  console.log(`PASS: desktop + phone VNC, input, automatic reconnect, remote-browser Back, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
   // Next installs an uncaught-exception listener; preserve a failing exit status explicitly.
   console.error(error);
