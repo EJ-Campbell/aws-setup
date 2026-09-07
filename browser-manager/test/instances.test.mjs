@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, open, readFile, readdir, readlink, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, readlink, realpath, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { createInstanceManager } from '../lib/instances.mjs';
 
+// macOS /var is a symlink and its per-user tmp path can exceed the Unix socket limit.
+// Use a short canonical temporary root, without weakening production path validation.
+const testTmp = await realpath(process.platform === 'darwin' ? '/tmp' : tmpdir());
+
 async function fixture(t, launch) {
-  const stateDir = await mkdtemp(join(tmpdir(), 'browser-manager-'));
+  const stateDir = await mkdtemp(join(testTmp, 'browser-manager-'));
   const launches = [];
   const manager = createInstanceManager({ stateDir, browserBin: '/test/chrome', baseUrl: 'https://browsers.example' }, {
     launch: launch ?? (async (options) => {
@@ -157,6 +161,24 @@ test('named desktops have isolated profiles and sockets; stopping preserves only
   assert.equal((await stat(join(stateDir, 'instances.json'))).mode & 0o777, 0o600);
   await manager.close();
   assert.equal(launches.every(({ handle }) => handle.stopped), true);
+});
+
+test('Mac page handles are scoped to the selected running desktop and revoked on stop or replacement', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('mac'); await manager.start('other');
+  assert.equal(manager.getPage('mac'), null, 'Linux desktops are not page transports');
+  launches[0].handle.transport = 'page';
+  assert.equal(manager.getPage('mac'), launches[0].handle);
+  assert.equal(manager.getPage('other'), null);
+  assert.equal(manager.getPage('missing'), null);
+  assert.throws(() => manager.getPage('../mac'), /Invalid browser name/);
+  await manager.stop('mac');
+  assert.equal(manager.getPage('mac'), null);
+  await manager.start('mac');
+  launches[2].handle.transport = 'page';
+  assert.equal(manager.getPage('mac'), launches[2].handle);
+  await manager.close();
+  assert.equal(manager.getPage('mac'), null);
 });
 
 test('rejects route escapes, unsafe URLs, linked state/profiles, and overbroad state permissions', async (t) => {

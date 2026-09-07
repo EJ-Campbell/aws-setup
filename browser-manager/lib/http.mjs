@@ -33,14 +33,14 @@ function pathOf(req, baseUrl) {
 }
 
 /** Same small API for the authenticated web listener and owner-only local CLI socket. */
-export function createApi({ manager, baseUrl, local = false }) {
+export function createApi({ manager, baseUrl, local = false, transport = 'vnc' }) {
   return async (req, res, path) => {
     if (!path.startsWith('/api/')) return false;
     if (req.method === 'GET' && path === '/api/browsers') {
       json(res, 200, { browsers: await manager.list() }); return true;
     }
     if (req.method === 'GET' && path === '/api/config') {
-      json(res, 200, { baseUrl }); return true;
+      json(res, 200, { baseUrl, transport }); return true;
     }
     const navigation = /^\/api\/browsers\/([a-z0-9-]+)\/navigation$/.exec(path);
     if (req.method === 'GET' && navigation) {
@@ -80,7 +80,7 @@ export function createApi({ manager, baseUrl, local = false }) {
 }
 
 export function createHttpServer({ manager, config, authorize, nextHandler, local = false, isReady = () => true }) {
-  const api = createApi({ manager, baseUrl: config.baseUrl, local });
+  const api = createApi({ manager, baseUrl: config.baseUrl, local, transport: config.transport });
   const server = createServer(async (req, res) => {
     try {
       if (!local) await authorize(req);
@@ -105,14 +105,98 @@ export function createHttpServer({ manager, config, authorize, nextHandler, loca
   if (local) return server;
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024, perMessageDeflate: false });
-  server.closeVnc = () => { for (const client of wss.clients) client.terminate(); };
+  const pages = new WebSocketServer({ noServer: true, maxPayload: 16384, perMessageDeflate: false });
+  const pageViewers = new Map();
+  server.closeVnc = () => {
+    for (const pool of [wss, pages]) for (const client of pool.clients) client.terminate();
+  };
   server.on('upgrade', async (req, socket, head) => {
     socket.on('error', () => {});
     try {
       const identity = await authorize(req);
       if (!isReady()) throw new HttpError(503, 'Browser manager is starting or stopping');
       requireOrigin(req, config.baseUrl);
-      const route = /^\/browsers\/([a-z0-9-]+)\/vnc$/.exec(pathOf(req, config.baseUrl));
+      const path = pathOf(req, config.baseUrl);
+      const pageRoute = /^\/browsers\/([a-z0-9-]+)\/page$/.exec(path);
+      if (pageRoute) {
+        const name = instanceName(pageRoute[1]);
+        const desktop = manager.getPage?.(name);
+        if (!desktop) throw new HttpError(404, 'Browser is not running');
+        if ((pageViewers.get(name) ?? 0) >= 8) throw new HttpError(429, 'Too many browser viewers');
+        if (!Number.isFinite(identity.expiresAt) || identity.expiresAt <= Date.now()) {
+          throw new HttpError(401, 'Sign in again');
+        }
+        pages.handleUpgrade(req, socket, head, ws => {
+          pageViewers.set(name, (pageViewers.get(name) ?? 0) + 1);
+          let active = true;
+          let unsubscribe = () => {};
+          let pending = 0;
+          let tail = Promise.resolve();
+          let tokens = 120;
+          let updated = Date.now();
+          let alive = true;
+          const authorized = () => active && isReady() && Date.now() < identity.expiresAt &&
+            manager.getPage?.(name) === desktop;
+          const send = message => {
+            if (message.type === 'closed') { disconnect(1000, 'Browser stopped'); return; }
+            if (!authorized() || ws.readyState !== 1) return;
+            // Frames may be dropped, but losing tab identity would show new pixels beneath an
+            // old address/title and allow input into the wrong labeled page. Reconnect to resync.
+            if (ws.bufferedAmount > 2 * 1024 * 1024) {
+              if (message.type !== 'frame') disconnect(1013, 'Slow viewer; reconnect to resync');
+              return;
+            }
+            ws.send(JSON.stringify(message));
+          };
+          const cleanup = () => {
+            if (!active) return;
+            active = false;
+            clearTimeout(expire);
+            clearInterval(heartbeat);
+            unsubscribe();
+            const remaining = (pageViewers.get(name) ?? 1) - 1;
+            if (remaining) pageViewers.set(name, remaining); else pageViewers.delete(name);
+          };
+          const disconnect = (code, reason) => { cleanup(); ws.close(code, reason); };
+          const expire = setTimeout(() => disconnect(1008, 'Sign in again'),
+            Math.max(1, Math.min(identity.expiresAt - Date.now(), 2147483647)));
+          expire.unref();
+          const heartbeat = setInterval(() => {
+            if (!alive || !authorized()) { cleanup(); ws.terminate(); return; }
+            alive = false;
+            ws.ping();
+          }, 30000);
+          heartbeat.unref();
+          ws.on('pong', () => { alive = true; });
+          ws.once('close', cleanup);
+          ws.once('error', cleanup);
+          ws.on('message', (bytes, binary) => {
+            if (!authorized()) { disconnect(1008, 'Browser session expired'); return; }
+            const now = Date.now();
+            tokens = Math.min(120, tokens + (now - updated) * 0.12);
+            updated = now;
+            if (binary || bytes.length > 16384 || tokens < 1 || pending >= 32) {
+              disconnect(1008, 'Invalid or excessive browser input'); return;
+            }
+            tokens--;
+            let message;
+            try {
+              message = JSON.parse(bytes.toString('utf8'));
+              if (!message || typeof message !== 'object' || Array.isArray(message)) throw new Error();
+            } catch { disconnect(1008, 'Invalid browser input'); return; }
+            pending++;
+            tail = tail.then(async () => {
+              // Queued input loses authority immediately on expiry/disconnect/replacement.
+              if (authorized()) await desktop.command(message, { isAuthorized: authorized });
+            }).catch(() => send({ type: 'error', message: 'Browser action could not be completed.' }))
+              .finally(() => { pending--; });
+          });
+          try { unsubscribe = desktop.subscribe(send); }
+          catch { disconnect(1011, 'Browser stream unavailable'); }
+        });
+        return;
+      }
+      const route = /^\/browsers\/([a-z0-9-]+)\/vnc$/.exec(path);
       if (!route) throw new HttpError(404, 'Unknown desktop');
       const target = manager.getSocket(instanceName(route[1]));
       if (!target) throw new HttpError(404, 'Desktop is not running');
@@ -141,6 +225,6 @@ export function createHttpServer({ manager, config, authorize, nextHandler, loca
       socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     }
   });
-  server.once('close', () => { server.closeVnc(); wss.close(); });
+  server.once('close', () => { server.closeVnc(); wss.close(); pages.close(); });
   return server;
 }
