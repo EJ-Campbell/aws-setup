@@ -23,6 +23,8 @@ jobs:
           cache: npm
           cache-dependency-path: browser-manager/package-lock.json
       - run: npm ci --ignore-scripts
+      - name: Install native VNC regression prerequisite
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends x11vnc
       - run: npm test
       - run: npm run typecheck
       - run: npm run build

@@ -17,6 +17,15 @@ function authority(display, cookie) {
   return Buffer.concat([Buffer.from([255, 255]), ...fields]);
 }
 
+export function vncArguments({ display, authFile, socketPath }) {
+  return [
+    '-norc', '-display', `:${display}`, '-auth', authFile,
+    // LibVNCServer has its own IPv6 port; x11vnc's -no6 does not disable it.
+    '-unixsock', socketPath, '-rfbport', '0', '-rfbportv6', '0', '-no6', '-forever', '-shared',
+    '-nopw', '-noremote', '-nocmds', '-novncconnect', '-input', 'KMBC', '-quiet',
+  ];
+}
+
 /** Only these fixed programs are launched. Native subprocesses never inherit a shell or CDP port. */
 export async function launchDesktop({ runtimeDir, profile, browserBin, url, signal }) {
   const children = [];
@@ -94,11 +103,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
     const env = { ...process.env, DISPLAY: `:${display}`, XAUTHORITY: authFile };
     delete env.WAYLAND_DISPLAY;
     launch('Window manager', '/usr/bin/openbox', ['--sm-disable'], env);
-    launch('VNC server', '/usr/bin/x11vnc', [
-      '-norc', '-display', `:${display}`, '-auth', authFile,
-      '-unixsock', socketPath, '-rfbport', '0', '-no6', '-forever', '-shared',
-      '-nopw', '-noremote', '-nocmds', '-novncconnect', '-input', 'KMBC', '-quiet',
-    ], env);
+    launch('VNC server', '/usr/bin/x11vnc', vncArguments({ display, authFile, socketPath }), env);
     launch('Browser', browserBin, [
       `--user-data-dir=${profile}`, '--ozone-platform=x11', '--no-first-run',
       '--no-default-browser-check', '--start-maximized', '--window-size=1440,900', url,
