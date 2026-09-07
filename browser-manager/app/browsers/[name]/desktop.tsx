@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type RFB from "@novnc/novnc";
 import { Icon } from "../../ui";
+import { createReconnectLoop } from "../../../lib/reconnect.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
@@ -11,10 +12,12 @@ export default function Desktop({ name }: { name: string }) {
   const screen = useRef<HTMLDivElement>(null);
   const workspace = useRef<HTMLElement>(null);
   const client = useRef<RFB | null>(null);
+  const reconnect = useRef<() => void>(() => {});
   const textInput = useRef<HTMLTextAreaElement>(null);
   const [connection, setConnection] = useState<Connection>("connecting");
   const [detail, setDetail] = useState("");
-  const [attempt, setAttempt] = useState(0);
+  const [retryDelay, setRetryDelay] = useState<number | null>(null);
+  const [foreground, setForeground] = useState(true);
   const [fit, setFit] = useState(true);
   const [keyboard, setKeyboard] = useState(false);
   const [text, setText] = useState("");
@@ -26,50 +29,100 @@ export default function Desktop({ name }: { name: string }) {
   useEffect(() => {
     let disposed = false;
     let rfb: RFB | undefined;
-    setConnection("connecting");
-    setDetail("");
-    void import("@novnc/novnc").then(({ default: RFBClient }) => {
-      if (disposed || !screen.current) return;
-      const url = new URL(`/browsers/${encodeURIComponent(name)}/vnc`, window.location.href);
-      url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      rfb = new RFBClient(screen.current, url.href, { shared: true });
-      rfb.scaleViewport = true;
-      // Scaling is local: one viewer must not resize another viewer's desktop.
-      rfb.resizeSession = false;
-      rfb.background = "#171d25";
-      rfb.focusOnClick = true;
-      client.current = rfb;
-      rfb.addEventListener("connect", () => {
-        if (!disposed) { setConnection("connected"); setDetail(""); }
-      });
-      rfb.addEventListener("disconnect", (event) => {
-        if (disposed) return;
-        const clean = (event as CustomEvent<{ clean: boolean }>).detail.clean;
-        setConnection((current) => current === "error" ? current : "disconnected");
-        setDetail((current) => current || (clean
-          ? "The desktop connection closed. Your browser may still be running."
-          : "Could not reach this desktop. Check that it is running, or reload to renew your sign-in."));
-      });
-      const authenticationFailure = () => {
-        if (disposed) return;
-        setConnection("error");
-        setDetail("The desktop rejected the connection. Return to your browsers and check its status.");
-        rfb?.disconnect();
+    let generation = 0;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const isActive = () => document.visibilityState === "visible" && document.hasFocus();
+    const loop = createReconnectLoop(connect, setRetryDelay, isActive());
+    reconnect.current = loop.retry;
+
+    function connect() {
+      if (!isActive()) { loop.setActive(false); setForeground(false); return; }
+      const attempt = ++generation;
+      clearTimeout(timeout);
+      rfb?.disconnect();
+      rfb = undefined;
+      client.current = null;
+      setConnection("connecting");
+      setDetail("");
+      const current = () => !disposed && generation === attempt;
+      const failed = (message: string, error = false) => {
+        if (!current()) return;
+        clearTimeout(timeout);
+        setConnection((state) => error || state === "error" ? "error" : "disconnected");
+        setDetail((detail) => detail || message);
+        loop.disconnected();
       };
-      rfb.addEventListener("credentialsrequired", authenticationFailure);
-      rfb.addEventListener("securityfailure", authenticationFailure);
-    }).catch(() => {
-      if (!disposed) {
-        setConnection("error");
-        setDetail("The desktop viewer could not load. Reload this page to try again.");
-      }
-    });
+      // A half-open socket or stalled handshake must not leave a phone connecting forever.
+      timeout = setTimeout(() => {
+        if (!current()) return;
+        failed("The connection timed out. Check that the desktop is running, or reload to renew your sign-in.");
+        generation++;
+        rfb?.disconnect();
+      }, 10_000);
+      void import("@novnc/novnc").then(({ default: RFBClient }) => {
+        if (!current() || !screen.current || !isActive()) return;
+        const url = new URL(`/browsers/${encodeURIComponent(name)}/vnc`, window.location.href);
+        url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const next = new RFBClient(screen.current, url.href, { shared: true });
+        rfb = next;
+        next.scaleViewport = true;
+        // Scaling is local: one viewer must not resize another viewer's desktop.
+        next.resizeSession = false;
+        next.background = "#171d25";
+        next.focusOnClick = true;
+        client.current = next;
+        next.addEventListener("connect", () => {
+          if (!current()) return;
+          clearTimeout(timeout);
+          loop.connected();
+          setConnection("connected");
+          setDetail("");
+        });
+        next.addEventListener("disconnect", (event) => {
+          const clean = (event as CustomEvent<{ clean: boolean }>).detail.clean;
+          failed(clean
+            ? "The desktop connection closed. Your browser may still be running."
+            : "Could not reach this desktop. Check that it is running, or reload to renew your sign-in.");
+        });
+        const authenticationFailure = () => {
+          if (!current()) return;
+          failed("The desktop rejected the connection. Reload to renew your sign-in, or check the desktop status.", true);
+          generation++;
+          next.disconnect();
+        };
+        next.addEventListener("credentialsrequired", authenticationFailure);
+        next.addEventListener("securityfailure", authenticationFailure);
+      }).catch(() => failed("The desktop viewer could not load. Reload this page to try again.", true));
+    }
+
+    const activityChanged = () => {
+      const active = isActive();
+      setForeground(active);
+      loop.setActive(active);
+    };
+    const suspended = () => { setForeground(false); loop.setActive(false); };
+    document.addEventListener("visibilitychange", activityChanged);
+    window.addEventListener("focus", activityChanged);
+    window.addEventListener("blur", activityChanged);
+    window.addEventListener("pageshow", activityChanged);
+    window.addEventListener("pagehide", suspended);
+    setForeground(isActive());
+    loop.retry();
     return () => {
       disposed = true;
+      generation++;
+      clearTimeout(timeout);
+      loop.dispose();
+      reconnect.current = () => {};
+      document.removeEventListener("visibilitychange", activityChanged);
+      window.removeEventListener("focus", activityChanged);
+      window.removeEventListener("blur", activityChanged);
+      window.removeEventListener("pageshow", activityChanged);
+      window.removeEventListener("pagehide", suspended);
       client.current = null;
       rfb?.disconnect();
     };
-  }, [name, attempt]);
+  }, [name]);
 
   useEffect(() => { if (client.current) client.current.scaleViewport = fit; }, [fit, connection]);
   useEffect(() => {
@@ -80,7 +133,7 @@ export default function Desktop({ name }: { name: string }) {
   }, []);
   useEffect(() => {
     if (keyboard) { client.current?.blur(); textInput.current?.focus(); }
-  }, [keyboard]);
+  }, [keyboard, connection]);
 
   async function toggleFullscreen() {
     try {
@@ -139,12 +192,12 @@ export default function Desktop({ name }: { name: string }) {
       <header className="desktop-header">
         <a href="/" className="icon-button back-button" aria-label="Back to your browsers"><Icon name="back" /></a>
         <div className="desktop-title"><h1>{name}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
-        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="back" size={18} /><span>Back</span></button>
+        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="browserBack" size={20} /><span>Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
           <button className="button quiet" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit to screen</span></button>
           <button className="button quiet" aria-pressed={keyboard} aria-controls="keyboard-panel" onClick={() => setKeyboard(!keyboard)}><Icon name="keyboard" size={18} /><span>Keyboard</span></button>
           <button className="button quiet" disabled={!canFullscreen} onClick={() => void toggleFullscreen()} title={canFullscreen ? "Toggle fullscreen" : "Fullscreen is not supported in this browser"} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><Icon name="expand" size={18} /><span className="fullscreen-label">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span></button>
-          <button className="button quiet" onClick={() => setAttempt((value) => value + 1)} disabled={connection === "connecting"} aria-label="Reconnect desktop"><Icon name="refresh" size={18} /><span>Reconnect</span></button>
+          <button className="button quiet" onClick={() => reconnect.current()} disabled={connection === "connecting"} aria-label="Reconnect desktop"><Icon name="refresh" size={18} /><span>Reconnect</span></button>
         </div>
       </header>
 
@@ -154,7 +207,8 @@ export default function Desktop({ name }: { name: string }) {
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}
           <h2>{connection === "connecting" ? "Connecting to your desktop" : "Desktop disconnected"}</h2>
           <p>{detail || "Opening a private connection to your browser."}</p>
-          {connection !== "connecting" && <div className="connection-actions"><button className="button primary" onClick={() => setAttempt((value) => value + 1)}>Reconnect</button><a className="button" href="/">Your browsers</a></div>}
+          <p role="status">{!foreground ? "Automatic reconnect is paused until you return to this tab." : retryDelay !== null ? `Retrying automatically in ${retryDelay} ${retryDelay === 1 ? "second" : "seconds"}…` : ""}</p>
+          {connection !== "connecting" && <div className="connection-actions"><button className="button primary" onClick={() => reconnect.current()}>Reconnect</button><a className="button" href="/">Your browsers</a></div>}
         </div></div>}
       </section>
 

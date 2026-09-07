@@ -6,6 +6,7 @@ const paths = {
   plus: <path d="M12 5v14M5 12h14" />,
   arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
   back: <path d="m14 6-6 6 6 6" />,
+  browserBack: <><rect x="2" y="3" width="20" height="18" rx="3" /><path d="M2 8h20M6 5.5h.01M9 5.5h.01M16 14H8m4-4-4 4 4 4" /></>,
   close: <path d="m6 6 12 12M6 18 18 6" />,
   refresh: <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6 7a7 7 0 0 1 12-1l2 2M4 16l2 2a7 7 0 0 0 12-1" /></>,
   expand: <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" />,

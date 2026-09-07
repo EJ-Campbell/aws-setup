@@ -859,6 +859,11 @@ On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable 
 input also work directly. Each viewer scales independently instead of resizing other viewers'
 desktop. Fullscreen is available where the viewing browser supports it. This is a remote
 desktop, so the website inside it keeps the host desktop layout rather than becoming mobile.
+Disconnected viewers retry automatically while their tab is visible and focused, waiting
+1, 2, 4, 8, then at most 10 seconds between failed attempts. Returning to the tab reconnects
+immediately, including after phone suspension; background retries pause. A successful connection
+resets the delay. Manual **Reconnect** remains available. Retries never bypass Access sign-in;
+if it has expired, reload to sign in again. Reconnecting the viewer does not restart the browser.
 
 To reuse an existing login profile without copying it, first close its existing browser using
 that browser's normal service controls, then run
