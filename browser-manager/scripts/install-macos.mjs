@@ -232,7 +232,12 @@ export async function installMacOS({ configFile, tokenFile } = {}, dependencies 
   if (!isAbsolute(browser) || !safeText(browser) || /["\\]/u.test(browser)) fail('BM_BROWSER_BIN must be an absolute executable Chrome path.');
   await io.access(browser, constants.X_OK).catch(() => fail('Install Chrome or set BM_BROWSER_BIN to its executable; no browser is downloaded or replaced.'));
   const browserInfo = await io.stat(browser);
-  if (!browserInfo.isFile() || (browserInfo.mode & 0o022) !== 0) fail('Chrome must be a regular executable not writable by other users.');
+  // Native macOS app bundles commonly permit the trusted admin group (GID 80) to
+  // update them. Do not chmod the owner's Chrome; this exception is browser-only.
+  if (!browserInfo.isFile() || ![0, uid].includes(browserInfo.uid) ||
+      (browserInfo.mode & 0o002) !== 0 || ((browserInfo.mode & 0o020) !== 0 && browserInfo.gid !== 80)) {
+    fail('Chrome must be an owner/root regular executable, writable only by its owner or the macOS admin group.');
+  }
   parsed.env.BM_BROWSER_BIN = browser;
   const content = Object.entries(parsed.env).sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `${key}="${value}"`).join('\n') + '\n';

@@ -269,6 +269,42 @@ test('missing build or non-executable Chrome cannot change running services', as
   assert.equal(mutations(f.calls).length, 0);
 });
 
+test('Chrome accepts standard admin-group app permissions without changing the app', async t => {
+  for (const owner of [uid, 0]) {
+    const f = await fixture(t);
+    await fs.chmod(f.browser, 0o775);
+    f.dependencies.io = { ...fs, stat: async target => {
+      const info = await fs.stat(target);
+      if (target === f.browser) { info.uid = owner; info.gid = 80; }
+      return info;
+    } };
+    await installMacOS({ configFile: f.configFile }, f.dependencies);
+    assert.equal((await fs.stat(f.browser)).mode & 0o777, 0o775);
+    assert.equal(mutations(f.calls).length, 1);
+  }
+});
+
+test('Chrome refuses writable staff/other groups, world write, and an unrelated owner', async t => {
+  for (const { mode, gid, owner } of [
+    { mode: 0o775, gid: 20, owner: uid },
+    { mode: 0o775, gid: 81, owner: uid },
+    { mode: 0o777, gid: 80, owner: uid },
+    { mode: 0o757, gid: 80, owner: uid },
+    { mode: 0o755, gid: 80, owner: uid + 1 },
+  ]) {
+    const f = await fixture(t);
+    await fs.chmod(f.browser, mode);
+    f.dependencies.io = { ...fs, stat: async target => {
+      const info = await fs.stat(target);
+      if (target === f.browser) { info.uid = owner; info.gid = gid; }
+      return info;
+    } };
+    await assert.rejects(installMacOS({ configFile: f.configFile }, f.dependencies), /owner\/root regular executable/);
+    assert.equal(mutations(f.calls).length, 0);
+    assert.equal((await fs.stat(f.browser)).mode & 0o777, mode);
+  }
+});
+
 test('configuration/plist checks complete before owned jobs are stopped', async t => {
   const f = await fixture(t);
   await installMacOS({ configFile: f.configFile }, f.dependencies);
