@@ -80,6 +80,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
     const temp = join(stateDir, `.instances-${randomUUID()}.tmp`);
     let file;
     let created = false;
+    let stateReplaced = false;
     try {
       file = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
       created = true;
@@ -90,10 +91,17 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
       await file.close();
       file = undefined;
       await rename(temp, stateFile);
+      stateReplaced = true;
       const dir = await open(stateDir, constants.O_RDONLY | constants.O_DIRECTORY);
       try { await dir.sync(); } finally { await dir.close(); }
     } catch (cause) {
-      throw new Error('Could not save private browser state', { cause });
+      const error = new Error(stateReplaced
+        ? 'Browser state was replaced, but its durability could not be confirmed'
+        : 'Could not save private browser state', { cause });
+      // A successful rename changes the visible snapshot even if directory fsync subsequently fails.
+      // Callers may undo an uncommitted mutation, never pretend the replaced file was rolled back.
+      error.stateReplaced = stateReplaced;
+      throw error;
     } finally {
       await file?.close().catch(() => {});
       if (created) await rm(temp, { force: true }).catch(() => {});
@@ -195,10 +203,18 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
           profile = await directory(options.profile);
         } else await directory(profile, !record, !record);
         if (profile !== join(stateDir, 'profiles', name)) await profileAvailable(profile);
+        const previous = record && { profile: record.profile, startUrl: record.startUrl, desired: record.desired };
         record ??= { name, createdAt: new Date().toISOString(), state: 'stopped' };
         Object.assign(record, { profile, startUrl: startUrl ?? record.startUrl ?? 'about:blank', desired: true });
         records.set(name, record);
-        await save();
+        try { await save(); }
+        catch (error) {
+          if (!error.stateReplaced) {
+            if (previous) Object.assign(record, previous);
+            else records.delete(name);
+          }
+          throw error;
+        }
         return startRecord(record);
       });
     },
@@ -208,8 +224,13 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
         assertOpen();
         const record = records.get(name);
         if (!record) throw new Error('Unknown browser');
+        const previousDesired = record.desired;
         record.desired = false;
-        await save();
+        try { await save(); }
+        catch (error) {
+          if (!error.stateReplaced) record.desired = previousDesired;
+          throw error;
+        }
         const desktop = record.desktop;
         record.desktop = undefined;
         await desktop?.close();

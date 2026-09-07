@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, readlink, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, readlink, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
@@ -20,6 +20,17 @@ async function fixture(t, launch) {
   t.after(async () => { await manager.close(); await rm(stateDir, { recursive: true, force: true }); });
   await manager.initialize();
   return { manager, stateDir, launches };
+}
+
+async function failStateSync(t, stateDir, directory = false) {
+  const file = await open(stateDir);
+  const prototype = Object.getPrototypeOf(file);
+  await file.close();
+  const sync = prototype.sync;
+  return t.mock.method(prototype, 'sync', async function () {
+    if ((await this.stat()).isDirectory() === directory) throw new Error('Injected sync failure');
+    return sync.call(this);
+  });
 }
 
 test('named desktops have isolated profiles and sockets; stopping preserves only the chosen profile', async (t) => {
@@ -171,6 +182,69 @@ test('state-save failures do not expose private paths or leave temporary metadat
   await assert.rejects(manager.start('save-failed'), { message: 'Could not save private browser state' });
   assert.equal(launches.length, 0);
   assert.equal((await readdir(stateDir)).some((name) => name.startsWith('.instances-')), false);
+  assert.deepEqual(manager.list(), []);
+  await rm(join(stateDir, 'instances.json'), { recursive: true });
+  for (let index = 0; index < 32; index++) await manager.start(`browser-${index}`);
+  assert.equal(launches.length, 32);
+});
+
+test('failed start restores the existing profile and URL configuration', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  await manager.start('alpha', { url: 'https://original.example' });
+  await manager.stop('alpha');
+  const before = manager.list();
+  const profile = join(stateDir, 'other-profile');
+  await mkdir(profile, { mode: 0o700 });
+  const failure = await failStateSync(t, stateDir);
+  await assert.rejects(manager.start('alpha', { profile, url: 'https://changed.example' }), /Could not save/);
+  failure.mock.restore();
+  assert.deepEqual(manager.list(), before);
+  await manager.start('alpha');
+  assert.equal(launches[1].profile, launches[0].profile);
+  assert.equal(launches[1].url, 'https://original.example/');
+});
+
+test('failed stop retains desired running state through a later save and reload', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  await manager.start('alpha');
+  const failure = await failStateSync(t, stateDir);
+  await assert.rejects(manager.stop('alpha'), /Could not save/);
+  failure.mock.restore();
+  assert.equal(manager.list()[0].state, 'running');
+  assert.equal(launches[0].handle.stopped, undefined);
+  await manager.start('beta');
+  const saved = JSON.parse(await readFile(join(stateDir, 'instances.json'), 'utf8'));
+  assert.equal(saved.find(({ name }) => name === 'alpha').desired, true);
+  await launches[0].handle.close();
+  await manager.stop('beta'); // Wait behind alpha's exit callback in the manager's queue.
+  assert.equal(manager.list().find(({ name }) => name === 'alpha').state, 'error');
+  await manager.close();
+  const restored = createInstanceManager({ stateDir, browserBin: '/test/chrome', baseUrl: 'https://browsers.example' }, {
+    launch: async () => ({ socketPath: '/test/socket', close: async () => {}, closed: new Promise(() => {}) }),
+  });
+  t.after(() => restored.close());
+  await restored.initialize();
+  assert.equal(restored.list().find(({ name }) => name === 'alpha').state, 'running');
+});
+
+test('directory sync failure after rename retains the replaced state without claiming rollback', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  const failure = await failStateSync(t, stateDir, true);
+  await assert.rejects(manager.start('alpha'), /durability could not be confirmed/);
+  failure.mock.restore();
+  assert.equal(manager.list()[0].name, 'alpha');
+  assert.equal(launches.length, 0);
+  const saved = JSON.parse(await readFile(join(stateDir, 'instances.json'), 'utf8'));
+  assert.equal(saved[0].desired, true);
+  await manager.start('beta');
+  assert.equal(JSON.parse(await readFile(join(stateDir, 'instances.json'), 'utf8'))[0].desired, true);
+  const stopFailure = await failStateSync(t, stateDir, true);
+  await assert.rejects(manager.stop('beta'), /durability could not be confirmed/);
+  stopFailure.mock.restore();
+  assert.equal(manager.list().find(({ name }) => name === 'beta').state, 'running');
+  await manager.start('gamma');
+  assert.equal(JSON.parse(await readFile(join(stateDir, 'instances.json'), 'utf8'))
+    .find(({ name }) => name === 'beta').desired, false);
 });
 
 test('limits accidental process fanout to 32 named desktops', async (t) => {
