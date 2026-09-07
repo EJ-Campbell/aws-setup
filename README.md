@@ -1048,6 +1048,13 @@ input also work directly. **Fit to screen** scales independently for each viewer
 explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
 viewing browser supports it.
 
+In the Linux VNC viewer, swipe with one finger to scroll the remote page or the panel
+where the swipe starts. A quick swipe has a short glide; touching again stops it. Reduced-motion
+preferences disable the glide. Tap normally to click; to drag an item, tap once, then touch
+and drag within a moment. Long-press and multitouch gestures keep noVNC's existing behavior.
+Mouse input is unchanged. VNC carries discrete wheel steps, so this improves touch handling
+but cannot promise pixel-for-pixel scrolling or a native phone's frame rate over the network.
+
 In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting and actual size
 are already the same (less than one pixel of difference), or while disconnected. It re-enables
 when the shared display or available viewer space changes, including rotation and opening the
