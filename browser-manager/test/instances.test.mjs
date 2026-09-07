@@ -34,6 +34,46 @@ async function failStateSync(t, stateDir, directory = false) {
   });
 }
 
+test('navigation reads only the selected live desktop and never saves or exposes history', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  await manager.start('alpha'); await manager.start('beta');
+  const saved = await readFile(join(stateDir, 'instances.json'), 'utf8');
+  const socket = manager.getSocket('alpha');
+  launches[0].handle.getNavigation = async () => ({ canGoBack: true, history: 'private' });
+  launches[1].handle.getNavigation = async () => ({ canGoBack: false });
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: true });
+  assert.deepEqual(await manager.getNavigation('beta'), { canGoBack: false });
+  assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), saved);
+  assert.equal(manager.getSocket('alpha'), socket);
+  for (const result of [null, {}, { canGoBack: 'yes' }]) {
+    launches[0].handle.getNavigation = async () => result;
+    assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  }
+  launches[0].handle.getNavigation = async () => { throw new Error('private native diagnostic'); };
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  await assert.rejects(manager.getNavigation('missing'), error => error.status === 404);
+  await assert.rejects(manager.getNavigation('../alpha'), /Invalid browser name/);
+  await manager.stop('alpha');
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  assert.equal(launches.length, 2);
+});
+
+test('navigation cannot enable Back from a late snapshot after stop, replacement, or close', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('alpha');
+  for (const boundary of ['stop', 'replace', 'close']) {
+    const result = Promise.withResolvers();
+    launches.at(-1).handle.getNavigation = () => result.promise;
+    const reading = manager.getNavigation('alpha');
+    if (boundary === 'close') await manager.close();
+    else await manager.stop('alpha');
+    if (boundary === 'replace') await manager.start('alpha');
+    result.resolve({ canGoBack: true });
+    assert.deepEqual(await reading, { canGoBack: null });
+    if (boundary === 'stop') await manager.start('alpha');
+  }
+});
+
 test('Phone mode resizes only the selected live desktop, without saving state or restarting its browser', async (t) => {
   const { manager, stateDir, launches } = await fixture(t);
   const desktop = { mode: 'desktop', width: 1440, height: 900 };

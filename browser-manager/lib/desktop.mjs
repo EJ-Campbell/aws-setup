@@ -5,8 +5,10 @@ import { connect } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
 const execute = promisify(execFile);
+const navigationHelper = fileURLToPath(new URL('./native-navigation.py', import.meta.url));
 // xprop can read these numeric hints, but writes them as CARDINAL instead of WM_SIZE_HINTS.
 // This fixed native call preserves the original type and every field; no script comes from callers.
 const WRITE_HINTS = `import ctypes as c,sys
@@ -49,12 +51,14 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
   let closing;
   const resizeAbort = new AbortController();
   let resizeTail = Promise.resolve();
+  let navigationRead;
   const close = () => {
     if (closing) return closing;
     closing = (async () => {
       signal.removeEventListener('abort', aborted);
       resizeAbort.abort();
       await resizeTail;
+      await navigationRead;
       const browser = children.find(({ label }) => label === 'Browser');
       if (browser) {
         // Chromium handles SIGINT as normal AttemptExit; SIGTERM takes the shorter SessionEnding
@@ -118,14 +122,46 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       }),
     ]);
     await writeFile(authFile, authority(display, cookie), { mode: 0o600 });
-    const env = { ...process.env, DISPLAY: `:${display}`, XAUTHORITY: authFile };
+    const env = { ...process.env, DISPLAY: `:${display}`, XAUTHORITY: authFile,
+      DBUS_SESSION_BUS_ADDRESS: `unix:path=${join(runtimeDir, 'bus.sock')}`, GSETTINGS_BACKEND: 'memory' };
     delete env.WAYLAND_DISPLAY;
+    delete env.AT_SPI_BUS_ADDRESS;
+    delete env.NO_AT_BRIDGE;
+    // A separate owned bus keeps accessibility away from other desktops and user-wide settings.
+    // Chromium depends on the native bus lifetime; individual metadata query failures are optional.
+    const bus = launch('Accessibility bus', '/usr/bin/dbus-daemon', [
+      '--session', '--nofork', `--address=${env.DBUS_SESSION_BUS_ADDRESS}`, '--print-address=3',
+    ], env, true);
+    try {
+      await Promise.race([
+        new Promise((resolve, reject) => {
+          bus.once('error', reject);
+          bus.once('exit', () => reject(new Error('Accessibility bus unavailable')));
+          bus.stdio[3].once('data', resolve);
+        }),
+        delay(2_000, undefined, { ref: false }).then(() => { throw new Error('Accessibility bus timed out'); }),
+      ]);
+      await execute('/usr/bin/gdbus', ['call', '--session', '--dest', 'org.a11y.Bus',
+        '--object-path', '/org/a11y/bus', '--method', 'org.freedesktop.DBus.Properties.Set',
+        'org.a11y.Status', 'IsEnabled', '<true>'], { env, timeout: 2_000, maxBuffer: 1024, signal: resizeAbort.signal });
+    } catch { /* Native navigation remains unknown; do not interrupt the browser. */ }
     launch('Window manager', '/usr/bin/openbox', ['--sm-disable'], env);
     launch('VNC server', '/usr/bin/x11vnc', vncArguments({ display, authFile, socketPath }), env);
     const browser = launch('Browser', browserBin, [
       `--user-data-dir=${profile}`, '--ozone-platform=x11', '--no-first-run',
-      '--no-default-browser-check', '--start-maximized', '--window-size=1440,900', url,
+      '--no-default-browser-check', '--force-renderer-accessibility=basic',
+      '--start-maximized', '--window-size=1440,900', url,
     ], env);
+    const getNavigation = () => {
+      if (closing || signal.aborted || resizeAbort.signal.aborted) return Promise.resolve({ canGoBack: null });
+      navigationRead ??= execute('/usr/bin/python3', [navigationHelper, String(browser.pid)], {
+        env, timeout: 2_000, killSignal: 'SIGKILL', maxBuffer: 1024, signal: resizeAbort.signal,
+      }).then(({ stdout }) => {
+        const value = JSON.parse(stdout).canGoBack;
+        return { canGoBack: !closing && !signal.aborted && typeof value === 'boolean' ? value : null };
+      }).catch(() => ({ canGoBack: null })).finally(() => { navigationRead = undefined; });
+      return navigationRead;
+    };
     let activeMode = '1440x900';
     const modes = new Map();
     const originalHints = new Map();
@@ -250,7 +286,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       })(),
     ]);
     if (signal.aborted) throw new Error('Desktop start cancelled');
-    return { socketPath, close, closed: failed.promise.catch(close), resize };
+    return { socketPath, close, closed: failed.promise.catch(close), resize, getNavigation };
   } catch (error) {
     await close();
     throw error;

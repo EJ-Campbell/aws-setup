@@ -19,6 +19,37 @@ const headers = { 'cf-access-jwt-assertion': token, Origin: config.baseUrl, 'Con
 const bind = async server => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return `http://127.0.0.1:${server.address().port}`; };
 const close = async server => { server.closeVnc?.(); server.closeAllConnections?.(); await new Promise(done => server.close(done)); };
 
+test('navigation is an owner-authenticated read on the exact registered route', async () => {
+  const calls = [];
+  const manager = { getNavigation: async name => { calls.push(name); return { canGoBack: name === 'alpha' }; } };
+  const server = createHttpServer({ manager, config, authorize: createAuthorizer(config, keys.publicKey), nextHandler: (_req, res) => res.end() });
+  const base = await bind(server);
+  const wrongOwner = await new SignJWT({ email: 'other@example.test' }).setProtectedHeader({ alg: 'RS256' })
+    .setIssuedAt().setSubject('other').setIssuer(config.issuer).setAudience(config.audience)
+    .setExpirationTime('5m').sign(keys.privateKey);
+  try {
+    for (const [sentHeaders, status] of [[{}, 401],
+      [{ 'cf-access-authenticated-user-email': config.owner }, 401],
+      [{ 'cf-access-jwt-assertion': wrongOwner }, 403]]) {
+      assert.equal((await fetch(`${base}/api/browsers/alpha/navigation`, { headers: sentHeaders })).status, status);
+    }
+    for (const path of ['/api/browsers/alpha/navigation/extra', '/api/browsers/alpha%2fbeta/navigation']) {
+      assert.equal((await fetch(base + path, { headers })).status, 404);
+    }
+    assert.equal((await fetch(`${base}/api/browsers/alpha/navigation`, { method: 'POST', headers, body: '{}' })).status, 404);
+    assert.deepEqual(calls, []);
+    for (const name of ['alpha', 'beta']) {
+      const response = await fetch(`${base}/api/browsers/${name}/navigation?pid=123&name=other`, {
+        headers: { 'cf-access-jwt-assertion': token },
+      });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.deepEqual(await response.json(), { canGoBack: name === 'alpha' });
+    }
+    assert.deepEqual(calls, ['alpha', 'beta']);
+  } finally { await close(server); }
+});
+
 test('viewport mutations require owner + exact Origin and bounded dimensions without command fields', async () => {
   const calls = [];
   const row = { name: 'stable', state: 'running' };

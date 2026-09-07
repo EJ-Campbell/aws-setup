@@ -5,6 +5,8 @@ import type RFB from "@novnc/novnc";
 import type { BrowserInstance } from "../../../lib/contracts";
 import { Icon } from "../../ui";
 import { createReconnectLoop } from "../../../lib/reconnect.mjs";
+import { watchVncQuality } from "../../../lib/vnc-quality.mjs";
+import { createNavigationState } from "../../../lib/navigation-state.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
@@ -26,6 +28,7 @@ export default function Desktop({ name }: { name: string }) {
   const [feedback, setFeedback] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const [canFullscreen, setCanFullscreen] = useState(false);
+  const [canGoBack, setCanGoBack] = useState<boolean | null>(null);
   const [label, setLabel] = useState(name);
   const [viewport, setViewport] = useState<BrowserInstance["viewport"] | null>(null);
   const [viewportPending, setViewportPending] = useState(false);
@@ -34,6 +37,19 @@ export default function Desktop({ name }: { name: string }) {
   const [viewportError, setViewportError] = useState("");
   const connected = connection === "connected";
   const phoneMode = viewport?.mode === "phone";
+
+  useEffect(() => {
+    const navigation = createNavigationState(async (signal: AbortSignal) => {
+      const response = await fetch(`/api/browsers/${encodeURIComponent(name)}/navigation`, {
+        cache: "no-store", signal,
+      });
+      if (!response.ok) throw new Error("Navigation state unavailable");
+      const state = await response.json();
+      return typeof state?.canGoBack === "boolean" ? state.canGoBack : null;
+    }, setCanGoBack);
+    navigation.setActive(connected && foreground);
+    return () => navigation.dispose();
+  }, [name, connected, foreground]);
 
   useEffect(() => {
     setLabel(name);
@@ -65,6 +81,7 @@ export default function Desktop({ name }: { name: string }) {
   useEffect(() => {
     let disposed = false;
     let rfb: RFB | undefined;
+    let stopQuality: () => void = () => {};
     let generation = 0;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const isActive = () => document.visibilityState === "visible" && document.hasFocus();
@@ -75,6 +92,7 @@ export default function Desktop({ name }: { name: string }) {
       if (!isActive()) { loop.setActive(false); setForeground(false); return; }
       const attempt = ++generation;
       clearTimeout(timeout);
+      stopQuality();
       rfb?.disconnect();
       rfb = undefined;
       client.current = null;
@@ -84,6 +102,7 @@ export default function Desktop({ name }: { name: string }) {
       const failed = (message: string, error = false) => {
         if (!current()) return;
         clearTimeout(timeout);
+        stopQuality();
         setConnection((state) => error || state === "error" ? "error" : "disconnected");
         setDetail((detail) => detail || message);
         loop.disconnected();
@@ -101,6 +120,7 @@ export default function Desktop({ name }: { name: string }) {
         url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const next = new RFBClient(screen.current, url.href, { shared: true });
         rfb = next;
+        stopQuality = watchVncQuality(next);
         next.scaleViewport = true;
         // Scaling is local: one viewer must not resize another viewer's desktop.
         next.resizeSession = false;
@@ -148,6 +168,7 @@ export default function Desktop({ name }: { name: string }) {
       disposed = true;
       generation++;
       clearTimeout(timeout);
+      stopQuality();
       loop.dispose();
       reconnect.current = () => {};
       document.removeEventListener("visibilitychange", activityChanged);
@@ -230,7 +251,7 @@ export default function Desktop({ name }: { name: string }) {
 
   function browserBack() {
     const rfb = client.current;
-    if (!connected || !rfb) return;
+    if (!connected || canGoBack !== true || !rfb) return;
     rfb.sendKey(keys.alt, "AltLeft", true);
     try { rfb.sendKey(keys.left, "ArrowLeft"); }
     finally { rfb.sendKey(keys.alt, "AltLeft", false); }
@@ -266,11 +287,11 @@ export default function Desktop({ name }: { name: string }) {
         <div className="desktop-title"><h1>{label}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
         <button className="button phone-mode" aria-label="Phone mode" aria-pressed={phoneMode} aria-describedby="phone-mode-help" disabled={!connected || viewportPending || metadataLoading || !viewport} onClick={() => void togglePhoneMode()} title={phoneMode ? "Restore Desktop for all viewers" : "Use a phone-sized display for all viewers"}><Icon name="phone" size={19} /><span>{viewportPending ? "Changing…" : "Phone"}</span></button>
         <span id="phone-mode-help" className="sr-only">Changes the shared display for all viewers. Turn Phone mode off to restore Desktop.</span>
-        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="browserBack" size={20} /><span className="remote-back-label">Back</span></button>
+        <button className="button remote-back" disabled={!connected || canGoBack !== true} onClick={browserBack} aria-label="Back in remote browser" title={!connected ? "Connect to use browser Back" : canGoBack === false ? "No previous page in remote browser" : canGoBack === null ? "Checking remote browser history" : "Back in remote browser"}><Icon name="browserBack" size={20} /><span className="remote-back-label">Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
           <button className="button quiet" aria-label="Fit to screen" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit<span className="fit-label-extra"> to screen</span></span></button>
           <button className="button quiet" aria-pressed={keyboard} aria-controls="keyboard-panel" onClick={() => setKeyboard(!keyboard)}><Icon name="keyboard" size={18} /><span>Keyboard</span></button>
-          <button className="button quiet" disabled={!canFullscreen} onClick={() => void toggleFullscreen()} title={canFullscreen ? "Toggle fullscreen" : "Fullscreen is not supported in this browser"} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><Icon name="expand" size={18} /><span className="fullscreen-label">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span></button>
+          {canFullscreen && <button className="button quiet" onClick={() => void toggleFullscreen()} title="Toggle fullscreen" aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><Icon name="expand" size={18} /><span className="fullscreen-label">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span></button>}
           <button className="button quiet" onClick={() => reconnect.current()} disabled={connection === "connecting"} aria-label="Reconnect desktop"><Icon name="refresh" size={18} /><span>Reconnect</span></button>
         </div>
       </header>

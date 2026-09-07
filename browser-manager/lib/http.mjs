@@ -42,6 +42,10 @@ export function createApi({ manager, baseUrl, local = false }) {
     if (req.method === 'GET' && path === '/api/config') {
       json(res, 200, { baseUrl }); return true;
     }
+    const navigation = /^\/api\/browsers\/([a-z0-9-]+)\/navigation$/.exec(path);
+    if (req.method === 'GET' && navigation) {
+      json(res, 200, await manager.getNavigation(instanceName(navigation[1]))); return true;
+    }
     if (req.method !== 'POST') throw new HttpError(404, 'Unknown API route');
     if (!local) requireOrigin(req, baseUrl);
     const data = await readBody(req);

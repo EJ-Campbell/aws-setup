@@ -280,6 +280,19 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
         return publicRow(record);
       });
     },
+    async getNavigation(name) {
+      checkedName(name);
+      const record = records.get(name);
+      if (!record) throw new HttpError(404, 'Unknown browser');
+      const desktop = record.desktop;
+      if (closed || record.state !== 'running' || !desktop) return { canGoBack: null };
+      try {
+        const state = await desktop.getNavigation();
+        // A late snapshot from a stopped/replaced desktop must never enable navigation.
+        return { canGoBack: !closed && record.state === 'running' && record.desktop === desktop &&
+          typeof state?.canGoBack === 'boolean' ? state.canGoBack : null };
+      } catch { return { canGoBack: null }; }
+    },
     getSocket(name) {
       checkedName(name);
       const record = records.get(name);

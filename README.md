@@ -808,7 +808,7 @@ file path. A public URL cannot work until both this apply and the host installat
 ### 2. Install on the browser host
 
 Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
-desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3`) and a current
+desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3 dbus libglib2.0-bin at-spi2-core python3-dbus`) and a current
 [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
 with `--token-file` support. Do not disable the Chrome sandbox to make installation pass.
 
@@ -859,7 +859,12 @@ the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved log
 and does not restart the browser. Older browsers initially display their stable name as the label.
 
 Use **Back** beside the desktop title to go back in the remote browser's history. The separate
-top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.
+top-left arrow returns to the browser-manager dashboard instead. Back follows the active remote
+Chrome window/tab's native toolbar state, including navigation from other viewers. It is disabled
+while disconnected or when the native state is unavailable. Foreground viewers refresh this
+read-only state every 500 ms after the previous read completes; background polling pauses.
+Each desktop uses its own private accessibility bus; no browsing history URLs are returned and
+no remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
 Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
 the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
@@ -871,8 +876,14 @@ browser. The mode survives viewer reconnects, but a browser/service restart star
 mode. Phone changes the viewport, not the browser's user agent; it is not an iOS emulator.
 **Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
 input also work directly. **Fit to screen** scales independently for each viewer; only the
-explicit **Phone** toggle resizes the shared desktop. Fullscreen is available where the
+explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
 viewing browser supports it.
+
+VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
+reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
+stronger compression; changing connection hints updates the live connection. Browsers without
+these hints, including Safari, keep high quality. These are browser hints, not a throughput test.
+
 Disconnected viewers retry automatically while their tab is visible and focused, waiting
 1, 2, 4, 8, then at most 10 seconds between failed attempts. Returning to the tab reconnects
 immediately, including after phone suspension; background retries pause. A successful connection

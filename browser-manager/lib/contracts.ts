@@ -9,6 +9,8 @@ export type BrowserInstance = {
 };
 
 // HTTP: GET /api/browsers -> { browsers: BrowserInstance[] }
+// GET /api/browsers/:name/navigation -> { canGoBack: boolean | null }
+// Native active-window toolbar availability; null means stopped/unavailable. No history URLs.
 // POST /api/browsers -> { name, url? } -> BrowserInstance
 // POST /api/browsers/:name/start -> {} -> BrowserInstance
 // POST /api/browsers/:name/stop -> {} -> BrowserInstance
