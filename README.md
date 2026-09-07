@@ -814,14 +814,25 @@ Roll out with fresh full Terraform plans in this order:
    SUCCESSFUL, with test resources successfully deleted. Metadata verification does
    not prove guest data or boot integrity. Inspect copy/restore logs; do not infer
    success from Terraform apply.
+   If a restore attempt fails, repair the evidenced cause, retain its job history,
+   and set a new future `backup_initial_restore_at` for the same one-off plan.
+   The controller checks a current-attempt job for every configured source volume.
+   Rescheduling does not clear a preceding failure: the new job must complete,
+   validate, and delete its test resource first. Missing or unfinished current jobs
+   alarm after the one-hour start window plus one hour of propagation grace.
+   Older jobs still receive validation/cleanup, and their failures remain in AWS
+   job history and logs. Require all five jobs from the new attempt to pass.
 5. Set only `backup_recovery_cleanup_enabled=true` and apply the two temporary-vault
    cleanup grants and controller update. Existing selections must remain unchanged.
    Verify the five processing captures and superseded CMK checkpoints actually disappear,
    not merely that deletion returned HTTP 200; keep each newest checkpoint. A permission
    failure must retain data, not lead to a broad identity-policy deletion grant.
 6. Only after that cleanup acceptance succeeds, set `backup_recovery_cutover_enabled=true`
-   and apply the two changed selections. Their preconditions reject cutover while cleanup
-   is disabled; replacement creates the new selection before removing the old one.
+   and apply the two changed selections plus the controller's acceptance handoff.
+   Their preconditions reject cutover while cleanup is disabled; replacement creates
+   the new selection before removing the old one. This verified handoff retires the
+   one-off health check so eventual AWS job-history expiration cannot create a false
+   alarm; monthly per-volume restore checks and historical test-volume cleanup continue.
    Verify an EBS `copySnapshot` event reports incremental copying on a
    subsequent cycle before claiming measured incremental-transfer savings. Keep the
    past one-off capture and restore definitions for audit; their explicit years prevent
@@ -845,7 +856,16 @@ or administrator role. Both initial and monthly tests explicitly use the recover
 account's us-east-1 `alias/aws/ebs` key: copied restore metadata can still reference
 the original source-account key. This changes only test volumes, not live disks or
 the final vault's AWS-owned encryption. Validation checks metadata/isolation, not
-filesystem contents or bootability. AWS Backup cleans up after the two-hour validation
+filesystem contents or bootability. The restore role also needs `kms:ReEncryptFrom`
+on the final vault's exact service-owned source key, through EC2 in the recovery
+region. Without it, EC2 initially returns a volume ID but the volume disappears
+when asynchronous key authorization fails. The pinned provider does not expose
+the air-gapped key, and its standard-vault data source rejects this vault type.
+`backup_recovery_source_key_arn` therefore pins the exact public key ARN verified
+with `DescribeBackupVault`; the vault has `prevent_destroy`. Recheck the pin against
+live vault metadata after any deliberate vault recovery/replacement. It does not
+grant access to every key in other accounts.
+AWS Backup cleans up after the two-hour validation
 window; the controller checks expected per-volume jobs and backs up cleanup after four hours.
 Require a real successful restore/validation/cleanup cycle before claiming recovery
 testing is proven. Five east1 tests cost $7.50 plus roughly $0.094 per hour retaining

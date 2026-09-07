@@ -28,6 +28,12 @@ locals {
     "arn:aws:ec2:${var.aws_region}::snapshot/*",
     "arn:aws:ec2:us-east-1::snapshot/*",
   ]
+
+  # DescribeBackupVault readback, 2026-09-07: exact AWS-owned key of the east1
+  # staging_recovery_dr vault protected by prevent_destroy below. Provider 5.100
+  # exports no LAG key attribute and its aws_backup_vault data source rejects LAG
+  # vaults. Keep this public pin; a deliberate vault replacement must re-verify it.
+  backup_recovery_source_key_arn = "arn:aws:kms:us-east-1:792761027311:key/74da7bec-f50b-45aa-9602-2666a665a785"
 }
 
 provider "aws" {
@@ -403,8 +409,12 @@ resource "aws_lambda_function" "backup_recovery" {
         restore_plan_arn     = aws_backup_restore_testing_plan.fleet_dr.arn
         canary_plan          = try(aws_backup_restore_testing_plan.initial[0].name, null)
         canary_plan_arn      = try(aws_backup_restore_testing_plan.initial[0].arn, null)
-        volumes              = local.backup_protected_volume_arns
-        topic                = aws_sns_topic.cost_alerts.arn
+        canary_start_at      = local.backup_initial_restore_at
+        # Verified cutover retires one-off health checks before AWS job history
+        # ages out. Monthly recovery tests and old test-volume cleanup continue.
+        canary_accepted = local.backup_recovery_cutover_enabled
+        volumes         = local.backup_protected_volume_arns
+        topic           = aws_sns_topic.cost_alerts.arn
       })
     }
   }
@@ -772,6 +782,17 @@ resource "aws_iam_role_policy" "backup_restore_test" {
         Effect    = "Allow"
         Action    = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*", "kms:ReEncrypt*", "kms:DescribeKey"]
         Resource  = "arn:aws:kms:${local.backup_recovery_region}:${data.aws_caller_identity.staging.account_id}:key/*"
+        Condition = { StringEquals = { "kms:ViaService" = "ec2.${local.backup_recovery_region}.amazonaws.com" } }
+      },
+      {
+        # The 2026-09-07 22:02:25 UTC restore canary hit a CloudTrail-confirmed
+        # ReEncryptFrom denial after CreateVolume accepted the destination key.
+        # Permit only that operation on this vault's exact service-owned source
+        # key, through regional EBS; do not grant arbitrary cross-account keys.
+        Sid       = "ReEncryptFromExactRecoveryVaultKey"
+        Effect    = "Allow"
+        Action    = "kms:ReEncryptFrom"
+        Resource  = local.backup_recovery_source_key_arn
         Condition = { StringEquals = { "kms:ViaService" = "ec2.${local.backup_recovery_region}.amazonaws.com" } }
       },
       {

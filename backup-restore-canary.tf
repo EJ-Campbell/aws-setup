@@ -7,7 +7,10 @@
 # moving-time precondition would block unrelated permission repairs during a test.
 # The explicit year makes this a single occurrence, not an annual/monthly schedule.
 locals {
-  backup_initial_restore_at = "2026-09-07T21:35:00Z"
+  # Retry after the first wave exposed missing ReEncryptFrom on the LAG source
+  # key. Keep the same plan/job history; a retry must prove every source before
+  # the controller clears the preceding failure.
+  backup_initial_restore_at = "2026-09-07T23:15:00Z"
   # Provider validation still requires a non-null schedule when count=0. The past
   # placeholder is never created: null disables both resources, and malformed
   # non-null input is rejected by the plan precondition below.

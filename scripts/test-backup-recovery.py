@@ -467,9 +467,144 @@ class MonthlyRestoreTests(unittest.TestCase):
         self.assertFalse(module.failed_job_event({}))
 
 
+class CanaryRestoreTests(unittest.TestCase):
+    config = dict(CONFIG, canary_plan_arn="canary-arn", canary_start_at="2026-09-08T12:00:00Z")
+
+    def job(self, **changes):
+        return dict(dict(RESTORE_JOB, CreatedBy={"RestoreTestingPlanArn": "canary-arn"}), **changes)
+
+    def health(self, jobs, now=None, config=None):
+        stage = MonthlyRestoreTests().stage(jobs)
+        return module.canary_restore_health(stage, config or self.config,
+                                            now or SCHEDULED + timedelta(hours=3))
+
+    def test_disabled_canary_does_not_query_restore_jobs(self):
+        stage = Mock()
+        self.assertEqual(module.canary_restore_health(stage, CONFIG, NOW), [])
+        stage.get_paginator.assert_not_called()
+
+    def test_only_explicit_accepted_cutover_retires_one_off_health(self):
+        stage = Mock()
+        self.assertEqual(module.canary_restore_health(stage, dict(self.config, canary_accepted=True),
+                                                      SCHEDULED + timedelta(days=120)), [])
+        stage.get_paginator.assert_not_called()
+        for value in ["true", "false", 1, 0, None, [], {}]:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "canary acceptance"):
+                module.canary_restore_health(stage, dict(self.config, canary_accepted=value), NOW)
+        stage.get_paginator.assert_not_called()
+
+    def test_accepted_cutover_does_not_skip_strict_schedule_validation(self):
+        with self.assertRaisesRegex(ValueError, "canary schedule"):
+            module.canary_restore_health(Mock(), dict(self.config, canary_accepted=True,
+                                                      canary_start_at="invalid"), NOW)
+
+    def test_all_five_sources_need_individual_restore_validation_and_deletion_success(self):
+        resources = [RESOURCE + str(index) for index in range(5)]
+        config = dict(self.config, volumes=resources)
+        prior = self.job(Status="FAILED", CreationDate=SCHEDULED - timedelta(minutes=15))
+        jobs = {resource: [dict(prior, RestoreJobId="old-" + str(index)),
+                           self.job(RestoreJobId="new-" + str(index))]
+                for index, resource in enumerate(resources)}
+        self.assertEqual(self.health(jobs, config=config), [])
+        # Four complete successes cannot clear the fifth source's old failure.
+        for changes in [{"Status": "RUNNING"}, {"ValidationStatus": "VALIDATING"},
+                        {"DeletionStatus": "DELETING"}]:
+            with self.subTest(changes=changes):
+                partial = dict(jobs, **{resources[-1]: [prior, self.job(**changes)]})
+                errors = self.health(partial, now=SCHEDULED + timedelta(minutes=30), config=config)
+                self.assertEqual(len(errors), 1)
+                self.assertIn(resources[-1], errors[0])
+                self.assertIn("failed", errors[0])
+        missing = dict(jobs, **{resources[-1]: []})
+        errors = self.health(missing, config=config)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing", errors[0])
+        self.assertIn(resources[-1], errors[0])
+
+    def test_prior_failure_remains_unhealthy_before_a_future_retry_or_with_no_retry_job(self):
+        prior = self.job(Status="FAILED", CreationDate=SCHEDULED - timedelta(days=60))
+        for now in [SCHEDULED - timedelta(hours=1), SCHEDULED + timedelta(minutes=30),
+                    SCHEDULED + timedelta(hours=3)]:
+            with self.subTest(now=now):
+                self.assertIn("failed", self.health({RESOURCE: [prior]}, now=now)[0])
+
+    def test_prior_failure_remains_unhealthy_until_every_current_status_is_successful(self):
+        for prior_changes in [{"Status": "FAILED"}, {"Status": "ABORTED"},
+                              {"ValidationStatus": "FAILED"}, {"ValidationStatus": "TIMED_OUT"},
+                              {"DeletionStatus": "FAILED"}]:
+            prior = self.job(CreationDate=SCHEDULED - timedelta(minutes=15), **prior_changes)
+            for changes in [{"Status": "PENDING"}, {"Status": "RUNNING"},
+                            {"ValidationStatus": "VALIDATING"}, {"ValidationStatus": None},
+                            {"DeletionStatus": "DELETING"}, {"DeletionStatus": None}]:
+                with self.subTest(prior=prior_changes, current=changes):
+                    errors = self.health({RESOURCE: [prior, self.job(**changes)]},
+                                         now=SCHEDULED + timedelta(minutes=30))
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn("failed", errors[0])
+
+    def test_initial_untried_wave_gets_only_two_hours_of_grace(self):
+        stage = MonthlyRestoreTests().stage()
+        for now in [SCHEDULED - timedelta(hours=1), SCHEDULED + timedelta(hours=2, microseconds=-1)]:
+            self.assertEqual(module.canary_restore_health(stage, self.config, now), [])
+        errors = module.canary_restore_health(stage, self.config, SCHEDULED + timedelta(hours=2))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing", errors[0])
+
+    def test_initial_nonterminal_or_incomplete_job_alarms_at_the_two_hour_boundary(self):
+        for changes in [{"Status": "PENDING"}, {"Status": "RUNNING"}, {"Status": None},
+                        {"ValidationStatus": "VALIDATING"}, {"ValidationStatus": None},
+                        {"DeletionStatus": "DELETING"}, {"DeletionStatus": None}]:
+            with self.subTest(changes=changes):
+                jobs = {RESOURCE: [self.job(**changes)]}
+                self.assertEqual(self.health(jobs, now=SCHEDULED + timedelta(hours=2, microseconds=-1)), [])
+                self.assertIn("incomplete after 2h", self.health(jobs, now=SCHEDULED + timedelta(hours=2))[0])
+
+    def test_stale_success_cannot_satisfy_the_current_wave(self):
+        stale = self.job(CreationDate=SCHEDULED - timedelta(microseconds=1))
+        self.assertIn("missing", self.health({RESOURCE: [stale]})[0])
+
+    def test_latest_current_job_controls_success_not_any_earlier_success(self):
+        success = self.job(CreationDate=SCHEDULED)
+        pending = self.job(Status="RUNNING", CreationDate=SCHEDULED + timedelta(minutes=1))
+        for jobs in [[success, pending], [pending, success]]:
+            self.assertIn("incomplete", self.health({RESOURCE: jobs})[0])
+        failed = self.job(Status="FAILED", CreationDate=SCHEDULED)
+        self.assertEqual(self.health({RESOURCE: [self.job(), failed]}), [])
+
+    def test_failure_at_retry_start_alarms_immediately_even_inside_grace(self):
+        for changes in [{"Status": "FAILED"}, {"Status": "ABORTED"},
+                        {"ValidationStatus": "FAILED"}, {"ValidationStatus": "TIMED_OUT"},
+                        {"DeletionStatus": "FAILED"}]:
+            with self.subTest(changes=changes):
+                failed = self.job(CreationDate=SCHEDULED, **changes)
+                self.assertIn("failed", self.health({RESOURCE: [failed]}, now=SCHEDULED)[0])
+
+    def test_unrelated_plan_role_type_or_optional_source_field_cannot_supply_coverage(self):
+        for changes in [{"IamRoleArn": "other-role"}, {"ResourceType": "EC2"},
+                        {"CreatedBy": {"RestoreTestingPlanArn": "plan-arn"}}, {"CreatedBy": {}}]:
+            with self.subTest(changes=changes):
+                self.assertIn("missing", self.health({RESOURCE: [self.job(**changes)]})[0])
+        other = "other-source"
+        config = dict(self.config, volumes=[RESOURCE, other])
+        errors = self.health({RESOURCE: [self.job(SourceResourceArn=other)]}, config=config)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(other, errors[0])
+
+    def test_history_is_paginated_per_source_without_backup_age_or_new_sdk_fields(self):
+        prior = self.job(Status="FAILED", CreationDate=SCHEDULED - timedelta(days=60))
+        paginator = SimpleNamespace(paginate=Mock(return_value=[{"RestoreJobs": []}, {"RestoreJobs": [prior]}]))
+        stage = SimpleNamespace(get_paginator=Mock(return_value=paginator))
+        self.assertIn("failed", module.canary_restore_health(stage, self.config, SCHEDULED)[0])
+        stage.get_paginator.assert_called_once_with("list_restore_jobs_by_protected_resource")
+        paginator.paginate.assert_called_once_with(ResourceArn=RESOURCE)
+
+
 class HandlerTests(unittest.TestCase):
     def run_handler(self, restore_jobs, event=None, expected_error=None, listed_jobs=None, config_changes=None):
-        stage = MonthlyRestoreTests().stage({RESOURCE: restore_jobs})
+        # The same per-source API returns both monthly and canary jobs. Plan-wide
+        # cleanup inventory is separate, as in AWS, and carries no source field.
+        resource_jobs = restore_jobs + [job for jobs in (listed_jobs or {}).values() for job in jobs]
+        stage = MonthlyRestoreTests().stage({RESOURCE: resource_jobs})
         resource_paginator = stage.get_paginator.return_value
         restore_paginator = SimpleNamespace(paginate=Mock(side_effect=lambda **kwargs: [{
             "RestoreJobs": (listed_jobs or {}).get(kwargs["ByRestoreTestingPlanArn"], [])}]))
@@ -489,7 +624,8 @@ class HandlerTests(unittest.TestCase):
                 patch.object(module.boto3, "client", side_effect=lambda service, **kwargs: clients[service]), \
                 patch.object(module.boto3, "Session", return_value=stage_session), \
                 patch.object(module, "reconcile", return_value=([], [])), \
-                patch.object(module, "datetime", SimpleNamespace(now=lambda tz: SCHEDULED + timedelta(hours=3))):
+                patch.object(module, "datetime", SimpleNamespace(
+                    now=lambda tz: SCHEDULED + timedelta(hours=3), strptime=datetime.strptime)):
             if expected_error:
                 with self.assertRaisesRegex(RuntimeError, expected_error):
                     module.handler(event or {}, None)
@@ -525,7 +661,8 @@ class HandlerTests(unittest.TestCase):
         with patch.object(module, "validate_restore") as validate, \
                 patch.object(module, "cleanup_expired_test") as cleanup:
             clients = self.run_handler([], listed_jobs={"canary-arn": [canary]},
-                                       config_changes={"canary_plan": "initial", "canary_plan_arn": "canary-arn"},
+                                       config_changes={"canary_plan": "initial", "canary_plan_arn": "canary-arn",
+                                                       "canary_start_at": "2026-09-08T12:00:00Z"},
                                        expected_error="monthly restore test missing")
             validate.assert_called_once()
             cleanup.assert_called_once()
@@ -538,8 +675,83 @@ class HandlerTests(unittest.TestCase):
                       CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
         with patch.object(module, "cleanup_expired_test"):
             self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [canary]},
-                             config_changes={"canary_plan_arn": "canary-arn"},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"},
                              expected_error="Initial restore canary failed")
+
+    def test_prior_failed_canary_does_not_poison_retry_but_still_gets_cleanup(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-failed", Status="FAILED",
+                     CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        retry = dict(RESTORE_JOB, RestoreJobId="successful-retry",
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "cleanup_expired_test") as cleanup:
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [prior, retry]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"})
+            self.assertEqual([call.args[1]["RestoreJobId"] for call in cleanup.call_args_list],
+                             ["prior-failed", "successful-retry"])
+
+    def test_canary_failure_at_retry_start_is_not_ignored(self):
+        retry = dict(RESTORE_JOB, RestoreJobId="failed-retry", Status="FAILED",
+                     CreationDate=SCHEDULED, CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "cleanup_expired_test"):
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [retry]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"},
+                             expected_error="Initial restore canary failed")
+
+    def test_prior_canary_still_receives_validation(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-unvalidated", ValidationStatus="VALIDATING",
+                     DeletionStatus="DELETING", CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "validate_restore") as validate, \
+                patch.object(module, "cleanup_expired_test") as cleanup:
+            self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [prior]},
+                             config_changes={"canary_plan_arn": "canary-arn",
+                                             "canary_start_at": "2026-09-08T12:00:00Z"},
+                             expected_error="Initial restore canary missing")
+            self.assertEqual(validate.call_args.args[2], "prior-unvalidated")
+            self.assertEqual(cleanup.call_args.args[1]["RestoreJobId"], "prior-unvalidated")
+
+    def test_future_retry_keeps_failed_health_metric_and_old_job_cleanup(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-failed", Status="FAILED",
+                     CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "cleanup_expired_test") as cleanup:
+            clients = self.run_handler([RESTORE_JOB], listed_jobs={"canary-arn": [prior]},
+                                       config_changes={"canary_plan_arn": "canary-arn",
+                                                       "canary_start_at": "2026-09-08T16:00:00Z"},
+                                       expected_error="Initial restore canary failed")
+            self.assertEqual(cleanup.call_args.args[1]["RestoreJobId"], "prior-failed")
+        metrics = clients["cloudwatch"].put_metric_data.call_args.kwargs["MetricData"]
+        self.assertEqual({metric["MetricName"]: metric["Value"] for metric in metrics},
+                         {"MissingRecoveryCopies": 0, "UnhealthyRestoreTests": 1, "RecoveryControllerErrors": 1})
+
+    def test_accepted_canary_still_cleans_old_jobs_and_requires_monthly_health(self):
+        prior = dict(RESTORE_JOB, RestoreJobId="prior-unvalidated", ValidationStatus="VALIDATING",
+                     DeletionStatus="DELETING", CreationDate=SCHEDULED - timedelta(minutes=15),
+                     CreatedBy={"RestoreTestingPlanArn": "canary-arn"})
+        with patch.object(module, "validate_restore") as validate, \
+                patch.object(module, "cleanup_expired_test") as cleanup:
+            clients = self.run_handler([], listed_jobs={"canary-arn": [prior]},
+                                       config_changes={"canary_plan_arn": "canary-arn", "canary_accepted": True,
+                                                       "canary_start_at": "2026-09-08T12:00:00Z"},
+                                       expected_error="monthly restore test missing")
+            self.assertEqual(validate.call_args.args[2], "prior-unvalidated")
+            self.assertEqual(cleanup.call_args.args[1]["RestoreJobId"], "prior-unvalidated")
+        metrics = clients["cloudwatch"].put_metric_data.call_args.kwargs["MetricData"]
+        self.assertEqual({metric["MetricName"]: metric["Value"] for metric in metrics},
+                         {"MissingRecoveryCopies": 0, "UnhealthyRestoreTests": 1, "RecoveryControllerErrors": 1})
+
+    def test_canary_start_is_strict_and_missing_configuration_fails_closed(self):
+        self.assertIsNone(module.canary_test_start({"canary_plan_arn": None}))
+        for value in (None, "", "2026-09-08T12:00:01Z", "2026-09-08T12:00:00+00:00",
+                      "2026-02-30T12:00:00Z", "2026-9-8T12:00:00Z"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Invalid initial restore"):
+                module.canary_test_start({"canary_plan_arn": "canary-arn", "canary_start_at": value})
+        self.assertEqual(module.canary_test_start({"canary_plan_arn": "canary-arn",
+                                                  "canary_start_at": "2026-09-08T12:00:00Z"}), SCHEDULED)
 
     def test_null_canary_does_not_query_any_extra_plan(self):
         clients = self.run_handler([RESTORE_JOB], config_changes={"canary_plan_arn": None})

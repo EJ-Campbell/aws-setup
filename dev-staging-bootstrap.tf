@@ -76,8 +76,11 @@ resource "aws_backup_vault_policy" "staging" {
 # undeclared keys show as a diff on every plan (perpetual drift).
 resource "aws_backup_global_settings" "main" {
   global_settings = {
-    "isCrossAccountBackupEnabled"     = "true"
-    "isDelegatedAdministratorEnabled" = "false"
+    "isCrossAccountBackupEnabled" = "true"
+    # Preserve the live Organizations synchronization setting read on 2026-09-07;
+    # no delegated administrator is registered. Do not flip this global setting
+    # as a side effect of deploying the detached-restore key repair.
+    "isDelegatedAdministratorEnabled" = "true"
     "isMpaEnabled"                    = "false"
   }
 }
