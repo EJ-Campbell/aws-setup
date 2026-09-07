@@ -45,9 +45,10 @@ const fixture = createServer((req, res) => {
   res.end(`<!doctype html><html><head><title>${name} isolated browser</title><style>
     body{margin:48px;background:#f1f5f9;color:#172033;font:24px system-ui}h1{font-size:52px}
     input{padding:20px;width:80%;font:28px system-ui}button{margin-top:32px;padding:32px;font:24px system-ui}
-    @media(max-width:500px){body{margin:20px;font-size:18px}h1{font-size:30px}input{box-sizing:border-box;width:100%;padding:14px;font-size:18px}}
+    .mode-paint{position:fixed;right:8px;bottom:8px;width:16px;height:16px;background:#3b82f6;pointer-events:none}
+    @media(max-width:500px){body{margin:20px;font-size:18px}h1{font-size:30px}input{box-sizing:border-box;width:100%;padding:14px;font-size:18px}.mode-paint{background:#8b5cf6}}
     </style></head><body><h1>${name}: private desktop</h1><p>This browser has its own persistent profile.</p>
-    <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p>
+    <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p><span class="mode-paint" aria-hidden="true"></span>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
     const reportViewport=()=>report('viewport',JSON.stringify({width:innerWidth,height:innerHeight,
@@ -55,7 +56,8 @@ const fixture = createServer((req, res) => {
       value:document.querySelector('input').value,url:location.pathname+location.search,
       profile:localStorage.getItem('owner'),overflow:document.documentElement.scrollWidth>innerWidth}));
     addEventListener('resize',reportViewport);
-    addEventListener('pageshow',()=>{report('location',location.pathname+location.search);reportViewport();});
+    addEventListener('pageshow',()=>{report('location',location.pathname+location.search);
+      report('history-length',String(history.length));reportViewport();});
     document.querySelector('input').addEventListener('input',e=>{
       document.body.style.background='#d5f4e6';report('input',e.target.value);
     });
@@ -69,7 +71,7 @@ const keys = await generateKeyPair('RS256');
 const token = await new SignJWT({ email: config.owner }).setProtectedHeader({ alg: 'RS256' })
   .setSubject('local-owner').setIssuer(config.issuer).setAudience(config.audience)
   .setIssuedAt().setExpirationTime('15m').sign(keys.privateKey);
-let manager, app, server, control, browser;
+let manager, app, server, control, browser, activePage;
 try {
   app = next({ dev: false, dir: project, hostname: '127.0.0.1' });
   await app.prepare();
@@ -100,7 +102,11 @@ try {
   for (const [label, viewport] of [['desktop', { width: 1440, height: 1000 }], ['phone', { width: 390, height: 844 }]]) {
     const context = await browser.newContext({ viewport, extraHTTPHeaders: { 'Cf-Access-Jwt-Assertion': token },
       isMobile: label === 'phone', hasTouch: label === 'phone' });
+    await context.addInitScript(supported => {
+      Object.defineProperty(document, 'fullscreenEnabled', { get: () => supported });
+    }, label === 'desktop');
     const page = await context.newPage();
+    activePage = page;
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(config.baseUrl);
     await expect(page.getByRole('heading', { name: 'alpha', exact: true })).toBeVisible();
@@ -111,6 +117,11 @@ try {
       .getByRole('link', { name: 'Open desktop', exact: true }).click();
     await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     await expect(page.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
+    const back = page.getByRole('button', { name: 'Back in remote browser', exact: true });
+    await expect(back).toHaveText('Back');
+    await expect(back).toBeDisabled();
+    if (label === 'desktop') await expect(page.getByRole('button', { name: 'Enter fullscreen', exact: true })).toBeVisible();
+    else await expect(page.getByRole('button', { name: /^(Enter|Exit) fullscreen$/ })).toHaveCount(0);
     const canvas = page.locator('.vnc-screen canvas');
     await expect(canvas).toBeVisible();
     await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
@@ -144,11 +155,12 @@ try {
     await expect.poll(() => events.some(e => e.name === selected && e.kind === 'location' && e.value === nextLocation)).toBe(true);
     await page.getByRole('button', { name: 'Close keyboard controls' }).click();
     const beforeBack = events.length;
-    const back = page.getByRole('button', { name: 'Back in remote browser', exact: true });
-    await expect(back).toHaveText('Back');
     await expect(back).toBeEnabled();
     await back.click();
     await expect.poll(() => events.slice(beforeBack).some(e => e.name === selected && e.kind === 'location' && e.value === `/${selected}`)).toBe(true);
+    await expect(back).toBeDisabled();
+    await expect.poll(() => events.slice(beforeBack).some(e => e.name === selected &&
+      e.kind === 'history-length' && Number(e.value) > 1)).toBe(true);
     await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     await expect.poll(() => remoteViewport(selected)?.value).toBe(`typed-from-${label}`);
     const baseline = remoteViewport(selected);
@@ -180,6 +192,9 @@ try {
     const phoneContent = remoteViewport(selected);
     assert.ok(phoneContent.height > 0 && phoneContent.height <= phoneViewport.height);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${label} Phone mode overflow`);
+    // Geometry and DOM reflow can arrive before their new VNC pixels; capture the painted mode.
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+      .toEqual([139, 92, 246, 255]);
     await page.screenshot({ path: join(shots, `${label}-phone-mode.png`), fullPage: true });
     // A new VNC connection must retain the native viewport, not merely redraw a scaled desktop.
     const phoneSocket = page.waitForEvent('websocket', {
@@ -204,8 +219,10 @@ try {
     await expect.poll(() => remoteViewport(selected)?.url).toBe(phoneLocation);
     assert.equal(remoteViewport(selected).width, 390);
     await page.getByRole('button', { name: 'Close keyboard controls' }).click();
+    await expect(back).toBeEnabled();
     await back.click();
     await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
+    await expect(back).toBeDisabled();
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
       .toEqual([390, phoneViewport.height]);
     const afterPhoneNavigation = untouchedEvents();
@@ -219,6 +236,8 @@ try {
       url: baseline.url, profile: baseline.profile, overflow: false });
     assert.ok(remoteViewport(selected).height > 0 && remoteViewport(selected).height < 900,
       'Desktop restores browser chrome outside fullscreen');
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+      .toEqual([59, 130, 246, 255]);
     assert.equal(untouchedEvents(), afterPhoneNavigation, 'Restoring Desktop must not reload, navigate, or replay input');
     assert.equal(manager.getSocket(selected), originalSocket);
     assert.equal(manager.getSocket(otherName), otherSocket);
@@ -248,11 +267,15 @@ try {
   await writeFile(join(shots, 'acceptance.json'), JSON.stringify({ passed: true, browserBin,
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
       'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone',
+      'native-back-availability', 'fullscreen-supported-and-unsupported',
       'native-phone-reflow-desktop-and-phone', 'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
   // Next installs an uncaught-exception listener; preserve a failing exit status explicitly.
   console.error(error);
+  await activePage?.screenshot({ path: join(shots, 'failure.png'), fullPage: true }).catch(() => {});
+  await writeFile(join(shots, 'acceptance.json'), JSON.stringify({ passed: false, events }, null, 2), { mode: 0o600 });
+  console.error(`Failure artifacts: ${shots}`);
   process.exitCode = 1;
 } finally {
   await browser?.close();
