@@ -45,6 +45,7 @@ const fixture = createServer((req, res) => {
     <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
+    addEventListener('pageshow',()=>report('location',location.pathname+location.search));
     document.querySelector('input').addEventListener('input',e=>{
       document.body.style.background='#d5f4e6';report('input',e.target.value);
     });
@@ -111,7 +112,22 @@ try {
     await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
       .toEqual([213, 244, 230, 255]);
     await page.screenshot({ path: join(shots, `${label}-keyboard.png`), fullPage: true });
+    // Navigate the actual remote Chrome, then use the viewer toolbar to go back. pageshow
+    // reports both a network reload and a back/forward-cache restore without using CDP.
+    const nextLocation = `/${selected}?history=next-${label}`;
+    await page.getByRole('button', { name: 'Address bar', exact: true }).click();
+    await page.getByRole('textbox', { name: 'Text for the remote desktop' }).fill(`${fixtureOrigin}${nextLocation}`);
+    await page.getByRole('button', { name: 'Type text', exact: true }).click();
+    await page.getByRole('button', { name: 'Enter ↵', exact: true }).click();
+    await expect.poll(() => events.some(e => e.name === selected && e.kind === 'location' && e.value === nextLocation)).toBe(true);
     await page.getByRole('button', { name: 'Close keyboard controls' }).click();
+    const beforeBack = events.length;
+    const back = page.getByRole('button', { name: 'Back in remote browser', exact: true });
+    await expect(back).toHaveText('Back');
+    await expect(back).toBeEnabled();
+    await back.click();
+    await expect.poll(() => events.slice(beforeBack).some(e => e.name === selected && e.kind === 'location' && e.value === `/${selected}`)).toBe(true);
+    await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     const rect = await canvas.boundingBox();
     await page.mouse.click(rect.x + rect.width * 0.5, rect.y + rect.height * 0.65);
     await expect.poll(() => events.some(e => e.name === (label === 'phone' ? 'beta' : 'alpha') && e.kind === 'pointer')).toBe(true);
@@ -130,8 +146,8 @@ try {
   assert.ok(events.filter(e => e.name === 'alpha' && e.kind === 'profile').slice(1).every(e => e.value === 'alpha'));
   await writeFile(join(shots, 'acceptance.json'), JSON.stringify({ passed: true, browserBin,
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
-      'desktop-and-phone-layout', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
-  console.log(`PASS: desktop + phone VNC, input, reconnect, and retained profile data. Screenshots: ${shots}`);
+      'desktop-and-phone-layout', 'remote-browser-back-desktop-and-phone', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
+  console.log(`PASS: desktop + phone VNC, input, remote-browser Back, reconnect, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
   // Next installs an uncaught-exception listener; preserve a failing exit status explicitly.
   console.error(error);
