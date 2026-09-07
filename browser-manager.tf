@@ -147,11 +147,11 @@ resource "aws_iam_role_policy" "dev_server_browser_manager" {
 # Cloudflare returns a service-token secret only at creation. Keep the pair in Secrets
 # Manager and give the local operator a narrow role instead of creating a long-lived IAM
 # access key for the Mac. The existing AWS SSO AdministratorAccess session may assume this
-# role; the role itself can read only this one secret.
+# role; the role itself can read only the AWS and Mac viewer secrets.
 resource "aws_secretsmanager_secret" "browser_manager_openclaw_access" {
   name                    = "browser-manager-openclaw-access"
   description             = "Cloudflare Access service token for the local OpenClaw browser viewer"
-  recovery_window_in_days = 7
+  recovery_window_in_days = 30
 
   tags = { Name = "browser-manager-openclaw-access", Managed = "terraform" }
 }
@@ -194,9 +194,39 @@ resource "aws_iam_role_policy" "browser_manager_openclaw_client" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.browser_manager_openclaw_access.arn
+      Effect = "Allow"
+      Action = "secretsmanager:GetSecretValue"
+      Resource = [
+        aws_secretsmanager_secret.browser_manager_openclaw_access.arn,
+        aws_secretsmanager_secret.browser_manager_mac_openclaw_access.arn,
+      ]
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "browser_manager_openclaw_access" {
+  for_each = {
+    aws = aws_secretsmanager_secret.browser_manager_openclaw_access.arn
+    mac = aws_secretsmanager_secret.browser_manager_mac_openclaw_access.arn
+  }
+  secret_arn = each.value
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheViewerCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = each.value
+      Condition = {
+        ArnNotEquals = {
+          "aws:PrincipalArn" = [
+            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
+            aws_iam_role.jumpbox_admin[0].arn,
+            aws_iam_role.browser_manager_openclaw_client.arn,
+          ]
+        }
+      }
     }]
   })
 }

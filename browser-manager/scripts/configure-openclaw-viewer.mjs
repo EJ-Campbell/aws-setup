@@ -5,7 +5,10 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 
-const BASE_URL = 'https://browsers.cc-games.dev';
+const VIEWERS = Object.freeze({
+  'https://browsers.cc-games.dev': 'secure-browser-viewer',
+  'https://mac-browsers.cc-games.dev': 'secure-mac-browser-viewer',
+});
 const ISSUER = 'https://ejc3.cloudflareaccess.com';
 const fail = message => { throw new Error(`browser-manager viewer: ${message}`); };
 
@@ -17,7 +20,7 @@ export function readViewerSecret(raw) {
       ['client_id', 'client_secret', 'base_url', 'issuer', 'audience'].some(name => typeof secret[name] !== 'string') ||
       !/^[a-f0-9]{32}\.access$/.test(secret.client_id || '') ||
       !/^(?:[a-f0-9]{64}|cfast_[A-Za-z0-9]{48})$/.test(secret.client_secret || '') ||
-      secret.base_url !== BASE_URL || secret.issuer !== ISSUER ||
+      !Object.hasOwn(VIEWERS, secret.base_url) || secret.issuer !== ISSUER ||
       !/^[a-f0-9]{64}$/.test(secret.audience || '')) {
     fail('secret input is not the configured browser-manager Access credential');
   }
@@ -39,11 +42,13 @@ export async function readViewerInput(input) {
 // not restrict extra HTTP headers to one origin: redirects, subresources, and later
 // navigations would otherwise disclose them. Only a host-only short-lived cookie
 // enters the viewer; remote desktops retain their own, separate website sessions.
-export async function configureViewer({ raw, profile = 'secure-browser-viewer' }, {
+export async function configureViewer({ raw, profile }, {
   callBrowserRequest, fetchImpl = globalThis.fetch, key,
 }) {
-  if (!/^[a-z0-9][a-z0-9-]{0,47}$/.test(profile)) fail('invalid OpenClaw browser profile name');
   const secret = readViewerSecret(raw);
+  const baseUrl = secret.base_url;
+  profile ??= VIEWERS[baseUrl];
+  if (profile !== VIEWERS[baseUrl]) fail('use the dedicated OpenClaw profile for this browser host');
   const parent = { browserProfile: profile, timeout: '30000' };
   const request = (path, body) => callBrowserRequest(parent, {
     method: 'POST', path, query: { profile }, body,
@@ -53,7 +58,7 @@ export async function configureViewer({ raw, profile = 'secure-browser-viewer' }
     // Remove credentials installed by older versions before any navigation. Failure
     // to clear them aborts; never silently continue with profile-wide secret headers.
     await request('/set/headers', { headers: {} });
-    const response = await fetchImpl(`${BASE_URL}/`, {
+    const response = await fetchImpl(`${baseUrl}/`, {
       method: 'GET', redirect: 'error', signal: AbortSignal.timeout(15000),
       headers: {
         'CF-Access-Client-Id': secret.client_id,
@@ -61,7 +66,7 @@ export async function configureViewer({ raw, profile = 'secure-browser-viewer' }
       },
     });
     await response.body?.cancel();
-    if (response.status !== 200 || response.redirected || response.url !== `${BASE_URL}/`) {
+    if (response.status !== 200 || response.redirected || response.url !== `${baseUrl}/`) {
       fail('Access did not return a successful direct response');
     }
     const cookies = response.headers.getSetCookie().filter(value => value.startsWith('CF_Authorization='));
@@ -82,11 +87,21 @@ export async function configureViewer({ raw, profile = 'secure-browser-viewer' }
         payload.exp <= now + 60 || payload.exp > now + 13 * 3600 || payload.iat > now + 30) {
       fail('Access cookie does not identify the expected short-lived service session');
     }
+    // Prove that a browser can use the cookie alone before handing it to OpenClaw.
+    // A successful header-based exchange does not establish cookie acceptance.
+    const probe = await fetchImpl(`${baseUrl}/api/config`, {
+      method: 'GET', redirect: 'error', signal: AbortSignal.timeout(15000),
+      headers: { Cookie: `CF_Authorization=${token}` },
+    });
+    await probe.body?.cancel();
+    if (probe.status !== 200 || probe.redirected || probe.url !== `${baseUrl}/api/config`) {
+      fail('Access did not accept the cookie-only browser session');
+    }
     await request('/cookies/set', { cookie: {
-      name: 'CF_Authorization', value: token, url: `${BASE_URL}/`,
+      name: 'CF_Authorization', value: token, url: `${baseUrl}/`,
       httpOnly: true, secure: true, sameSite: 'Lax', expires: payload.exp,
     } });
-    await request('/navigate', { url: BASE_URL });
+    await request('/navigate', { url: baseUrl });
     return { profile, expiresAt: payload.exp * 1000 };
   } catch {
     // Dependency errors may include HTTP bodies or cookie values. Never print their

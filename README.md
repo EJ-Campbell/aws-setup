@@ -805,14 +805,17 @@ The connector token and saved Terraform plan are sensitive. Do not print or chec
 The application receives the public Access settings; only `cloudflared` receives the token
 file path. A public URL cannot work until both this apply and the host installation are done.
 
-Terraform also creates a second, dedicated Cloudflare Access service token for the local
-OpenClaw viewer. It is accepted only by the exact browser-manager Access application, and
+Terraform also creates separate Cloudflare Access service tokens for OpenClaw viewers of
+the AWS and Mac browser hosts. Each is accepted only by its exact Access application, and
 the origin independently verifies that the signed JWT's `common_name` equals that token's
-client ID. The client ID is public application configuration; the client secret is stored
-only in AWS Secrets Manager as `browser-manager-openclaw-access`.
+client ID. The client ID is public application configuration. The secrets are stored in
+AWS Secrets Manager as `browser-manager-openclaw-access` and
+`browser-manager-mac-openclaw-access`, and also in sensitive Terraform state. Resource
+policies deny direct reads by dev and CI roles. Account administrators can still change
+those policies; this is not an immutable boundary against an administrator.
 
 The local Mac uses its existing AWS SSO login to assume
-`browser-manager-openclaw-client`. That role can read only the viewer secret; it has no
+`browser-manager-openclaw-client`. That role can read only those two viewer secrets; it has no
 Cloudflare administration, tunnel, or other Secrets Manager access. Configure the local
 profile after apply. Obtain `browser_manager_openclaw_client_role_arn` with Terraform
 on the administration jumpbox and hand that public ARN to the Mac operator; do not
@@ -821,14 +824,15 @@ run Terraform on the Mac. For this account the commands are (no credential value
 ```bash
 aws configure set profile.browser-manager-openclaw role_arn \
   arn:aws:iam::928413605543:role/browser-manager-openclaw-client
-aws configure set profile.browser-manager-openclaw source_profile default
+aws configure set profile.browser-manager-openclaw source_profile AdministratorAccess-928413605543
 aws configure set profile.browser-manager-openclaw region us-west-1
 ```
 
-The service-token resource has `prevent_destroy`: replacing it changes the client ID
+Both service-token resources have `prevent_destroy`: replacing one changes the client ID
 pinned in the browser-manager environment. Do not remove the guard for an ordinary
 apply. A deliberate replacement requires a coordinated maintenance deployment: save
-the new `browser_manager_env` output, reinstall/restart the origin with that environment,
+the corresponding `browser_manager_env` or `browser_manager_mac_env` output,
+reinstall/restart that origin with its environment,
 refresh the local viewer session, and verify both machine access and unauthenticated
 denial. The existing owner-login policy stays attached throughout. A stale origin must
 fail closed, not accept an arbitrary replacement service identity.
@@ -886,23 +890,35 @@ Labels are trimmed and saved; the dashboard and desktop title show them. Renamin
 the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
 and does not restart the browser. Older browsers initially display their stable name as the label.
 
-For a machine-controlled viewer, create a dedicated OpenClaw browser profile and an
-empty tab once. Install the helper's existing dependencies on the Mac, then stream the
+For machine-controlled viewers, create the two dedicated OpenClaw browser profiles and
+an empty tab in each once. Leave existing profiles in place. Install the helper's dependencies
+on the Mac, then stream each
 AWS secret directly into it. The helper exchanges the service credential over HTTPS
-with only the fixed browser-manager hostname, refuses redirects, verifies the returned
-Access JWT, and installs a host-scoped cookie. It never installs the long-lived service
+with only the credential's allowlisted browser-manager hostname, refuses redirects,
+verifies the returned Access JWT and a cookie-only API request, then installs a host-scoped cookie.
+The helper pins each hostname to its own dedicated profile, never a normal browsing profile.
+It never installs the long-lived service
 secret as profile-wide browser headers or puts it in argv, a file, or command output:
 
 ```bash
 openclaw browser create-profile --name secure-browser-viewer --color '#6B5BFF'
 openclaw browser --browser-profile secure-browser-viewer open about:blank
+openclaw browser create-profile --name secure-mac-browser-viewer --color '#16A34A'
+openclaw browser --browser-profile secure-mac-browser-viewer open about:blank
 npm --prefix browser-manager ci --ignore-scripts
 aws --profile browser-manager-openclaw secretsmanager get-secret-value \
   --secret-id browser-manager-openclaw-access --query SecretString --output text \
   | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-browser-viewer
+aws --profile browser-manager-openclaw secretsmanager get-secret-value \
+  --secret-id browser-manager-mac-openclaw-access --query SecretString --output text \
+  | node browser-manager/scripts/configure-openclaw-viewer.mjs secure-mac-browser-viewer
 ```
 
-Use `secure-browser-viewer` for `browsers.cc-games.dev`. The helper clears any legacy
+Use `secure-browser-viewer` for `browsers.cc-games.dev` and `secure-mac-browser-viewer`
+for `mac-browsers.cc-games.dev`. An expired AWS SSO session must be renewed with
+`aws sso login --profile AdministratorAccess-928413605543` before secret retrieval;
+the helper does not copy administrator credentials or silently bypass failed login.
+The helper clears any legacy
 profile-wide headers, sets only the short-lived host-scoped Access cookie, and navigates
 to the dashboard. Browser cookies are credentials and may be persisted in that local
 profile; the one-year service-token secret never enters it. Run the helper again when

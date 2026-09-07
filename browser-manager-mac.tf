@@ -4,6 +4,26 @@ locals {
   browser_manager_mac_hostname = "mac-browsers.cc-games.dev"
 }
 
+resource "cloudflare_zero_trust_access_service_token" "browser_manager_mac_openclaw" {
+  account_id = var.cloudflare_account_id
+  name       = "browser-manager-mac-openclaw"
+  duration   = "8760h"
+  lifecycle {
+    create_before_destroy = true
+    prevent_destroy       = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "browser_manager_mac_openclaw" {
+  account_id       = var.cloudflare_account_id
+  name             = "Mac browser-manager OpenClaw client"
+  decision         = "non_identity"
+  session_duration = "12h"
+  include = [{
+    service_token = { token_id = cloudflare_zero_trust_access_service_token.browser_manager_mac_openclaw.id }
+  }]
+}
+
 resource "cloudflare_zero_trust_access_application" "browser_manager_mac" {
   account_id       = var.cloudflare_account_id
   name             = "Private Mac browser manager"
@@ -14,10 +34,36 @@ resource "cloudflare_zero_trust_access_application" "browser_manager_mac" {
     cloudflare_zero_trust_access_identity_provider.google[*].id,
     [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
   )
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.browser_manager_owner.id
-    precedence = 1
-  }]
+  policies = [
+    {
+      id         = cloudflare_zero_trust_access_policy.browser_manager_owner.id
+      precedence = 1
+    },
+    {
+      id         = cloudflare_zero_trust_access_policy.browser_manager_mac_openclaw.id
+      precedence = 2
+    },
+  ]
+}
+
+# Distinct from both the AWS viewer identity and the Mac tunnel connector. Neither
+# viewer credential authenticates to the other host's application/audience.
+resource "aws_secretsmanager_secret" "browser_manager_mac_openclaw_access" {
+  name                    = "browser-manager-mac-openclaw-access"
+  description             = "Cloudflare Access service credential for the Mac browser-manager viewer only"
+  recovery_window_in_days = 30
+  tags                    = { Managed = "terraform", Name = "browser-manager-mac-openclaw-access" }
+}
+
+resource "aws_secretsmanager_secret_version" "browser_manager_mac_openclaw_access" {
+  secret_id = aws_secretsmanager_secret.browser_manager_mac_openclaw_access.id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.browser_manager_mac_openclaw.client_id
+    client_secret = cloudflare_zero_trust_access_service_token.browser_manager_mac_openclaw.client_secret
+    audience      = cloudflare_zero_trust_access_application.browser_manager_mac.aud
+    issuer        = local.browser_manager_issuer
+    base_url      = "https://${local.browser_manager_mac_hostname}"
+  })
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared" "browser_manager_mac" {
@@ -143,6 +189,7 @@ output "browser_manager_mac_env" {
     BM_BASE_URL=https://${local.browser_manager_mac_hostname}
     BM_ACCESS_AUD=${cloudflare_zero_trust_access_application.browser_manager_mac.aud}
     BM_ACCESS_ISSUER=${local.browser_manager_issuer}
+    BM_ACCESS_SERVICE_TOKEN_ID=${cloudflare_zero_trust_access_service_token.browser_manager_mac_openclaw.client_id}
     BM_OWNER_EMAIL=${local.browser_manager_owner}
     BM_PORT=3210
   ENV
@@ -154,4 +201,8 @@ output "browser_manager_mac_tunnel_secret_name" {
 
 output "browser_manager_mac_connector_role_arn" {
   value = aws_iam_role.browser_manager_mac_connector.arn
+}
+
+output "browser_manager_mac_openclaw_access_secret_name" {
+  value = aws_secretsmanager_secret.browser_manager_mac_openclaw_access.name
 }
