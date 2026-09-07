@@ -1038,8 +1038,11 @@ top-left arrow returns to the browser-manager dashboard instead. Back follows th
 Chrome window/tab's native toolbar state, including navigation from other viewers. It is disabled
 while disconnected or when the native state is unavailable. Foreground viewers refresh this
 read-only state every 500 ms after the previous read completes; background polling pauses.
-Each desktop uses its own private accessibility bus; no browsing history URLs are returned and
-no remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
+Each desktop uses its own private accessibility bus and one persistent native reader, kept alive
+until Chrome exits. Repeatedly subscribing and disconnecting short-lived readers can crash
+Chromium's ATK keyboard-event handler, including on versions 151 and 153. A slow read returns
+unknown without tearing down the subscription. No browsing history URLs are returned and no
+remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
 Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
 the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
@@ -1057,6 +1060,13 @@ input also work directly. **Fit to screen** scales independently for each viewer
 explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
 viewing browser supports it.
 
+In the Linux VNC viewer, swipe with one finger to scroll the remote page or the panel
+where the swipe starts. A quick swipe has a short glide; touching again stops it. Reduced-motion
+preferences disable the glide. Tap normally to click; to drag an item, tap once, then touch
+and drag within a moment. Long-press and multitouch gestures keep noVNC's existing behavior.
+Mouse input is unchanged. VNC carries discrete wheel steps, so this improves touch handling
+but cannot promise pixel-for-pixel scrolling or a native phone's frame rate over the network.
+
 In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting and actual size
 are already the same (less than one pixel of difference), or while disconnected. It re-enables
 when the shared display or available viewer space changes, including rotation and opening the
@@ -1068,9 +1078,6 @@ keep their logical size; **Fit** off means logical actual size, not one physical
 pixel per CSS pixel. This supplies more detail on high-density screens at four times the
 source pixel count; it is not lossless or full native density on every phone. Existing
 desktops pick up the density change when restarted.
-Use a current Chromium build: native HiDPI acceptance passes on 153.0.8010.12, while
-151.0.7922.34 reproduced crashes in Chromium's ATK key-event handler. Upgrade that older
-build and update `BM_BROWSER_BIN` before restarting; do not disable native Back or the sandbox.
 
 VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
 reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
