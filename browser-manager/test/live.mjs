@@ -53,13 +53,18 @@ const fixture = createServer((req, res) => {
   const name = url.pathname === '/beta' ? 'beta' : 'alpha';
   res.setHeader('Content-Type', 'text/html');
   res.end(`<!doctype html><html><head><title>${name} isolated browser</title><style>
+    html{scrollbar-width:none}
     body{margin:48px;background:#f1f5f9;color:#172033;font:24px system-ui}h1{font-size:52px}
     input{padding:20px;width:80%;font:28px system-ui}button{margin-top:32px;padding:32px;font:24px system-ui}
     .pointer-target{position:fixed;right:20px;top:130px;width:56px;height:44px;border:0;margin:0;padding:0;background:#176457;color:white;font:14px system-ui}
     .mode-paint{position:fixed;right:8px;bottom:8px;width:16px;height:16px;background:#3b82f6;pointer-events:none}
+    .scroll-panel{position:fixed;left:20px;top:320px;width:260px;height:120px;overflow:auto;overscroll-behavior:contain;scrollbar-width:none;background:#dbeafe}
+    .scroll-panel-content{height:1000px;padding:12px;box-sizing:border-box;background:repeating-linear-gradient(#dbeafe 0 60px,#bfdbfe 60px 120px)}
+    .scroll-paint{position:fixed;left:8px;bottom:8px;width:16px;height:16px;background:#eab308;pointer-events:none}
     @media(max-width:500px){body{margin:20px;font-size:18px}h1{font-size:30px}input{box-sizing:border-box;width:100%;padding:14px;font-size:18px}.mode-paint{background:#8b5cf6}}
     </style></head><body><h1>${name}: private desktop</h1><p>This browser has its own persistent profile.</p>
     <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p><button class="pointer-target">Hit me</button><span class="mode-paint" aria-hidden="true"></span>
+    <div class="scroll-panel"><div class="scroll-panel-content">Nested scroll target</div></div><div style="height:1800px"></div><span class="scroll-paint" aria-hidden="true"></span>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
     const reportViewport=()=>report('viewport',JSON.stringify({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,
@@ -73,6 +78,15 @@ const fixture = createServer((req, res) => {
       document.body.style.background='#d5f4e6';report('input',e.target.value);
     });
     document.querySelector('.pointer-target').addEventListener('click',e=>report('target-click',JSON.stringify({x:e.clientX,y:e.clientY})));
+    const panel=document.querySelector('.scroll-panel');
+    const reportScroll=(target,end=false)=>{
+      document.querySelector('.scroll-paint').style.background=panel.scrollTop>0?'#ec4899':scrollY>0?'#f97316':'#eab308';
+      report('scroll',JSON.stringify({target,end,page:scrollY,panel:panel.scrollTop}));
+    };
+    addEventListener('scroll',()=>reportScroll('document'));
+    addEventListener('scrollend',()=>reportScroll('document',true));
+    panel.addEventListener('scroll',()=>reportScroll('panel'));
+    panel.addEventListener('scrollend',()=>reportScroll('panel',true));
     document.addEventListener('pointerdown',()=>report('pointer','received'));</script></body></html>`);
 });
 const fixtureAddress = await listen(fixture, { host: '127.0.0.1', port: 0 });
@@ -113,7 +127,7 @@ try {
   const errors = [];
   for (const [label, viewport] of [['desktop', { width: 1440, height: 1000 }], ['phone', { width: 390, height: 844 }]]) {
     const context = await browser.newContext({ viewport, extraHTTPHeaders: { 'Cf-Access-Jwt-Assertion': token },
-      isMobile: label === 'phone', hasTouch: label === 'phone', deviceScaleFactor: label === 'phone' ? 2 : 1 });
+      isMobile: label === 'phone', hasTouch: true, deviceScaleFactor: label === 'phone' ? 2 : 1 });
     await context.addInitScript(supported => {
       Object.defineProperty(document, 'fullscreenEnabled', { get: () => supported });
     }, label === 'desktop');
@@ -234,6 +248,29 @@ try {
       await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
     }
     await page.screenshot({ path: join(shots, `${label}-phone-mode.png`), fullPage: true });
+    // One noVNC wheel quantum is an RFB button step, not a requested physical-pixel distance.
+    // Measure the resulting native CSS scroll, then return to the unchanged initial document.
+    for (const deltaY of [50, -50]) {
+      const beforeWheel = events.length;
+      await canvas.evaluate((node, { deltaY, chromeHeight }) => {
+        const box = node.getBoundingClientRect(), scale = box.width / 390;
+        node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaMode: 0,
+          deltaY, clientX: box.x + 350 * scale, clientY: box.y + (chromeHeight + 250) * scale }));
+      }, { deltaY, chromeHeight: phoneViewport.height - remoteViewport(selected).height });
+      let settled;
+      await expect.poll(() => {
+        const end = events.slice(beforeWheel).findLast(event => event.name === selected && event.kind === 'scroll' && JSON.parse(event.value).end);
+        settled = end ? JSON.parse(end.value) : null;
+        return settled?.target;
+      }).toBe('document');
+      if (deltaY > 0) {
+        assert.ok(settled.page > 0);
+        assert.equal(settled.panel, 0);
+        console.log(`${label}: one 50-delta wheel step scrolled ${settled.page} native CSS pixels at DPR2.`);
+        await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(32, node.height - 32, 1, 1).data]))
+          .toEqual([249, 115, 22, 255]);
+      } else assert.equal(settled.page, 0);
+    }
     if (peerPage) {
       activePage = peerPage;
       const peerMode = peerPage.getByRole('button', { name: 'Phone mode', exact: true });
@@ -334,6 +371,76 @@ try {
     await expect(back).toBeDisabled();
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
       .toEqual([780, phoneViewport.height * 2]);
+    const touch = await context.newCDPSession(page); // Viewer input only; never attach to the remote browser.
+    const scrollState = () => {
+      const event = events.findLast(event => event.name === selected && event.kind === 'scroll');
+      return event ? JSON.parse(event.value) : null;
+    };
+    const outerScroll = () => page.evaluate(() => {
+      const display = document.querySelector('.desktop-display');
+      return [scrollX, scrollY, display.scrollLeft, display.scrollTop];
+    });
+    const pointInCanvas = async (x, y) => {
+      const box = await canvas.boundingBox(), scale = box.width / 390;
+      return { x: box.x + x * scale,
+        y: box.y + (phoneViewport.height - remoteViewport(selected).height + y) * scale, scale };
+    };
+    const swipeAndTap = async (x, y, distance) => {
+      const before = events.length, outer = await outerScroll();
+      const start = await pointInCanvas(x, y);
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: start.x, y: start.y, id: 1 }] });
+      for (let step = 1; step <= 6; step++) {
+        await touch.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [
+          { x: start.x, y: start.y + distance * start.scale * step / 6, id: 1 },
+        ] });
+        await page.waitForTimeout(16); // Pace an actual finger stroke, not an assertion retry.
+      }
+      // A deliberate held finish removes inertia from the exact reverse-position assertion.
+      await page.waitForTimeout(120);
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      const tap = await pointInCanvas(356, 152);
+      await page.touchscreen.tap(tap.x, tap.y);
+      await expect.poll(() => events.slice(before).filter(event => event.name === selected && event.kind === 'target-click').length).toBe(1);
+      await expect.poll(() => events.slice(before).some(event => event.name === selected && event.kind === 'scroll' && JSON.parse(event.value).end)).toBe(true);
+      assert.equal(events.slice(before).filter(event => event.name === selected && event.kind === 'target-click').length, 1,
+        'A swipe must not manufacture a click or leave the following tap pressed');
+      assert.deepEqual(await outerScroll(), outer, 'Touch scroll must stay in the remote browser, not the viewer container');
+    };
+    await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
+    for (const fitted of [true, false]) {
+      if (!fitted) await fitMode.click();
+      await expect(fitMode).toHaveAttribute('aria-pressed', String(fitted));
+      await expect.poll(async () => {
+        const box = await canvas.boundingBox();
+        return fitted ? box.width < 390 : Math.abs(box.width - 390) < 1;
+      }).toBe(true);
+      await swipeAndTap(350, 230, -120);
+      await expect.poll(() => scrollState()?.page).toBeGreaterThan(0);
+      assert.equal(scrollState().panel, 0);
+      await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(32, node.height - 32, 1, 1).data]))
+        .toEqual([249, 115, 22, 255]);
+      await swipeAndTap(350, 10, 240);
+      await expect.poll(() => scrollState()?.page).toBe(0);
+      await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(32, node.height - 32, 1, 1).data]))
+        .toEqual([234, 179, 8, 255]);
+    }
+    await fitMode.click();
+    await page.getByRole('button', { name: 'Close keyboard controls' }).click();
+    // Closing the keyboard resizes the local VNC canvas asynchronously. Start
+    // the next gesture only after the displayed coordinates reflect that resize.
+    await expect.poll(() => canvas.evaluate((node, height) => {
+      const target = document.querySelector('.vnc-screen').getBoundingClientRect();
+      const expected = 390 * Math.min(target.width / 390, target.height / height);
+      return Math.abs(node.getBoundingClientRect().width - expected) < 1;
+    }, phoneViewport.height)).toBe(true);
+    // The finger leaves the nested panel; wheel targeting must remain latched to its start point.
+    await swipeAndTap(150, 400, -160);
+    await expect.poll(() => scrollState()?.panel).toBeGreaterThan(0);
+    assert.equal(scrollState().page, 0, 'Nested scrolling must not move the outer remote document');
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(32, node.height - 32, 1, 1).data]))
+      .toEqual([236, 72, 153, 255]);
+    await page.screenshot({ path: join(shots, `${label}-touch-scrolled.png`), fullPage: true });
+    await touch.detach();
     const afterPhoneNavigation = untouchedEvents();
     if (label === 'phone') await phoneMode.tap(); else await phoneMode.click();
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
@@ -383,6 +490,7 @@ try {
       'native-phone-reflow-desktop-and-phone', 'phone-selected-style-with-touch-taps', 'shared-phone-toggle-without-reconnect',
       'fit-disabled-only-when-no-visible-effect',
       '2x-framebuffer-with-logical-viewport', 'fitted-and-natural-exact-pointer-hit',
+      'one-finger-document-and-nested-scroll', 'touch-scroll-fitted-and-natural', 'tap-after-swipe',
       'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {

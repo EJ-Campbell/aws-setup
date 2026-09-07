@@ -9,6 +9,7 @@ import { watchVncQuality } from "../../../lib/vnc-quality.mjs";
 import { createNavigationState } from "../../../lib/navigation-state.mjs";
 import { frameViewport } from "../../../lib/frame-viewport.mjs";
 import { canFitViewport } from "../../../lib/fit-viewport.mjs";
+import { attachTouchScroll } from "../../../lib/touch-scroll.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
@@ -45,6 +46,11 @@ export default function Desktop({ name }: { name: string }) {
   const connected = connection === "connected";
   const currentViewport = frame ?? viewport;
   const phoneMode = currentViewport?.mode === "phone";
+
+  useEffect(() => {
+    if (!connected || !foreground || !screen.current) return;
+    return attachTouchScroll(screen.current);
+  }, [connected, foreground, fit, frame?.width, frame?.height]);
 
   useEffect(() => {
     const target = screen.current;
@@ -344,7 +350,7 @@ export default function Desktop({ name }: { name: string }) {
         <div className="keyboard-input-row"><label className="sr-only" htmlFor="remote-text">Text for the remote desktop</label><textarea id="remote-text" ref={textInput} value={text} onChange={(event) => setText(event.target.value)} onFocus={() => client.current?.blur()} placeholder="Type or paste text here…" autoCapitalize="none" autoCorrect="off" spellCheck={false} rows={2} maxLength={4096} /><div className="text-actions"><button className="button primary" disabled={!connected || !text} onClick={() => sendText(false)}>Type text</button><button className="button" disabled={!connected || !text} onClick={() => sendText(true)}>Paste text</button></div></div>
         <div className="keyboard-bottom"><div className="special-keys" aria-label="Remote keyboard shortcuts"><button className="button key" disabled={!connected} onClick={() => { shortcut("l"); setFeedback("Address bar selected in the remote browser."); }}>Address bar</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.tab, "Tab")}>Tab</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.escape, "Escape")}>Esc</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.backspace, "Backspace")}>Backspace</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.enter, "Enter")}>Enter ↵</button></div><p className="input-note">Paste updates the remote clipboard. New lines in typed text send Enter.</p></div>
       </section>}
-      <footer className="desktop-footer"><span role="status">{feedback || "Closing this tab leaves the browser running."}</span><span className="desktop-footer-private"><Icon name="lock" size={12} /> Private connection</span></footer>
+      <footer className="desktop-footer"><span role="status">{feedback || "Swipe to scroll. To drag, tap once, then touch and drag."}</span><span className="desktop-footer-private"><Icon name="lock" size={12} /> Private connection</span></footer>
     </main>
   );
 }
