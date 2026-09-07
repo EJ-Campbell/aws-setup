@@ -71,7 +71,7 @@ const keys = await generateKeyPair('RS256');
 const token = await new SignJWT({ email: config.owner }).setProtectedHeader({ alg: 'RS256' })
   .setSubject('local-owner').setIssuer(config.issuer).setAudience(config.audience)
   .setIssuedAt().setExpirationTime('15m').sign(keys.privateKey);
-let manager, app, server, control, browser, activePage;
+let manager, app, server, control, browser, peerBrowser, activePage;
 try {
   app = next({ dev: false, dir: project, hostname: '127.0.0.1' });
   await app.prepare();
@@ -173,6 +173,21 @@ try {
     const beforeResize = untouchedEvents();
     const phoneMode = page.getByRole('button', { name: 'Phone mode', exact: true });
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+    let peerPage, peerConnections = 0, primaryReconnects = 0;
+    const trackPrimary = () => primaryReconnects++;
+    if (label === 'desktop') {
+      // Separate processes keep both viewers foregrounded; tab focus/reconnect must not refresh away the bug.
+      peerBrowser = await chromium.launch({ executablePath: browserBin, chromiumSandbox: true });
+      peerPage = await peerBrowser.newPage({ viewport, extraHTTPHeaders: { 'Cf-Access-Jwt-Assertion': token } });
+      peerPage.on('pageerror', error => errors.push(error.message));
+      peerPage.on('websocket', () => peerConnections++);
+      await peerPage.goto(`${config.baseUrl}/browsers/${selected}`);
+      await expect(peerPage.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
+      await expect(peerPage.getByRole('button', { name: 'Phone mode', exact: true })).toHaveAttribute('aria-pressed', 'false');
+      assert.ok(await peerPage.evaluate(() => document.hasFocus()));
+      assert.ok(await page.evaluate(() => document.hasFocus()));
+      page.on('websocket', trackPrimary);
+    }
     await phoneMode.click();
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
     const phoneViewport = manager.list().find(row => row.name === selected).viewport;
@@ -196,6 +211,33 @@ try {
     await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
       .toEqual([139, 92, 246, 255]);
     await page.screenshot({ path: join(shots, `${label}-phone-mode.png`), fullPage: true });
+    if (peerPage) {
+      activePage = peerPage;
+      const peerMode = peerPage.getByRole('button', { name: 'Phone mode', exact: true });
+      const peerCanvas = peerPage.locator('.vnc-screen canvas');
+      await expect.poll(() => peerCanvas.evaluate(node => [node.width, node.height])).toEqual([390, phoneViewport.height]);
+      await expect(peerMode).toHaveAttribute('aria-pressed', 'true');
+      await peerPage.screenshot({ path: join(shots, 'second-viewer-phone-mode.png'), fullPage: true });
+      const restore = peerPage.waitForRequest(request => request.method() === 'POST' &&
+        new URL(request.url()).pathname === `/api/browsers/${selected}/viewport`);
+      await peerMode.click();
+      assert.deepEqual((await restore).postDataJSON(), { mode: 'desktop' }, 'An existing second viewer must request the opposite shared mode');
+      await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
+      await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+      await expect(peerMode).toHaveAttribute('aria-pressed', 'false');
+      await phoneMode.click();
+      await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
+      await expect(peerMode).toHaveAttribute('aria-pressed', 'true');
+      await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
+      await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+        .toEqual([139, 92, 246, 255]);
+      assert.equal(primaryReconnects, 0, 'Shared mode must synchronize without reconnecting the first viewer');
+      assert.equal(peerConnections, 1, 'Shared mode must synchronize without reconnecting the second viewer');
+      await expect(peerPage).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
+      page.off('websocket', trackPrimary);
+      await peerBrowser.close(); peerBrowser = undefined;
+      activePage = page;
+    }
     // A new VNC connection must retain the native viewport, not merely redraw a scaled desktop.
     const phoneSocket = page.waitForEvent('websocket', {
       predicate: socket => new URL(socket.url()).pathname === `/browsers/${selected}/vnc`, timeout: 15000,
@@ -268,7 +310,8 @@ try {
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
       'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone',
       'native-back-availability', 'fullscreen-supported-and-unsupported',
-      'native-phone-reflow-desktop-and-phone', 'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
+      'native-phone-reflow-desktop-and-phone', 'shared-phone-toggle-without-reconnect',
+      'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
   // Next installs an uncaught-exception listener; preserve a failing exit status explicitly.
@@ -278,6 +321,7 @@ try {
   console.error(`Failure artifacts: ${shots}`);
   process.exitCode = 1;
 } finally {
+  await peerBrowser?.close();
   await browser?.close();
   await closeServer(server); await closeServer(control);
   await manager?.close(); await app?.close(); await closeServer(fixture);
