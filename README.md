@@ -827,6 +827,12 @@ Roll out with fresh full Terraform plans in this order:
    past one-off capture and restore definitions for audit; their explicit years prevent
    recurring test jobs.
 
+Main-account us-east-1 EBS `copySnapshot` completion events are retained for seven days
+in CloudWatch Logs `/aws/events/fleet-backup-copy-snapshots`. Correlate each event's
+source and destination snapshot IDs with Backup copy-job lineage before using its
+`detail.incremental` value as evidence for the CMK checkpoint leg. This log does not
+recover old events or prove the service-owned final air-gapped storage leg.
+
 Existing recovery points keep their original lifecycles and age out normally; switching
 selections does not shorten them. Never bulk-delete old history. Preserve the unmanaged
 `fcvm-backups` vault's two indefinitely retained snapshots. Do not add compliance locks

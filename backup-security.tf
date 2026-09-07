@@ -475,6 +475,79 @@ resource "aws_cloudwatch_metric_alarm" "backup_restore_tests_unhealthy" {
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
 }
 
+# EBS emits copySnapshot completion events in the destination region but does not
+# save them. Keep the full event, including detail.incremental, for operator evidence
+# about the two main-account east1 CMK checkpoints. Snapshot IDs change every run:
+# correlate detail.snapshot_id/source with completed Backup copy-job lineage rather
+# than filtering this rule to IDs or to incremental=true (which would hide full copies).
+# This observes main/east1 copies only, not the service-owned final LAG storage leg.
+# https://docs.aws.amazon.com/ebs/latest/userguide/ebs-cloud-watch-events.html#copy-snapshot-complete
+resource "aws_cloudwatch_log_group" "backup_copy_evidence" {
+  provider          = aws.dr
+  name              = "/aws/events/fleet-backup-copy-snapshots"
+  retention_in_days = 7
+  tags              = { Managed = "terraform", Purpose = "ebs-incremental-copy-evidence" }
+}
+
+resource "aws_cloudwatch_event_rule" "backup_copy_evidence" {
+  provider       = aws.dr
+  name           = "fleet-backup-copy-snapshot-evidence"
+  description    = "Retain EBS copy completion evidence, including full/incremental status"
+  event_bus_name = "default"
+  event_pattern = jsonencode({
+    account     = [data.aws_caller_identity.current.account_id]
+    region      = ["us-east-1"]
+    source      = ["aws.ec2"]
+    detail-type = ["EBS Snapshot Notification"]
+    detail      = { event = ["copySnapshot"] }
+  })
+  tags = { Managed = "terraform", Purpose = "ebs-incremental-copy-evidence" }
+}
+
+resource "aws_cloudwatch_log_resource_policy" "backup_copy_evidence" {
+  provider    = aws.dr
+  policy_name = "fleet-backup-copy-snapshot-evidence"
+  # EventBridge's CreateLogStream call does not supply the rule SourceArn. Keep
+  # that grant limited to this one group, and bind PutLogEvents to the exact rule.
+  # This split follows the pinned provider's documented CloudWatch Logs example:
+  # https://github.com/hashicorp/terraform-provider-aws/blob/v5.100.0/website/docs/r/cloudwatch_event_target.html.markdown#cloudwatch-log-group-usage
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowEventBridgeStreamCreation"
+        Effect    = "Allow"
+        Principal = { Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"] }
+        Action    = "logs:CreateLogStream"
+        Resource  = "${aws_cloudwatch_log_group.backup_copy_evidence.arn}:*"
+      },
+      {
+        Sid       = "AllowOnlyThisRuleToWriteEvents"
+        Effect    = "Allow"
+        Principal = { Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"] }
+        Action    = "logs:PutLogEvents"
+        Resource  = "${aws_cloudwatch_log_group.backup_copy_evidence.arn}:*:*"
+        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.backup_copy_evidence.arn } }
+      },
+    ]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "backup_copy_evidence" {
+  provider       = aws.dr
+  rule           = aws_cloudwatch_event_rule.backup_copy_evidence.name
+  event_bus_name = "default"
+  target_id      = "copy-snapshot-evidence"
+  arn            = aws_cloudwatch_log_group.backup_copy_evidence.arn
+  # No RoleArn or input transform: Logs uses its resource policy and retains the
+  # original event, preserving strings/booleans and unexpected diagnostic fields.
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 185
+  }
+  depends_on = [aws_cloudwatch_log_resource_policy.backup_copy_evidence]
+}
+
 # Job-state events accelerate reconciliation/alerts; the hourly scan remains the
 # source of truth because AWS Backup events are delivered on a best-effort basis.
 resource "aws_cloudwatch_event_bus" "backup_recovery" {

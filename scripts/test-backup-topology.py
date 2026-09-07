@@ -249,6 +249,41 @@ class BackupTopologyTests(unittest.TestCase):
         self.assertIn('state = ["COMPLETED", "FAILED", "EXPIRED", "ABORTED", "PARTIAL"]', SECURITY)
         self.assertIn('status = ["COMPLETED", "FAILED", "ABORTED"]', SECURITY)
 
+    def test_ebs_copy_evidence_is_local_bounded_and_keeps_full_events(self):
+        for kind in ("aws_cloudwatch_log_group", "aws_cloudwatch_event_rule",
+                     "aws_cloudwatch_log_resource_policy", "aws_cloudwatch_event_target"):
+            self.assertRegex(resource(kind, "backup_copy_evidence"), r"provider\s*=\s*aws\.dr\b")
+        group = resource("aws_cloudwatch_log_group", "backup_copy_evidence")
+        self.assertRegex(group, r'retention_in_days\s*=\s*7\b')
+        self.assertIn('"/aws/events/fleet-backup-copy-snapshots"', group)
+        rule = resource("aws_cloudwatch_event_rule", "backup_copy_evidence")
+        for field, expected in (("account", "data.aws_caller_identity.current.account_id"),
+                                ("region", '"us-east-1"'), ("source", '"aws.ec2"'),
+                                ("detail-type", '"EBS Snapshot Notification"')):
+            self.assertRegex(rule, r"\b" + field + r"\s*=\s*\[" + re.escape(expected) + r"\]")
+        self.assertIn('event = ["copySnapshot"]', rule)
+        self.assertNotRegex(rule, r"\b(?:incremental|result|resources)\s*=")
+        target = resource("aws_cloudwatch_event_target", "backup_copy_evidence")
+        self.assertRegex(target, r"arn\s*=\s*aws_cloudwatch_log_group\.backup_copy_evidence\.arn")
+        self.assertNotRegex(target, r"\b(?:role_arn|input|input_path|input_transformer)\s*[={]")
+        self.assertIn("aws_cloudwatch_log_resource_policy.backup_copy_evidence", target)
+        self.assertRegex(target, r"maximum_event_age_in_seconds\s*=\s*86400\b")
+        self.assertRegex(target, r"maximum_retry_attempts\s*=\s*185\b")
+
+    def test_ebs_log_policy_separates_stream_creation_from_rule_bound_writes(self):
+        policy = resource("aws_cloudwatch_log_resource_policy", "backup_copy_evidence")
+        creation = re.search(r'Sid\s*=\s*"AllowEventBridgeStreamCreation"(.*?)\n      \},', policy, re.S).group(1)
+        writes = re.search(r'Sid\s*=\s*"AllowOnlyThisRuleToWriteEvents"(.*?)\n      \},', policy, re.S).group(1)
+        self.assertRegex(creation, r'Action\s*=\s*"logs:CreateLogStream"')
+        self.assertIn('"${aws_cloudwatch_log_group.backup_copy_evidence.arn}:*"', creation)
+        self.assertNotIn("Condition", creation)
+        self.assertRegex(writes, r'Action\s*=\s*"logs:PutLogEvents"')
+        self.assertIn('"${aws_cloudwatch_log_group.backup_copy_evidence.arn}:*:*"', writes)
+        self.assertIn('ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.backup_copy_evidence.arn }', writes)
+        for statement in (creation, writes):
+            self.assertIn('Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"]', statement)
+            self.assertNotRegex(statement, r'\bResource\s*=\s*"\*"')
+
     def test_packaged_controller_and_test_workflow_are_credential_free(self):
         archive = block(SECURITY, "data", "archive_file", "backup_recovery")
         self.assertIn('file("${path.module}/scripts/backup-recovery.py")', archive)
