@@ -9,7 +9,7 @@ locals {
   # Permanent rollout gates, not operator options. Verify five final copies and
   # restores, then enable cleanup against disposable processing captures while the
   # legacy selections remain active. Switch selections only after cleanup succeeds.
-  backup_recovery_cleanup_enabled = false
+  backup_recovery_cleanup_enabled = true
   backup_recovery_cutover_enabled = false
   backup_recovery_region          = "us-east-1"
   backup_service_role_arn         = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/AWSBackupDefaultServiceRole"

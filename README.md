@@ -789,7 +789,7 @@ Cleanup permissions come only from those two temporary-vault policies; the contr
 cannot delete legacy history or final recovery points. Copy failures retain pending
 data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
 
-The checked-in cleanup and selection-cutover gates are initially false. Bootstrap
+Cold bootstrap must start with both cleanup and selection-cutover gates false. Bootstrap
 leaves the existing daily/weekly/monthly plans and their selections unchanged; it seeds
 from their latest recovery points and has no recovery-point deletion permission.
 Roll out with fresh full Terraform plans in this order:
