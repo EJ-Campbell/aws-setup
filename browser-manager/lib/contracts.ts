@@ -20,7 +20,9 @@ export type BrowserInstance = {
 // Explicit resize affects this browser's shared desktop, not other browsers. No browser restart.
 // Live viewport survives viewer reconnects; restarting the browser resets to Desktop (1440×900).
 // Labels are display-only, trimmed 1–80 characters without control characters. Names/URLs stay fixed.
-// GET /api/config -> { baseUrl: string }
+// GET /api/config -> { baseUrl: string, transport: 'vnc' | 'page' }
+// macOS WS /browsers/:name/page -> bounded page images/tab metadata + fixed input commands.
+// Chrome debugging stays on inherited private pipes; this route is not a CDP proxy.
 // WS /browsers/:name/vnc -> binary RFB, authenticated on every upgrade.
 // Desktop page /browsers/:name; names match /^[a-z0-9][a-z0-9-]{0,47}$/.
 // All errors: { error: string }; no secrets/profile paths in public responses.

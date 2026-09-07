@@ -750,7 +750,7 @@ It is single-owner, not a multi-tenant service: separate profiles isolate browse
 but are not separate OS security boundaries. These browsers have the host user's normal
 network and filesystem access. Only that owner should have Cloudflare Access permission.
 
-The dashboard and VNC WebSocket both require a verified Cloudflare Access
+The dashboard and browser-view WebSocket both require a verified Cloudflare Access
 JWT for the configured audience and owner. Mutations require the expected Origin. The local
 CLI uses an owner-only Unix socket, not a public bearer token. VNC uses private Unix sockets,
 not public ports; unknown instance names cannot become arbitrary network or filesystem targets.
@@ -918,6 +918,63 @@ go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retain
 printed temporary directory and all test desktops are stopped. New E2E findings should get
 the smallest practical regression at the layer responsible, not a new proof framework.
 
+### Native browsers on the personal Mac
+
+`https://mac-browsers.cc-games.dev` is an independent browser manager on the personal
+Mac, not the optional AWS Mac instance. Chrome renders webpages, stores its profiles and
+uses the Mac's network locally. The AWS browser list at `browsers.cc-games.dev` is separate;
+there is no profile synchronization or automatic federation. The Mac has its own tunnel
+and Access application/audience. Never run its connector with the AWS browser tunnel token:
+Cloudflare would load-balance requests between two different machines' browser lists.
+
+The Mac backend starts installed, sandboxed **native headed Chrome** with a dedicated
+profile per browser. It streams webpage images and accepts only bounded tab, navigation,
+pointer, key and explicit text commands through an authenticated WebSocket. Browser-manager
+supplies the tabs and address bar; Chrome's native toolbar, macOS file dialogs, Touch ID and
+the rest of the Mac desktop are not streamed. Downloads are disabled in managed Mac browsers.
+Chrome debugging uses inherited private pipes, never a listening debug port or public CDP
+proxy. No Screen Recording or Accessibility grant is requested. The normal Chrome profile
+and existing OpenClaw services are not touched, and website logins must be made in the new
+managed profiles. Profiles are private but are not separate OS security boundaries.
+
+Terraform runs only on the jumpbox. After reviewing/applying the full plan, export
+`terraform output -raw browser_manager_mac_env` into a private environment file. The Mac's
+connector credential is stored in Secrets Manager as `browser-manager-mac-tunnel-token`;
+it is also sensitive Terraform state. Transfer that token and public environment file over
+the existing authenticated SSH connection, owned by the Mac user and mode `0600`. Do not
+print tokens or place them in Git, command arguments, browser profiles or LaunchAgent XML.
+For later credential retrieval, the Mac's existing SSO administrator session can assume
+`browser-manager-mac-connector`, which can read only that connector secret. No AWS
+credentials are required by the running browser-manager or tunnel process.
+
+Install as the logged-in Mac user from a full checkout at a permanent path (the deployed
+path is `/Users/ejcampbell/src/aws-browser-manager`). Existing Chrome and Node.js 22.13+
+are prerequisites; `brew install cloudflared` supplies the connector. From `browser-manager`:
+
+```bash
+npm ci --ignore-scripts
+npm run build
+node scripts/install-macos.mjs /absolute/private/browser-manager.env /absolute/private/tunnel-token
+browserctl start personal --url https://example.com
+```
+
+The installer owns only the user LaunchAgents `com.ejc3.browser-manager` and
+`com.ejc3.browser-manager-tunnel`. They restart on that user's login, not before FileVault
+unlock; logout or sleep makes the Mac URL unavailable. It does not change power settings.
+State stays under `~/.local/state/browser-manager`, configuration under
+`~/.config/browser-manager`. Rerun the installer after rebuilding to update only these
+services; previously running managed browsers are restored and their profiles retained.
+Always use this GUI LaunchAgent startup path: Chrome started directly under SSH on this
+Mac cannot access Keychain (`errSecInteractionNotAllowed`) and cannot persist encrypted
+cookies. Do not substitute an unencrypted password store or a mock Keychain. If macOS
+requests Keychain authorization, the owner must approve it in their GUI login session.
+Open the Mac URL on your phone and sign in as the same configured owner. Multiple viewers
+of one named browser share its selected tab and input; different names have separate profiles.
+
+`npm test`, `npm run typecheck`, and `npm run build` also run on macOS; the native Linux
+VNC test is skipped there. The Mac backend and authenticated page-transport regressions
+cover private pipes, bounded actions, profile isolation and immediate session expiry.
+
 ## File map
 
 | Area | Main files |
@@ -930,7 +987,7 @@ the smallest practical regression at the layer responsible, not a new proof fram
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
-| Private browser desktops | `browser-manager/`, `browser-manager.tf` |
+| Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 

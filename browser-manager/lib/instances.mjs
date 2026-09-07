@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promi
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { launchDesktop } from './desktop.mjs';
+import { launchMacDesktop } from './macos-desktop.mjs';
 import { browserViewport, DESKTOP_VIEWPORT, HttpError, instanceLabel } from './auth.mjs';
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,47}$/;
@@ -48,7 +49,9 @@ async function profileAvailable(profile) {
 }
 
 /** Single-owner lifecycle and desired state. The optional launcher is a deterministic test seam. */
-export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launch = launchDesktop } = {}) {
+export function createInstanceManager({ stateDir, browserBin, baseUrl }, {
+  launch = process.platform === 'darwin' ? launchMacDesktop : launchDesktop,
+} = {}) {
   if (typeof stateDir !== 'string' || !isAbsolute(stateDir) || resolve(stateDir) !== stateDir) {
     throw new Error('Browser state directory must be an absolute normalized path');
   }
@@ -297,6 +300,12 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
       checkedName(name);
       const record = records.get(name);
       return !closed && record?.state === 'running' ? record.desktop?.socketPath ?? null : null;
+    },
+    getPage(name) {
+      checkedName(name);
+      const record = records.get(name);
+      return !closed && record?.state === 'running' && record.desktop?.transport === 'page'
+        ? record.desktop : null;
     },
     async close() {
       if (closing) return closing;

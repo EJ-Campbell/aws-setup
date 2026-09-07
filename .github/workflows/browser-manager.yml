@@ -1,15 +1,19 @@
 name: browser-manager
 on:
   pull_request:
-    paths: ['browser-manager/**', 'browser-manager.tf', '.github/workflows/browser-manager.yml']
+    paths: ['browser-manager/**', 'browser-manager*.tf', '.github/workflows/browser-manager.yml']
   push:
     branches: [main]
-    paths: ['browser-manager/**', 'browser-manager.tf', '.github/workflows/browser-manager.yml']
+    paths: ['browser-manager/**', 'browser-manager*.tf', '.github/workflows/browser-manager.yml']
 permissions:
   contents: read
 jobs:
   app:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: browser-manager
@@ -24,6 +28,7 @@ jobs:
           cache-dependency-path: browser-manager/package-lock.json
       - run: npm ci --ignore-scripts
       - name: Install native VNC regression prerequisite
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends x11vnc
       - run: npm test
       - run: npm run typecheck
