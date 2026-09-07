@@ -36,7 +36,7 @@ const remoteViewport = name => {
   return event ? JSON.parse(event.value) : null;
 };
 async function expectPhoneSelection(button, selected) {
-  const hover = await button.evaluate(() => matchMedia('(hover: hover)').matches);
+  const hover = await button.evaluate(() => matchMedia('(hover: hover) and (pointer: fine)').matches);
   const background = selected
     ? (hover ? /^rgb\((23, 100, 87|17, 83, 71)\)$/ : 'rgb(23, 100, 87)')
     : (hover ? /^rgb\((255, 255, 255|240, 243, 244)\)$/ : 'rgb(255, 255, 255)');
