@@ -7,9 +7,14 @@ import { Icon } from "../../ui";
 import { createReconnectLoop } from "../../../lib/reconnect.mjs";
 import { watchVncQuality } from "../../../lib/vnc-quality.mjs";
 import { createNavigationState } from "../../../lib/navigation-state.mjs";
+import { frameViewport } from "../../../lib/frame-viewport.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
+const readFrameViewport = (target: HTMLDivElement | null) => {
+  const canvas = target?.querySelector("canvas");
+  return frameViewport(canvas?.width, canvas?.height);
+};
 
 export default function Desktop({ name }: { name: string }) {
   const screen = useRef<HTMLDivElement>(null);
@@ -31,12 +36,25 @@ export default function Desktop({ name }: { name: string }) {
   const [canGoBack, setCanGoBack] = useState<boolean | null>(null);
   const [label, setLabel] = useState(name);
   const [viewport, setViewport] = useState<BrowserInstance["viewport"] | null>(null);
+  const [frame, setFrame] = useState<BrowserInstance["viewport"] | null>(null);
   const [viewportPending, setViewportPending] = useState(false);
-  const [metadataLoading, setMetadataLoading] = useState(true);
   const [metadataError, setMetadataError] = useState("");
   const [viewportError, setViewportError] = useState("");
   const connected = connection === "connected";
-  const phoneMode = viewport?.mode === "phone";
+  const currentViewport = frame ?? viewport;
+  const phoneMode = currentViewport?.mode === "phone";
+
+  useEffect(() => {
+    const target = screen.current;
+    if (!target) return;
+    const changed = () => setFrame(readFrameViewport(target));
+    // Shared resizes arrive over VNC before (and independently of) metadata requests.
+    // Observe only the actual framebuffer; fitting/scaling this viewer changes CSS, not these attributes.
+    const observer = new MutationObserver(changed);
+    observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height"] });
+    changed();
+    return () => observer.disconnect();
+  }, [name]);
 
   useEffect(() => {
     const navigation = createNavigationState(async (signal: AbortSignal) => {
@@ -54,6 +72,7 @@ export default function Desktop({ name }: { name: string }) {
   useEffect(() => {
     setLabel(name);
     setViewport(null);
+    setFrame(null);
     setViewportError("");
     setMetadataError("");
     setViewportPending(false);
@@ -63,7 +82,6 @@ export default function Desktop({ name }: { name: string }) {
   useEffect(() => {
     if (!connected || viewportPending) return;
     const abort = new AbortController();
-    setMetadataLoading(true);
     setMetadataError("");
     void fetch("/api/browsers", { cache: "no-store", signal: abort.signal })
       .then(async (response) => {
@@ -74,7 +92,7 @@ export default function Desktop({ name }: { name: string }) {
         if (!abort.signal.aborted) { setLabel(browser.label ?? name); setViewport(browser.viewport); }
       }).catch((error) => {
         if (!abort.signal.aborted) { setViewport(null); setMetadataError(error instanceof Error ? error.message : "Could not read the display mode. Reconnect to retry."); }
-      }).finally(() => { if (!abort.signal.aborted) setMetadataLoading(false); });
+      });
     return () => abort.abort();
   }, [name, connected, viewportPending]);
 
@@ -200,14 +218,16 @@ export default function Desktop({ name }: { name: string }) {
   }
 
   async function togglePhoneMode() {
-    if (!connected || !viewport || metadataLoading || viewportRequest.current) return;
+    // Read again at click time, so even a queued React update cannot repeat the already-active mode.
+    const current = readFrameViewport(screen.current) ?? viewport;
+    if (!connected || !current || viewportRequest.current) return;
     const abort = new AbortController();
     viewportRequest.current = abort;
     setViewportPending(true);
     setViewportError("");
     const bounds = screen.current?.parentElement?.getBoundingClientRect();
     const mobile = window.innerWidth <= 700;
-    const requested = phoneMode ? { mode: "desktop" } : {
+    const requested = current.mode === "phone" ? { mode: "desktop" } : {
       mode: "phone",
       width: mobile ? Math.max(320, Math.min(500, Math.round(bounds?.width ?? window.innerWidth))) : 390,
       height: mobile ? Math.max(480, Math.min(900, Math.round(bounds?.height ?? 844))) : 844,
@@ -285,7 +305,7 @@ export default function Desktop({ name }: { name: string }) {
       <header className="desktop-header">
         <a href="/" className="icon-button back-button" aria-label="Back to your browsers"><Icon name="back" /></a>
         <div className="desktop-title"><h1>{label}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
-        <button className="button phone-mode" aria-label="Phone mode" aria-pressed={phoneMode} aria-describedby="phone-mode-help" disabled={!connected || viewportPending || metadataLoading || !viewport} onClick={() => void togglePhoneMode()} title={phoneMode ? "Restore Desktop for all viewers" : "Use a phone-sized display for all viewers"}><Icon name="phone" size={19} /><span>{viewportPending ? "Changing…" : "Phone"}</span></button>
+        <button className="button phone-mode" aria-label="Phone mode" aria-pressed={phoneMode} aria-describedby="phone-mode-help" disabled={!connected || viewportPending || !currentViewport} onClick={() => void togglePhoneMode()} title={phoneMode ? "Restore Desktop for all viewers" : "Use a phone-sized display for all viewers"}><Icon name="phone" size={19} /><span>{viewportPending ? "Changing…" : "Phone"}</span></button>
         <span id="phone-mode-help" className="sr-only">Changes the shared display for all viewers. Turn Phone mode off to restore Desktop.</span>
         <button className="button remote-back" disabled={!connected || canGoBack !== true} onClick={browserBack} aria-label="Back in remote browser" title={!connected ? "Connect to use browser Back" : canGoBack === false ? "No previous page in remote browser" : canGoBack === null ? "Checking remote browser history" : "Back in remote browser"}><Icon name="browserBack" size={20} /><span className="remote-back-label">Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
