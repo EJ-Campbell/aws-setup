@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parseEnv, promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export const MARKER = 'Managed by browser-manager/scripts/install-macos.mjs';
 export const LABELS = Object.freeze({ manager: 'com.ejc3.browser-manager', tunnel: 'com.ejc3.browser-manager-tunnel' });
@@ -19,6 +20,8 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const execute = promisify(execFile);
 const fail = message => { throw new Error(`browser-manager: ${message}`); };
 const safeText = value => typeof value === 'string' && !/[\u0000-\u001f\u007f]/u.test(value);
+const missingService = error => Number.isInteger(error.code) &&
+  /Could not find service|No such process|service.*not found/i.test(error.stderr || '');
 
 export function requireNode(version) {
   const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
@@ -183,6 +186,7 @@ export async function installMacOS({ configFile, tokenFile } = {}, dependencies 
   let node = dependencies.node || process.execPath;
   const version = dependencies.version || process.versions.node;
   const run = dependencies.run || execute;
+  const pause = dependencies.sleep || sleep;
   const validator = dependencies.validateConfig;
   if (platform !== 'darwin') fail('Use install.sh on Linux; this installer requires macOS.');
   if (uid === 0) fail('Run as the browser owner, never root.');
@@ -291,7 +295,7 @@ export async function installMacOS({ configFile, tokenFile } = {}, dependencies 
       loaded[kind] = true;
     } catch (error) {
       // An unreadable/denied GUI service is not evidence that its label is unused.
-      if (!Number.isInteger(error.code) || !/Could not find service|No such process|service.*not found/i.test(error.stderr || '')) throw error;
+      if (!missingService(error)) throw error;
       loaded[kind] = false;
     }
   }
@@ -303,6 +307,36 @@ export async function installMacOS({ configFile, tokenFile } = {}, dependencies 
     const handle = await io.open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, mode);
     try { await handle.writeFile(data); await handle.sync(); } finally { await handle.close(); }
     try { await io.rename(temporary, target); } catch (error) { await io.unlink(temporary); throw error; }
+  }
+  async function bootstrap(kind) {
+    const args = ['bootstrap', domain, plists[kind]];
+    const options = { maxBuffer: 65536, timeout: 5000 };
+    // A first installation has no known bootout race. Never retry its failures.
+    if (!loaded[kind]) return run('/bin/launchctl', args, options);
+    const delays = [500, 1000, 2000, 4000, 5000];
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      let draining = false;
+      try {
+        const result = await run('/bin/launchctl', ['print', `${domain}/${LABELS[kind]}`], options);
+        if (!result.stdout.split('\n').some(line => line.trim() === `path = ${plists[kind]}`)) {
+          fail('An unmanaged job appeared under the LaunchAgent label during restart.');
+        }
+        // The old job can remain visible while launchd drains it. Seeing our path
+        // is not success: only a fresh bootstrap returning zero completes restart.
+        draining = true;
+      } catch (error) { if (!missingService(error)) throw error; }
+      if (!draining) {
+        try { await run('/bin/launchctl', args, options); return; }
+        catch (error) {
+          if (error.code !== 5 || !/^Bootstrap failed:\s*5:\s*Input\/output error\b/im.test(error.stderr || '') ||
+              /permission denied|operation not permitted/i.test(error.stderr || '')) throw error;
+          if (attempt === delays.length) fail(`${LABELS[kind]} could not restart after six bounded attempts (launchctl bootstrap error 5).`);
+        }
+      } else if (attempt === delays.length) {
+        fail(`${LABELS[kind]} is still unloading after the bounded restart wait; no new job was bootstrapped.`);
+      }
+      await pause(delays[attempt]);
+    }
   }
   const settings = { project, home, node, cloudflared: cloudflared || manifest?.cloudflared || null, config, token, state, logs, path };
   const generated = renderWrapper(settings);
@@ -330,7 +364,7 @@ export async function installMacOS({ configFile, tokenFile } = {}, dependencies 
     }
     for (const kind of kinds) await atomic(plists[kind], rendered[kind]);
     if (!commandInfo) await io.symlink(join(project, 'bin/browserctl.mjs'), command);
-    for (const kind of kinds) await run('/bin/launchctl', ['bootstrap', domain, plists[kind]], { maxBuffer: 65536 });
+    for (const kind of kinds) await bootstrap(kind);
   } finally {
     // This directory is newly created here, private, and contains only our staged text.
     await io.rm(staged, { recursive: true, force: true });

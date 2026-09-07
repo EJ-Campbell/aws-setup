@@ -314,6 +314,139 @@ test('configuration/plist checks complete before owned jobs are stopped', async 
   assert.equal(mutations(f.calls).length, 0);
 });
 
+const bootstrapIOError = () => Object.assign(new Error('bootstrap I/O error'), {
+  code: 5, stderr: 'Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n',
+});
+
+test('verified owned restart retries transient bootstrap5 without touching other labels', async t => {
+  const f = await fixture(t);
+  await installMacOS({ configFile: f.configFile, tokenFile: f.tokenFile }, f.dependencies);
+  f.calls.length = 0;
+  const normal = f.dependencies.run;
+  const waits = [];
+  let failures = 1;
+  f.dependencies.sleep = async ms => { waits.push(ms); };
+  f.dependencies.run = async (command, args, options) => {
+    if (command === '/bin/launchctl' && args[0] === 'bootstrap' && failures-- > 0) {
+      f.calls.push({ command, args, options }); throw bootstrapIOError();
+    }
+    return normal(command, args, options);
+  };
+  await installMacOS({ configFile: f.configFile }, f.dependencies);
+  assert.deepEqual(waits, [500]);
+  assert.deepEqual(mutations(f.calls).map(call => call.args[0]), ['bootout', 'bootstrap', 'bootstrap']);
+  assert.ok(mutations(f.calls).every(call => !call.args.some(arg => arg.includes(LABELS.tunnel))));
+  assert.ok(f.loaded.has(`gui/${uid}/${LABELS.tunnel}`));
+});
+
+test('permanent post-bootout bootstrap5 is explicit and bounded to six attempts', async t => {
+  const f = await fixture(t);
+  await installMacOS({ configFile: f.configFile }, f.dependencies);
+  f.calls.length = 0;
+  const normal = f.dependencies.run;
+  const waits = [];
+  f.dependencies.sleep = async ms => { waits.push(ms); };
+  f.dependencies.run = async (command, args, options) => {
+    if (command === '/bin/launchctl' && args[0] === 'bootstrap') {
+      f.calls.push({ command, args, options }); throw bootstrapIOError();
+    }
+    return normal(command, args, options);
+  };
+  await assert.rejects(installMacOS({ configFile: f.configFile }, f.dependencies), /six bounded attempts/);
+  assert.deepEqual(waits, [500, 1000, 2000, 4000, 5000]);
+  const attempts = mutations(f.calls).filter(call => call.args[0] === 'bootstrap');
+  assert.equal(attempts.length, 6);
+  assert.ok(attempts.every(call => call.options.timeout === 5000));
+});
+
+test('first-install bootstrap5 and restart permission/non5 errors are never retried', async t => {
+  for (const [existing, error] of [
+    [false, bootstrapIOError()],
+    [true, Object.assign(new Error('permission denied'), { code: 1, stderr: 'Operation not permitted' })],
+    [true, Object.assign(new Error('permission denied'), { code: 5, stderr: 'Bootstrap failed: 5: Permission denied' })],
+  ]) {
+    const f = await fixture(t);
+    if (existing) await installMacOS({ configFile: f.configFile }, f.dependencies);
+    f.calls.length = 0;
+    const normal = f.dependencies.run;
+    const waits = [];
+    f.dependencies.sleep = async ms => { waits.push(ms); };
+    f.dependencies.run = async (command, args, options) => {
+      if (command === '/bin/launchctl' && args[0] === 'bootstrap') {
+        f.calls.push({ command, args, options }); throw error;
+      }
+      return normal(command, args, options);
+    };
+    await assert.rejects(installMacOS({ configFile: f.configFile }, f.dependencies), actual => actual === error);
+    assert.deepEqual(waits, []);
+    assert.equal(mutations(f.calls).filter(call => call.args[0] === 'bootstrap').length, 1);
+  }
+});
+
+test('a still-visible owned job must unload before a fresh successful bootstrap', async t => {
+  const f = await fixture(t);
+  await installMacOS({ configFile: f.configFile }, f.dependencies);
+  f.calls.length = 0;
+  const normal = f.dependencies.run;
+  const waits = [];
+  let bootedOut = false;
+  f.dependencies.sleep = async ms => { waits.push(ms); };
+  f.dependencies.run = async (command, args, options) => {
+    const result = await normal(command, args, options).catch(error => {
+      if (bootedOut && args[0] === 'print' && waits.length === 0 && error.code === 113) {
+        return { stdout: `path = ${join(f.home, 'Library/LaunchAgents', LABELS.manager + '.plist')}\n` };
+      }
+      throw error;
+    });
+    if (args[0] === 'bootout') bootedOut = true;
+    return result;
+  };
+  await installMacOS({ configFile: f.configFile }, f.dependencies);
+  assert.deepEqual(waits, [500]);
+  assert.equal(mutations(f.calls).filter(call => call.args[0] === 'bootstrap').length, 1);
+});
+
+test('an owned job that never finishes unloading is not mistaken for success', async t => {
+  const f = await fixture(t);
+  await installMacOS({ configFile: f.configFile }, f.dependencies);
+  f.calls.length = 0;
+  const normal = f.dependencies.run;
+  const waits = [];
+  f.dependencies.sleep = async ms => { waits.push(ms); };
+  f.dependencies.run = async (command, args, options) => {
+    if (args[0] === 'bootout') { f.calls.push({ command, args, options }); return {}; }
+    return normal(command, args, options);
+  };
+  await assert.rejects(installMacOS({ configFile: f.configFile }, f.dependencies), /still unloading/);
+  assert.equal(waits.length, 5);
+  assert.equal(mutations(f.calls).filter(call => call.args[0] === 'bootstrap').length, 0);
+});
+
+test('restart probes reject a different loaded path and permission failures without retries', async t => {
+  for (const deny of [false, true]) {
+    const f = await fixture(t);
+    await installMacOS({ configFile: f.configFile }, f.dependencies);
+    f.calls.length = 0;
+    const normal = f.dependencies.run;
+    const waits = [];
+    let bootedOut = false;
+    f.dependencies.sleep = async ms => { waits.push(ms); };
+    f.dependencies.run = async (command, args, options) => {
+      if (bootedOut && args[0] === 'print') {
+        f.calls.push({ command, args, options });
+        if (deny) throw Object.assign(new Error('probe permission denied'), { code: 5, stderr: 'Input/output error' });
+        return { stdout: 'path = /unmanaged/job.plist\n' };
+      }
+      const result = await normal(command, args, options);
+      if (args[0] === 'bootout') bootedOut = true;
+      return result;
+    };
+    await assert.rejects(installMacOS({ configFile: f.configFile }, f.dependencies), deny ? /probe permission denied/ : /unmanaged job appeared/);
+    assert.deepEqual(waits, []);
+    assert.equal(mutations(f.calls).filter(call => call.args[0] === 'bootstrap').length, 0);
+  }
+});
+
 test('generated wrapper is valid Node code with bounded redacted logging and scoped child termination', async t => {
   const f = await fixture(t);
   const text = renderWrapper({ project: f.project, home: f.home, node: process.execPath,
