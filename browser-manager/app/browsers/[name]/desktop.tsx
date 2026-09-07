@@ -8,6 +8,7 @@ import { createReconnectLoop } from "../../../lib/reconnect.mjs";
 import { watchVncQuality } from "../../../lib/vnc-quality.mjs";
 import { createNavigationState } from "../../../lib/navigation-state.mjs";
 import { frameViewport } from "../../../lib/frame-viewport.mjs";
+import { canFitViewport } from "../../../lib/fit-viewport.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
@@ -28,6 +29,7 @@ export default function Desktop({ name }: { name: string }) {
   const [retryDelay, setRetryDelay] = useState<number | null>(null);
   const [foreground, setForeground] = useState(true);
   const [fit, setFit] = useState(true);
+  const [canFit, setCanFit] = useState(false);
   const [keyboard, setKeyboard] = useState(false);
   const [text, setText] = useState("");
   const [feedback, setFeedback] = useState("");
@@ -47,13 +49,20 @@ export default function Desktop({ name }: { name: string }) {
   useEffect(() => {
     const target = screen.current;
     if (!target) return;
-    const changed = () => setFrame(readFrameViewport(target));
+    const changed = () => {
+      setFrame(readFrameViewport(target));
+      const canvas = target.querySelector("canvas");
+      const bounds = target.getBoundingClientRect();
+      setCanFit(canFitViewport(canvas?.width, canvas?.height, bounds.width, bounds.height));
+    };
     // Shared resizes arrive over VNC before (and independently of) metadata requests.
     // Observe only the actual framebuffer; fitting/scaling this viewer changes CSS, not these attributes.
     const observer = new MutationObserver(changed);
     observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height"] });
+    const resize = new ResizeObserver(changed);
+    resize.observe(target);
     changed();
-    return () => observer.disconnect();
+    return () => { observer.disconnect(); resize.disconnect(); };
   }, [name]);
 
   useEffect(() => {
@@ -309,7 +318,7 @@ export default function Desktop({ name }: { name: string }) {
         <span id="phone-mode-help" className="sr-only">Changes the shared display for all viewers. Turn Phone mode off to restore Desktop.</span>
         <button className="button remote-back" disabled={!connected || canGoBack !== true} onClick={browserBack} aria-label="Back in remote browser" title={!connected ? "Connect to use browser Back" : canGoBack === false ? "No previous page in remote browser" : canGoBack === null ? "Checking remote browser history" : "Back in remote browser"}><Icon name="browserBack" size={20} /><span className="remote-back-label">Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
-          <button className="button quiet" aria-label="Fit to screen" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit<span className="fit-label-extra"> to screen</span></span></button>
+          <button className="button quiet" aria-label="Fit to screen" aria-pressed={fit} disabled={!connected || !canFit} onClick={() => setFit(!fit)} title={!connected ? "Connect to use Fit" : !canFit ? "Already at actual size" : fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit<span className="fit-label-extra"> to screen</span></span></button>
           <button className="button quiet" aria-pressed={keyboard} aria-controls="keyboard-panel" onClick={() => setKeyboard(!keyboard)}><Icon name="keyboard" size={18} /><span>Keyboard</span></button>
           {canFullscreen && <button className="button quiet" onClick={() => void toggleFullscreen()} title="Toggle fullscreen" aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><Icon name="expand" size={18} /><span className="fullscreen-label">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span></button>}
           <button className="button quiet" onClick={() => reconnect.current()} disabled={connection === "connecting"} aria-label="Reconnect desktop"><Icon name="refresh" size={18} /><span>Reconnect</span></button>

@@ -882,6 +882,11 @@ input also work directly. **Fit to screen** scales independently for each viewer
 explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
 viewing browser supports it.
 
+In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting and actual size
+are already the same (less than one pixel of difference), or while disconnected. It re-enables
+when the shared display or available viewer space changes, including rotation and opening the
+keyboard, and retains its on/off setting.
+
 VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
 reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
 stronger compression; changing connection hints updates the live connection. Browsers without
