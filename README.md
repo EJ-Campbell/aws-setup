@@ -772,7 +772,6 @@ terraform init -lockfile=readonly
 terraform plan -out="$bm_handoff/plan"
 terraform apply "$bm_handoff/plan"
 terraform output -raw browser_manager_env > "$bm_handoff/browser-manager.env"
-terraform output -raw browser_manager_tunnel_token > "$bm_handoff/tunnel-token"
 ```
 
 The hostname is fixed at `browsers.cc-games.dev`. Terraform creates a dedicated tunnel,
@@ -780,8 +779,29 @@ DNS record, and owner-only Access application using the existing Google/one-time
 It does not reuse the kids' family policy or Dolphin's GitHub policy. The browser host needs no Terraform,
 AWS administration credentials, or Cloudflare account API token.
 
-Transfer the two output files privately to the browser host, owned by the browser user with
-mode `0600`. The connector token and saved Terraform plan are sensitive. Do not check them in.
+Terraform stores the raw connector token in AWS Secrets Manager as
+`browser-manager-tunnel-token` in `us-west-1`. The shared ARM/x86 dev-server instance role
+can read only this secret through its dedicated policy. Fetching it requires no additional
+AWS login; the Next.js, runner, and temporary-compute roles do not receive this grant.
+
+Transfer the public environment file privately to the browser host, owned by the browser
+user with mode `0600`. On the ARM/x86 host, retrieve the connector token as `ubuntu`:
+
+```bash
+umask 077
+install -d -m 0700 /home/ubuntu/.config/browser-manager
+bm_token_tmp=$(mktemp /home/ubuntu/.config/browser-manager/.tunnel-token.XXXXXX)
+if aws secretsmanager get-secret-value --region us-west-1 \
+  --secret-id browser-manager-tunnel-token --query SecretString --output text > "$bm_token_tmp" \
+  && test -s "$bm_token_tmp"; then
+  mv -f "$bm_token_tmp" /home/ubuntu/.config/browser-manager/tunnel-token
+else
+  rm -f "$bm_token_tmp"
+  echo 'Tunnel token retrieval failed; the existing token file was preserved.' >&2
+fi
+```
+
+The connector token and saved Terraform plan are sensitive. Do not print or check them in.
 The application receives the public Access settings; only `cloudflared` receives the token
 file path. A public URL cannot work until both this apply and the host installation are done.
 
@@ -801,7 +821,7 @@ any browser's credentials. Then, from this checkout:
 cd browser-manager
 npm ci --ignore-scripts
 npm run build
-./scripts/install.sh /absolute/path/browser-manager.env /absolute/path/tunnel-token
+./scripts/install.sh /absolute/path/browser-manager.env /home/ubuntu/.config/browser-manager/tunnel-token
 ```
 
 Run the installer as the browser owner, not root. It installs two **user** systemd units,

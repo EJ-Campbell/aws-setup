@@ -80,9 +80,42 @@ data "cloudflare_zero_trust_tunnel_cloudflared_token" "browser_manager" {
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.browser_manager.id
 }
 
-# Transfer this output from the apply host to a 0600 file. Only cloudflared receives its
-# file path; the application, browser processes, and their environment never receive it.
-# The token is sensitive Terraform state, not a reason to grant the browser host AWS IAM.
+# Publish the existing connector token for the ARM/x86 dev hosts. The value is already
+# sensitive Terraform state; Secrets Manager provides retrieval with their instance role.
+resource "aws_secretsmanager_secret" "browser_manager_tunnel_token" {
+  name                    = "browser-manager-tunnel-token"
+  description             = "Cloudflare connector token for the private browser-manager tunnel"
+  recovery_window_in_days = 7
+
+  tags = { Name = "browser-manager-tunnel-token", Managed = "terraform" }
+}
+
+resource "aws_secretsmanager_secret_version" "browser_manager_tunnel_token" {
+  secret_id     = aws_secretsmanager_secret.browser_manager_tunnel_token.id
+  secret_string = data.cloudflare_zero_trust_tunnel_cloudflared_token.browser_manager.token
+}
+
+resource "aws_iam_role_policy" "dev_server_browser_manager" {
+  name = "browser-manager-tunnel-read"
+  role = aws_iam_role.dev_server.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.browser_manager_tunnel_token.arn
+    }]
+  })
+}
+
+output "browser_manager_tunnel_secret_name" {
+  description = "Secrets Manager name for the connector token, readable by ARM/x86 dev hosts"
+  value       = aws_secretsmanager_secret.browser_manager_tunnel_token.name
+}
+
+# Retained for apply-host compatibility. Dev hosts fetch the Secrets Manager value;
+# only cloudflared receives the local 0600 token file path.
 output "browser_manager_tunnel_token" {
   description = "Dedicated connector credential; save to a private token file, never argv"
   value       = data.cloudflare_zero_trust_tunnel_cloudflared_token.browser_manager.token
