@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type RFB from "@novnc/novnc";
+import type { BrowserInstance } from "../../../lib/contracts";
 import { Icon } from "../../ui";
 import { createReconnectLoop } from "../../../lib/reconnect.mjs";
 
@@ -24,7 +25,21 @@ export default function Desktop({ name }: { name: string }) {
   const [feedback, setFeedback] = useState("");
   const [fullscreen, setFullscreen] = useState(false);
   const [canFullscreen, setCanFullscreen] = useState(false);
+  const [label, setLabel] = useState(name);
   const connected = connection === "connected";
+
+  useEffect(() => {
+    const abort = new AbortController();
+    setLabel(name);
+    void fetch("/api/browsers", { cache: "no-store", signal: abort.signal })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const data: { browsers: BrowserInstance[] } = await response.json();
+        const browser = data.browsers.find((entry) => entry.name === name);
+        if (!abort.signal.aborted && browser) setLabel(browser.label ?? name);
+      }).catch(() => {});
+    return () => abort.abort();
+  }, [name]);
 
   useEffect(() => {
     let disposed = false;
@@ -191,7 +206,7 @@ export default function Desktop({ name }: { name: string }) {
     <main className="desktop-workspace" ref={workspace}>
       <header className="desktop-header">
         <a href="/" className="icon-button back-button" aria-label="Back to your browsers"><Icon name="back" /></a>
-        <div className="desktop-title"><h1>{name}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
+        <div className="desktop-title"><h1>{label}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
         <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="browserBack" size={20} /><span>Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
           <button className="button quiet" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit to screen</span></button>
@@ -201,7 +216,7 @@ export default function Desktop({ name }: { name: string }) {
         </div>
       </header>
 
-      <section className="desktop-display" aria-label={`${name} remote desktop`}>
+      <section className="desktop-display" aria-label={`${label} remote desktop`}>
         <div ref={screen} className="vnc-screen" />
         {!connected && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}

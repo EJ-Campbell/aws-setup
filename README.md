@@ -745,7 +745,7 @@ box.
 `browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
 multiple named browser desktops on one host. One dedicated Cloudflare Tunnel hostname routes
 `/browsers/<name>` to that exact desktop; it does not modify Dolphin Labs or its tunnel.
-The dashboard can create/start/stop browsers; the CLI prints the same shareable desktop URLs.
+The dashboard can create/start/stop browsers and rename their display labels; the CLI prints the same shareable desktop URLs.
 It is single-owner, not a multi-tenant service: separate profiles isolate browser sessions,
 but are not separate OS security boundaries. These browsers have the host user's normal
 network and filesystem access. Only that owner should have Cloudflare Access permission.
@@ -843,6 +843,7 @@ browserctl start claude --url https://claude.ai
 browserctl start research --url https://example.com
 browserctl list
 browserctl url claude
+browserctl rename claude "Claude · Personal"
 browserctl stop research
 ```
 
@@ -851,6 +852,11 @@ open either desktop (for example `/browsers/claude`). Log in to websites within 
 those logins stay in its host-side profile. Closing a viewer tab does not stop the browser.
 Up to 32 names can be registered. Stop retains a name and its profile, and Start reuses it.
 On service restart, previously running managed desktops are restored from saved desired state.
+
+Use **Rename** on a browser card to edit its display label (1–80 characters, no control characters).
+Labels are trimmed and saved; the dashboard and desktop title show them. Renaming never changes
+the stable name used by CLI commands, `/browsers/<name>` URL, profile, saved logins, or live connection,
+and does not restart the browser. Older browsers initially display their stable name as the label.
 
 Use **Back** beside the desktop title to go back in the remote browser's history. The separate
 top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.
