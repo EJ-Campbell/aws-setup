@@ -14,8 +14,10 @@ import next from 'next';
 import { createAuthorizer } from '../lib/auth.mjs';
 import { createHttpServer } from '../lib/http.mjs';
 import { createInstanceManager } from '../lib/instances.mjs';
+import { VNC_PIXEL_RATIO } from '../lib/frame-viewport.mjs';
 
 process.umask(0o077);
+assert.equal(VNC_PIXEL_RATIO, 2);
 const browserBin = process.env.BM_BROWSER_BIN;
 assert.ok(browserBin?.startsWith('/'), 'Set BM_BROWSER_BIN to an installed, sandbox-capable Chromium binary');
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -53,13 +55,14 @@ const fixture = createServer((req, res) => {
   res.end(`<!doctype html><html><head><title>${name} isolated browser</title><style>
     body{margin:48px;background:#f1f5f9;color:#172033;font:24px system-ui}h1{font-size:52px}
     input{padding:20px;width:80%;font:28px system-ui}button{margin-top:32px;padding:32px;font:24px system-ui}
+    .pointer-target{position:fixed;right:20px;top:130px;width:56px;height:44px;border:0;margin:0;padding:0;background:#176457;color:white;font:14px system-ui}
     .mode-paint{position:fixed;right:8px;bottom:8px;width:16px;height:16px;background:#3b82f6;pointer-events:none}
     @media(max-width:500px){body{margin:20px;font-size:18px}h1{font-size:30px}input{box-sizing:border-box;width:100%;padding:14px;font-size:18px}.mode-paint{background:#8b5cf6}}
     </style></head><body><h1>${name}: private desktop</h1><p>This browser has its own persistent profile.</p>
-    <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p><span class="mode-paint" aria-hidden="true"></span>
+    <input autofocus placeholder="Type here from your phone"><p>Pointer and keyboard acceptance fixture.</p><button class="pointer-target">Hit me</button><span class="mode-paint" aria-hidden="true"></span>
     <script>const name=${JSON.stringify(name)};const report=(kind,value)=>fetch('/event?'+new URLSearchParams({name,kind,value}));
     report('profile',localStorage.getItem('owner')||'fresh');localStorage.setItem('owner',name);
-    const reportViewport=()=>report('viewport',JSON.stringify({width:innerWidth,height:innerHeight,
+    const reportViewport=()=>report('viewport',JSON.stringify({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,
       phone:matchMedia('(max-width:500px)').matches,font:getComputedStyle(document.querySelector('h1')).fontSize,
       value:document.querySelector('input').value,url:location.pathname+location.search,
       profile:localStorage.getItem('owner'),overflow:document.documentElement.scrollWidth>innerWidth}));
@@ -69,6 +72,7 @@ const fixture = createServer((req, res) => {
     document.querySelector('input').addEventListener('input',e=>{
       document.body.style.background='#d5f4e6';report('input',e.target.value);
     });
+    document.querySelector('.pointer-target').addEventListener('click',e=>report('target-click',JSON.stringify({x:e.clientX,y:e.clientY})));
     document.addEventListener('pointerdown',()=>report('pointer','received'));</script></body></html>`);
 });
 const fixtureAddress = await listen(fixture, { host: '127.0.0.1', port: 0 });
@@ -109,7 +113,7 @@ try {
   const errors = [];
   for (const [label, viewport] of [['desktop', { width: 1440, height: 1000 }], ['phone', { width: 390, height: 844 }]]) {
     const context = await browser.newContext({ viewport, extraHTTPHeaders: { 'Cf-Access-Jwt-Assertion': token },
-      isMobile: label === 'phone', hasTouch: label === 'phone' });
+      isMobile: label === 'phone', hasTouch: label === 'phone', deviceScaleFactor: label === 'phone' ? 2 : 1 });
     await context.addInitScript(supported => {
       Object.defineProperty(document, 'fullscreenEnabled', { get: () => supported });
     }, label === 'desktop');
@@ -132,13 +136,14 @@ try {
     else await expect(page.getByRole('button', { name: /^(Enter|Exit) fullscreen$/ })).toHaveCount(0);
     const canvas = page.locator('.vnc-screen canvas');
     await expect(canvas).toBeVisible();
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([2880, 1800]);
     await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
     await page.getByRole('textbox', { name: 'Text for the remote desktop' }).fill(`typed-from-${label}`);
     await page.getByRole('button', { name: 'Type text', exact: true }).click();
     await expect.poll(() => events.some(e => e.name === (label === 'phone' ? 'beta' : 'alpha') &&
       e.kind === 'input' && e.value === `typed-from-${label}`)).toBe(true);
     // Input reaching Chrome is insufficient: its resulting paint must return through VNC.
-    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(200, node.height - 80, 1, 1).data]))
       .toEqual([213, 244, 230, 255]);
     await page.screenshot({ path: join(shots, `${label}-keyboard.png`), fullPage: true });
     await page.bringToFront();
@@ -149,7 +154,7 @@ try {
     server.closeVnc();
     await automaticSocket;
     await expect(page.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
-    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(100, node.height - 40, 1, 1).data]))
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(200, node.height - 80, 1, 1).data]))
       .toEqual([213, 244, 230, 255]);
     await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     await page.screenshot({ path: join(shots, `${label}-auto-reconnected.png`), fullPage: true });
@@ -172,6 +177,8 @@ try {
     await expect(page).toHaveURL(`${config.baseUrl}/browsers/${selected}`);
     await expect.poll(() => remoteViewport(selected)?.value).toBe(`typed-from-${label}`);
     const baseline = remoteViewport(selected);
+    assert.equal(baseline.dpr, 2);
+    assert.equal(baseline.phone, false);
     const otherName = selected === 'alpha' ? 'beta' : 'alpha';
     const otherBrowser = manager.list().find(row => row.name === otherName);
     const originalSocket = manager.getSocket(selected), otherSocket = manager.getSocket(otherName);
@@ -207,19 +214,19 @@ try {
     if (label === 'desktop') assert.equal(phoneViewport.height, 844);
     else assert.ok(phoneViewport.height >= 480 && phoneViewport.height <= 900);
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
-      .toEqual([phoneViewport.width, phoneViewport.height]);
+      .toEqual([phoneViewport.width * 2, phoneViewport.height * 2]);
     await expect.poll(() => {
       const { height, ...content } = remoteViewport(selected) ?? {};
       return content;
     }).toEqual({
-      width: 390, phone: true, font: '30px',
+      width: 390, dpr: 2, phone: true, font: '30px',
       value: baseline.value, url: baseline.url, profile: baseline.profile, overflow: false,
     });
     const phoneContent = remoteViewport(selected);
     assert.ok(phoneContent.height > 0 && phoneContent.height <= phoneViewport.height);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${label} Phone mode overflow`);
     // Geometry and DOM reflow can arrive before their new VNC pixels; capture the painted mode.
-    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 32, node.height - 32, 1, 1).data]))
       .toEqual([139, 92, 246, 255]);
     if (label === 'phone') {
       await expect(fitMode).toBeVisible();
@@ -231,7 +238,7 @@ try {
       activePage = peerPage;
       const peerMode = peerPage.getByRole('button', { name: 'Phone mode', exact: true });
       const peerCanvas = peerPage.locator('.vnc-screen canvas');
-      await expect.poll(() => peerCanvas.evaluate(node => [node.width, node.height])).toEqual([390, phoneViewport.height]);
+      await expect.poll(() => peerCanvas.evaluate(node => [node.width, node.height])).toEqual([780, phoneViewport.height * 2]);
       await expect(peerMode).toHaveAttribute('aria-pressed', 'true');
       await expectPhoneSelection(peerMode, true);
       await peerPage.screenshot({ path: join(shots, 'second-viewer-phone-mode.png'), fullPage: true });
@@ -239,7 +246,7 @@ try {
         new URL(request.url()).pathname === `/api/browsers/${selected}/viewport`);
       await peerMode.click();
       assert.deepEqual((await restore).postDataJSON(), { mode: 'desktop' }, 'An existing second viewer must request the opposite shared mode');
-      await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
+      await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([2880, 1800]);
       await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
       await expect(peerMode).toHaveAttribute('aria-pressed', 'false');
       await expectPhoneSelection(phoneMode, false);
@@ -250,7 +257,7 @@ try {
       await expectPhoneSelection(phoneMode, true);
       await expectPhoneSelection(peerMode, true);
       await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
-      await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+      await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 32, node.height - 32, 1, 1).data]))
         .toEqual([139, 92, 246, 255]);
       assert.equal(primaryReconnects, 0, 'Shared mode must synchronize without reconnecting the first viewer');
       assert.equal(peerConnections, 1, 'Shared mode must synchronize without reconnecting the second viewer');
@@ -270,7 +277,7 @@ try {
     await expectPhoneSelection(phoneMode, true);
     assert.deepEqual(manager.list().find(row => row.name === selected).viewport, phoneViewport);
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
-      .toEqual([390, phoneViewport.height]);
+      .toEqual([780, phoneViewport.height * 2]);
     assert.equal(remoteViewport(selected).value, baseline.value);
     assert.equal(untouchedEvents(), beforeResize, 'Resize/reconnect must not reload, navigate, or replay input');
     // Phone mode must leave Chrome's real address bar and navigation usable.
@@ -280,6 +287,35 @@ try {
       await expect(fitMode).toBeEnabled();
       await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
     }
+    // Hit a small off-centre remote control with real input, at both fitted and logical 1:1 size.
+    // The remote viewport excludes Chrome's top toolbar; the framebuffer includes it.
+    const targetPoint = { x: 390 - 20 - 14, y: 130 + 22 };
+    for (const fitted of [true, false]) {
+      if (!fitted) await fitMode.click();
+      await expect(fitMode).toHaveAttribute('aria-pressed', String(fitted));
+      await expect.poll(async () => {
+        const box = await canvas.boundingBox();
+        return fitted ? box.width < 390 : Math.abs(box.width - 390) < 1;
+      }).toBe(true);
+      const box = await canvas.boundingBox();
+      const scale = box.width / 390;
+      const chromeHeight = phoneViewport.height - remoteViewport(selected).height;
+      const point = { x: box.x + targetPoint.x * scale, y: box.y + (chromeHeight + targetPoint.y) * scale };
+      const beforeHit = events.length;
+      if (label === 'phone') await page.touchscreen.tap(point.x, point.y);
+      else await page.mouse.click(point.x, point.y);
+      await expect.poll(() => {
+        const hit = events.slice(beforeHit).find(e => e.name === selected && e.kind === 'target-click');
+        if (!hit) return false;
+        const actual = JSON.parse(hit.value);
+        // Viewer events, RFB coordinates and remote DOM events each cross integer pixel boundaries.
+        const tolerance = Math.ceil(1 / scale) + 1;
+        return Math.abs(actual.x - targetPoint.x) <= tolerance && Math.abs(actual.y - targetPoint.y) <= tolerance;
+      }).toBe(true);
+      await page.screenshot({ path: join(shots, `${label}-phone-${fitted ? 'fitted' : 'natural'}.png`), fullPage: true });
+    }
+    await fitMode.click();
+    await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
     await page.getByRole('button', { name: 'Address bar', exact: true }).click();
     await page.getByRole('textbox', { name: 'Text for the remote desktop' }).fill(`${fixtureOrigin}${phoneLocation}`);
     await page.getByRole('button', { name: 'Type text', exact: true }).click();
@@ -297,22 +333,22 @@ try {
     await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
     await expect(back).toBeDisabled();
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
-      .toEqual([390, phoneViewport.height]);
+      .toEqual([780, phoneViewport.height * 2]);
     const afterPhoneNavigation = untouchedEvents();
     if (label === 'phone') await phoneMode.tap(); else await phoneMode.click();
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
     await expectPhoneSelection(phoneMode, false);
-    await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
+    await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([2880, 1800]);
     await expect(fitMode).toBeEnabled();
     await expect(fitMode).toHaveAttribute('aria-pressed', 'true');
     await expect.poll(() => {
       const { height, ...content } = remoteViewport(selected) ?? {};
       return content;
-    }).toEqual({ width: 1440, phone: false, font: '52px', value: baseline.value,
+    }).toEqual({ width: 1440, dpr: 2, phone: false, font: '52px', value: baseline.value,
       url: baseline.url, profile: baseline.profile, overflow: false });
     assert.ok(remoteViewport(selected).height > 0 && remoteViewport(selected).height < 900,
       'Desktop restores browser chrome outside fullscreen');
-    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
+    await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 32, node.height - 32, 1, 1).data]))
       .toEqual([59, 130, 246, 255]);
     assert.equal(untouchedEvents(), afterPhoneNavigation, 'Restoring Desktop must not reload, navigate, or replay input');
     assert.equal(manager.getSocket(selected), originalSocket);
@@ -346,6 +382,7 @@ try {
       'native-back-availability', 'fullscreen-supported-and-unsupported',
       'native-phone-reflow-desktop-and-phone', 'phone-selected-style-with-touch-taps', 'shared-phone-toggle-without-reconnect',
       'fit-disabled-only-when-no-visible-effect',
+      '2x-framebuffer-with-logical-viewport', 'fitted-and-natural-exact-pointer-hit',
       'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {

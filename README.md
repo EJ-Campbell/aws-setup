@@ -994,7 +994,7 @@ no remote-debugging endpoint is exposed. Host accessibility preferences are not 
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
 Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
 the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
-480–900 pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
+480–900 logical CSS pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
 the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
 viewers of that same browser also see the change; separate browser instances are unaffected.
 The Phone button follows the actual shared framebuffer in every connected viewer, not a cached
@@ -1012,6 +1012,16 @@ In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting an
 are already the same (less than one pixel of difference), or while disconnected. It re-enables
 when the shared display or available viewer space changes, including rotation and opening the
 keyboard, and retains its on/off setting.
+
+The Linux VNC browser renders at fixed 2× density: a 390 × 844 Phone viewport has a
+780 × 1688 framebuffer, while Desktop has 2880 × 1800 pixels. Text and browser controls
+keep their logical size; **Fit** off means logical actual size, not one physical framebuffer
+pixel per CSS pixel. This supplies more detail on high-density screens at four times the
+source pixel count; it is not lossless or full native density on every phone. Existing
+desktops pick up the density change when restarted.
+Use a current Chromium build: native HiDPI acceptance passes on 153.0.8010.12, while
+151.0.7922.34 reproduced crashes in Chromium's ATK key-event handler. Upgrade that older
+build and update `BM_BROWSER_BIN` before restarting; do not disable native Back or the sandbox.
 
 VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
 reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
@@ -1046,7 +1056,8 @@ A small native VNC regression checks that the real server accepts Unix-socket co
 and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
 `BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
 on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
-It checks desktop/phone layout, real VNC input, native phone-width reflow and restoration,
+It checks desktop/phone layout, 2× rendering with unchanged logical sizes, real VNC input
+including small-target clicks with Fit on and off, native phone-width reflow and restoration,
 phone-mode navigation, reconnect, and profile retention. Screenshots
 go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
 printed temporary directory and all test desktops are stopped. New E2E findings should get
