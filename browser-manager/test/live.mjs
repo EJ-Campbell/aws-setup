@@ -35,6 +35,14 @@ const remoteViewport = name => {
   const event = events.findLast(event => event.name === name && event.kind === 'viewport');
   return event ? JSON.parse(event.value) : null;
 };
+async function expectPhoneSelection(button, selected) {
+  const hover = await button.evaluate(() => matchMedia('(hover: hover)').matches);
+  const background = selected
+    ? (hover ? /^rgb\((23, 100, 87|17, 83, 71)\)$/ : 'rgb(23, 100, 87)')
+    : (hover ? /^rgb\((255, 255, 255|240, 243, 244)\)$/ : 'rgb(255, 255, 255)');
+  await expect(button).toHaveCSS('background-color', background);
+  if (selected) await expect(button).toHaveCSS('color', 'rgb(255, 255, 255)');
+}
 const fixture = createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname === '/event') {
@@ -173,6 +181,7 @@ try {
     const beforeResize = untouchedEvents();
     const phoneMode = page.getByRole('button', { name: 'Phone mode', exact: true });
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+    await expectPhoneSelection(phoneMode, false);
     let peerPage, peerConnections = 0, primaryReconnects = 0;
     const trackPrimary = () => primaryReconnects++;
     if (label === 'desktop') {
@@ -188,8 +197,9 @@ try {
       assert.ok(await page.evaluate(() => document.hasFocus()));
       page.on('websocket', trackPrimary);
     }
-    await phoneMode.click();
+    if (label === 'phone') await phoneMode.tap(); else await phoneMode.click();
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
+    await expectPhoneSelection(phoneMode, true);
     const phoneViewport = manager.list().find(row => row.name === selected).viewport;
     assert.equal(phoneViewport.mode, 'phone');
     assert.equal(phoneViewport.width, 390);
@@ -217,6 +227,7 @@ try {
       const peerCanvas = peerPage.locator('.vnc-screen canvas');
       await expect.poll(() => peerCanvas.evaluate(node => [node.width, node.height])).toEqual([390, phoneViewport.height]);
       await expect(peerMode).toHaveAttribute('aria-pressed', 'true');
+      await expectPhoneSelection(peerMode, true);
       await peerPage.screenshot({ path: join(shots, 'second-viewer-phone-mode.png'), fullPage: true });
       const restore = peerPage.waitForRequest(request => request.method() === 'POST' &&
         new URL(request.url()).pathname === `/api/browsers/${selected}/viewport`);
@@ -225,9 +236,13 @@ try {
       await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
       await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
       await expect(peerMode).toHaveAttribute('aria-pressed', 'false');
+      await expectPhoneSelection(phoneMode, false);
+      await expectPhoneSelection(peerMode, false);
       await phoneMode.click();
       await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
       await expect(peerMode).toHaveAttribute('aria-pressed', 'true');
+      await expectPhoneSelection(phoneMode, true);
+      await expectPhoneSelection(peerMode, true);
       await expect.poll(() => remoteViewport(selected)).toEqual(phoneContent);
       await expect.poll(() => canvas.evaluate(node => [...node.getContext('2d').getImageData(node.width - 16, node.height - 16, 1, 1).data]))
         .toEqual([139, 92, 246, 255]);
@@ -246,6 +261,7 @@ try {
     await phoneSocket;
     await expect(page.getByRole('status').filter({ hasText: /^Connected$/ })).toBeVisible({ timeout: 15000 });
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'true');
+    await expectPhoneSelection(phoneMode, true);
     assert.deepEqual(manager.list().find(row => row.name === selected).viewport, phoneViewport);
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
       .toEqual([390, phoneViewport.height]);
@@ -268,8 +284,9 @@ try {
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height]))
       .toEqual([390, phoneViewport.height]);
     const afterPhoneNavigation = untouchedEvents();
-    await phoneMode.click();
+    if (label === 'phone') await phoneMode.tap(); else await phoneMode.click();
     await expect(phoneMode).toHaveAttribute('aria-pressed', 'false');
+    await expectPhoneSelection(phoneMode, false);
     await expect.poll(() => canvas.evaluate(node => [node.width, node.height])).toEqual([1440, 900]);
     await expect.poll(() => {
       const { height, ...content } = remoteViewport(selected) ?? {};
@@ -310,7 +327,7 @@ try {
     checks: ['signed-auth', 'two-isolated-desktops', 'CLI-start-stop', 'real-VNC-keyboard-pointer',
       'desktop-and-phone-layout', 'automatic-reconnect-desktop-and-phone', 'remote-browser-back-desktop-and-phone',
       'native-back-availability', 'fullscreen-supported-and-unsupported',
-      'native-phone-reflow-desktop-and-phone', 'shared-phone-toggle-without-reconnect',
+      'native-phone-reflow-desktop-and-phone', 'phone-selected-style-with-touch-taps', 'shared-phone-toggle-without-reconnect',
       'phone-viewport-reconnect-and-restart', 'reconnect', 'profile-retention'], events }, null, 2), { mode: 0o600 });
   console.log(`PASS: desktop + phone VNC, input, reconnect, Back, native Phone mode, and retained profile data. Screenshots: ${shots}`);
 } catch (error) {
