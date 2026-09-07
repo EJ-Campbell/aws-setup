@@ -33,4 +33,9 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm run build
-      - run: bash -n scripts/install.sh
+      - name: Check Linux installer syntax
+        if: runner.os == 'Linux'
+        run: bash -n scripts/install.sh
+      - name: Check macOS installer syntax
+        if: runner.os == 'macOS'
+        run: node --check scripts/install-macos.mjs
