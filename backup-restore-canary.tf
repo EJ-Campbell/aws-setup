@@ -64,6 +64,8 @@ resource "aws_backup_restore_testing_selection" "initial_ebs" {
   restore_metadata_overrides = {
     availabilityZone = data.aws_availability_zones.backup_restore_staging_dr.names[0]
     volumeType       = "gp3"
+    # Override any original source-account/region key preserved in backup metadata.
+    kmsKeyId = "arn:aws:kms:${local.backup_recovery_region}:${data.aws_caller_identity.staging.account_id}:alias/aws/ebs"
   }
   # AWS restore testing infers encrypted=true for EBS. 'encrypted' is not an
   # overridable key; the restore role additionally allows only encrypted gp3
