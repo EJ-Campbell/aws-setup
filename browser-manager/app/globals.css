@@ -89,7 +89,8 @@ input::placeholder, textarea::placeholder { color: #77828d; opacity: 1; }
 .connection-status { display: flex; gap: 6px; align-items: center; font-size: 11px; color: #687481; margin-top: 3px; }
 .connection-status[data-state="connected"] { color: var(--accent); }
 .connection-status[data-state="error"], .connection-status[data-state="disconnected"] { color: #994b36; }
-.desktop-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 3px; margin-left: auto; flex-shrink: 0; }
+.remote-back { margin-left: auto; flex-shrink: 0; }
+.desktop-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 3px; flex-shrink: 0; }
 .desktop-toolbar .button { padding: 10px 12px; font-size: 12px; }
 .desktop-toolbar .button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
 .desktop-display { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #171d25; }

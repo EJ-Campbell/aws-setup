@@ -852,6 +852,8 @@ those logins stay in its host-side profile. Closing a viewer tab does not stop t
 Up to 32 names can be registered. Stop retains a name and its profile, and Start reuses it.
 On service restart, previously running managed desktops are restored from saved desired state.
 
+Use **Back** beside the desktop title to go back in the remote browser's history. The separate
+top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
 **Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
 input also work directly. Each viewer scales independently instead of resizing other viewers'

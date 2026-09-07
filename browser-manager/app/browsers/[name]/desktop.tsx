@@ -5,7 +5,7 @@ import type RFB from "@novnc/novnc";
 import { Icon } from "../../ui";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
-const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3 };
+const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
 
 export default function Desktop({ name }: { name: string }) {
   const screen = useRef<HTMLDivElement>(null);
@@ -103,6 +103,15 @@ export default function Desktop({ name }: { name: string }) {
     finally { rfb.sendKey(keys.control, "ControlLeft", false); }
   }
 
+  function browserBack() {
+    const rfb = client.current;
+    if (!connected || !rfb) return;
+    rfb.sendKey(keys.alt, "AltLeft", true);
+    try { rfb.sendKey(keys.left, "ArrowLeft"); }
+    finally { rfb.sendKey(keys.alt, "AltLeft", false); }
+    setFeedback("Back sent to the remote browser.");
+  }
+
   function sendText(paste: boolean) {
     const rfb = client.current;
     if (!connected || !rfb || !text) return;
@@ -130,6 +139,7 @@ export default function Desktop({ name }: { name: string }) {
       <header className="desktop-header">
         <a href="/" className="icon-button back-button" aria-label="Back to your browsers"><Icon name="back" /></a>
         <div className="desktop-title"><h1>{name}</h1><span className="connection-status" data-state={connection} role="status"><span />{connected ? "Connected" : connection === "connecting" ? "Connecting…" : "Disconnected"}</span></div>
+        <button className="button remote-back" disabled={!connected} onClick={browserBack} aria-label="Back in remote browser" title="Back in remote browser"><Icon name="back" size={18} /><span>Back</span></button>
         <div className="desktop-toolbar" aria-label="Desktop controls">
           <button className="button quiet" aria-pressed={fit} onClick={() => setFit(!fit)} title={fit ? "Show desktop at actual size" : "Fit desktop to screen"}><Icon name="fit" size={18} /><span>Fit to screen</span></button>
           <button className="button quiet" aria-pressed={keyboard} aria-controls="keyboard-panel" onClick={() => setKeyboard(!keyboard)}><Icon name="keyboard" size={18} /><span>Keyboard</span></button>
