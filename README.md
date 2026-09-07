@@ -853,9 +853,11 @@ desktop can be started from the dashboard. A profile remains on disk even if sta
 
 ### Development and acceptance
 
-`npm test`, `npm run typecheck`, and `npm run build` are the focused CI gate. They cover
-signed Access identities, Origin enforcement, exact socket routing, expiry, and lifecycle
-without needing a Cloudflare account. After building,
+`npm test`, `npm run typecheck`, and `npm run build` are the focused CI gate. Install `x11vnc`
+before testing (CI does this automatically). Tests cover signed Access identities, Origin
+enforcement, exact socket routing, expiry, and lifecycle without needing a Cloudflare account.
+A small native VNC regression checks that the real server accepts Unix-socket connections
+and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
 `BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
 on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
 It checks desktop/phone layout, real VNC input, reconnect, and profile retention. Screenshots
