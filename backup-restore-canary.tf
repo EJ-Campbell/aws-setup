@@ -7,7 +7,7 @@
 # moving-time precondition would block unrelated permission repairs during a test.
 # The explicit year makes this a single occurrence, not an annual/monthly schedule.
 locals {
-  backup_initial_restore_at = null
+  backup_initial_restore_at = "2026-09-07T21:35:00Z"
   # Provider validation still requires a non-null schedule when count=0. The past
   # placeholder is never created: null disables both resources, and malformed
   # non-null input is rejected by the plan precondition below.
@@ -17,7 +17,7 @@ locals {
 
   # Separate, one-off source capture proves processing-copy-cleanup behavior before
   # moving either existing backup selection. A null timestamp creates no resources.
-  backup_initial_capture_at = null
+  backup_initial_capture_at = "2026-09-07T21:10:00Z"
   backup_initial_capture_cron = try(
     "cron(${formatdate("m h D M ? YYYY", local.backup_initial_capture_at)})", "cron(0 0 1 1 ? 1970)"
   )
