@@ -685,6 +685,36 @@ or booting to take them.
 Runner roots and instance-store data are disposable. See `GITHUB-RUNNERS.md` for the
 webhook, AMI, lease, health, and cleanup internals.
 
+Runner-image publication is a separate privilege from running CI. The replacement
+`github-actions-ami-builder` role trusts only the `ejc3/fcvm` environment
+`runner-ami-publish`. That environment permits only the `main` branch, requires
+approval from `ejc3`, and disables administrator bypass. Collaborators can still
+launch ordinary CI; publishing a shared runner image requires the owner's explicit
+approval of the exact commit. `ejc3` may approve their own dispatch. Do not approve a
+publication without reviewing the workflow and all build inputs at that commit.
+
+The environment settings are versioned in `.github/runner-ami-environment.json`.
+They are applied with the operator's existing GitHub CLI login; Terraform's
+webhook-only PAT cannot administer repository environments, and personal GitHub
+credentials must not be copied into Terraform state or fleet secrets. To recover
+this GitHub prerequisite, create/update the environment, then add its sole branch
+policy only if the read-only policy listing does not already contain it:
+
+```bash
+gh api --method PUT repos/ejc3/fcvm/environments/runner-ami-publish \
+  --input .github/runner-ami-environment.json
+gh api repos/ejc3/fcvm/environments/runner-ami-publish/deployment-branch-policies
+# Only when the main branch policy is absent:
+gh api --method POST repos/ejc3/fcvm/environments/runner-ami-publish/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Read back the environment and branch policies before creating/enabling the AWS role.
+There must be no other allowed branch/tag, reviewer, or bypass. The additive producer
+stage creates the builder role/profile and own-instance bootstrap grant first; the
+`fcvm` workflow and runner controller must adopt them before the old CI authority and
+runner PAT grant are retired. An additive apply alone does not close the old path.
+
 The repository also manages:
 
 - a private CodeArtifact npm repository in `us-west-2`;
