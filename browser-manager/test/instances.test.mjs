@@ -1,17 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, open, readFile, readdir, readlink, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, readlink, realpath, writeFile, rm, stat, symlink, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { createInstanceManager } from '../lib/instances.mjs';
 
+// macOS /var is a symlink and its per-user tmp path can exceed the Unix socket limit.
+// Use a short canonical temporary root, without weakening production path validation.
+const testTmp = await realpath(process.platform === 'darwin' ? '/tmp' : tmpdir());
+
 async function fixture(t, launch) {
-  const stateDir = await mkdtemp(join(tmpdir(), 'browser-manager-'));
+  const stateDir = await mkdtemp(join(testTmp, 'browser-manager-'));
   const launches = [];
   const manager = createInstanceManager({ stateDir, browserBin: '/test/chrome', baseUrl: 'https://browsers.example' }, {
     launch: launch ?? (async (options) => {
       const ended = Promise.withResolvers();
       const handle = { socketPath: join(options.runtimeDir, 'vnc.sock'), closed: ended.promise,
+        resizes: [], resize: async viewport => { handle.resizes.push(viewport); },
         close: async () => { handle.stopped = true; ended.resolve(); } };
       launches.push({ ...options, handle });
       return handle;
@@ -32,6 +37,108 @@ async function failStateSync(t, stateDir, directory = false) {
     return sync.call(this);
   });
 }
+
+test('navigation reads only the selected live desktop and never saves or exposes history', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  await manager.start('alpha'); await manager.start('beta');
+  const saved = await readFile(join(stateDir, 'instances.json'), 'utf8');
+  const socket = manager.getSocket('alpha');
+  launches[0].handle.getNavigation = async () => ({ canGoBack: true, history: 'private' });
+  launches[1].handle.getNavigation = async () => ({ canGoBack: false });
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: true });
+  assert.deepEqual(await manager.getNavigation('beta'), { canGoBack: false });
+  assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), saved);
+  assert.equal(manager.getSocket('alpha'), socket);
+  for (const result of [null, {}, { canGoBack: 'yes' }]) {
+    launches[0].handle.getNavigation = async () => result;
+    assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  }
+  launches[0].handle.getNavigation = async () => { throw new Error('private native diagnostic'); };
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  await assert.rejects(manager.getNavigation('missing'), error => error.status === 404);
+  await assert.rejects(manager.getNavigation('../alpha'), /Invalid browser name/);
+  await manager.stop('alpha');
+  assert.deepEqual(await manager.getNavigation('alpha'), { canGoBack: null });
+  assert.equal(launches.length, 2);
+});
+
+test('navigation cannot enable Back from a late snapshot after stop, replacement, or close', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('alpha');
+  for (const boundary of ['stop', 'replace', 'close']) {
+    const result = Promise.withResolvers();
+    launches.at(-1).handle.getNavigation = () => result.promise;
+    const reading = manager.getNavigation('alpha');
+    if (boundary === 'close') await manager.close();
+    else await manager.stop('alpha');
+    if (boundary === 'replace') await manager.start('alpha');
+    result.resolve({ canGoBack: true });
+    assert.deepEqual(await reading, { canGoBack: null });
+    if (boundary === 'stop') await manager.start('alpha');
+  }
+});
+
+test('Phone mode resizes only the selected live desktop, without saving state or restarting its browser', async (t) => {
+  const { manager, stateDir, launches } = await fixture(t);
+  const desktop = { mode: 'desktop', width: 1440, height: 900 };
+  const phone = { mode: 'phone', width: 390, height: 680 };
+  await manager.start('alpha'); await manager.start('beta');
+  const socket = manager.getSocket('alpha');
+  const saved = await readFile(join(stateDir, 'instances.json'), 'utf8');
+  const resized = await manager.setViewport('alpha', phone);
+  assert.deepEqual(resized.viewport, phone);
+  assert.deepEqual(manager.list()[1].viewport, desktop);
+  assert.deepEqual(launches[0].handle.resizes, [phone]);
+  assert.deepEqual(launches[1].handle.resizes, []);
+  assert.equal(manager.getSocket('alpha'), socket);
+  assert.equal(launches.length, 2);
+  assert.equal(await readFile(join(stateDir, 'instances.json'), 'utf8'), saved);
+  // Public results cannot mutate geometry; explicit requests can recover uncertain native state.
+  resized.viewport.width = 500;
+  assert.deepEqual((await manager.setViewport('alpha', phone)).viewport, phone);
+  assert.equal(launches[0].handle.resizes.length, 2);
+  assert.deepEqual((await manager.setViewport('alpha', { mode: 'desktop' })).viewport, desktop);
+  assert.deepEqual(launches[0].handle.resizes, [phone, phone, desktop]);
+  await manager.setViewport('alpha', phone);
+  await manager.stop('alpha'); await manager.start('alpha');
+  assert.deepEqual(manager.list()[0].viewport, desktop);
+});
+
+test('resize validation and native failures cannot claim a mode change or restart the browser', async (t) => {
+  const { manager, launches } = await fixture(t);
+  const phone = { mode: 'phone', width: 390, height: 680 };
+  for (const input of [null, {}, [], { ...phone, width: '390' }, { ...phone, width: 319 },
+    { ...phone, width: 501 }, { ...phone, height: 479 }, { ...phone, height: 901 },
+    { ...phone, height: 500.5 }, { ...phone, display: ':0' }, { mode: 'desktop', width: 500 },
+    { mode: 'phone', width: 390 }, { ...phone, mode: 'arbitrary' }]) {
+    assert.throws(() => manager.setViewport('alpha', input), error => error.status === 400);
+  }
+  await assert.rejects(manager.setViewport('missing', phone), error => error.status === 404);
+  await manager.start('alpha');
+  const before = manager.list()[0];
+  launches[0].handle.resize = async () => { throw new Error('Native resize failed'); };
+  await assert.rejects(manager.setViewport('alpha', phone), /Native resize failed/);
+  assert.deepEqual(manager.list()[0], before);
+  assert.equal(launches.length, 1);
+  await manager.stop('alpha');
+  await assert.rejects(manager.setViewport('alpha', phone), error => error.status === 409);
+});
+
+test('queued resize completes before stop closes its exact desktop', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('alpha');
+  const started = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  launches[0].handle.resize = async () => { started.resolve(); await finish.promise; };
+  const resizing = manager.setViewport('alpha', { mode: 'phone', width: 390, height: 680 });
+  await started.promise;
+  const stopping = manager.stop('alpha');
+  assert.equal(launches[0].handle.stopped, undefined);
+  finish.resolve();
+  assert.equal((await resizing).viewport.mode, 'phone');
+  await stopping;
+  assert.equal(launches[0].handle.stopped, true);
+});
 
 test('named desktops have isolated profiles and sockets; stopping preserves only the chosen profile', async (t) => {
   const { manager, stateDir, launches } = await fixture(t);
@@ -54,6 +161,24 @@ test('named desktops have isolated profiles and sockets; stopping preserves only
   assert.equal((await stat(join(stateDir, 'instances.json'))).mode & 0o777, 0o600);
   await manager.close();
   assert.equal(launches.every(({ handle }) => handle.stopped), true);
+});
+
+test('Mac page handles are scoped to the selected running desktop and revoked on stop or replacement', async (t) => {
+  const { manager, launches } = await fixture(t);
+  await manager.start('mac'); await manager.start('other');
+  assert.equal(manager.getPage('mac'), null, 'Linux desktops are not page transports');
+  launches[0].handle.transport = 'page';
+  assert.equal(manager.getPage('mac'), launches[0].handle);
+  assert.equal(manager.getPage('other'), null);
+  assert.equal(manager.getPage('missing'), null);
+  assert.throws(() => manager.getPage('../mac'), /Invalid browser name/);
+  await manager.stop('mac');
+  assert.equal(manager.getPage('mac'), null);
+  await manager.start('mac');
+  launches[2].handle.transport = 'page';
+  assert.equal(manager.getPage('mac'), launches[2].handle);
+  await manager.close();
+  assert.equal(manager.getPage('mac'), null);
 });
 
 test('rejects route escapes, unsafe URLs, linked state/profiles, and overbroad state permissions', async (t) => {

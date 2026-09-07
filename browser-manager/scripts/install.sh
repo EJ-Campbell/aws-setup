@@ -43,9 +43,11 @@ for bm_path in "$bm_project" "$bm_config_dir" "$bm_node" "${bm_cloudflared:-/usr
 done
 [[ -f $bm_project/.next/BUILD_ID ]] || fail 'Build the application first: npm ci && npm run build.'
 [[ -f $bm_project/server.mjs && -x $bm_project/bin/browserctl.mjs ]] || fail 'The application or browserctl entry point is missing.'
-for bm_program in /usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/openbox; do
-  [[ -x $bm_program ]] || fail 'Install the desktop prerequisites: xvfb x11vnc openbox.'
+for bm_program in /usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/openbox /usr/bin/xrandr /usr/bin/wmctrl /usr/bin/xprop /usr/bin/python3 /usr/bin/dbus-daemon /usr/bin/gdbus; do
+  [[ -x $bm_program ]] || fail 'Install the desktop prerequisites: xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3 dbus libglib2.0-bin at-spi2-core python3-dbus.'
 done
+/usr/bin/python3 -c 'import dbus' || fail 'Install python3-dbus for native browser navigation state.'
+[[ -f /usr/share/dbus-1/services/org.a11y.Bus.service ]] || fail 'Install at-spi2-core for native browser navigation state.'
 
 # Parse data, never source it as shell code. Restrict EnvironmentFile to application
 # settings so it cannot inject a connector credential or change Node's execution mode.

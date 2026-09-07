@@ -43,7 +43,9 @@ function hasBanner(socketPath) {
   });
 }
 
-test('production x11vnc accepts Unix RFB without owning a TCP4 or TCP6 listener', { timeout: 10_000 }, async () => {
+test('production x11vnc accepts Unix RFB without owning a TCP4 or TCP6 listener', {
+  timeout: 10_000, skip: process.platform !== 'linux',
+}, async () => {
   const scratch = await mkdtemp(join(tmpdir(), 'browser-vnc-test-'));
   const socketPath = join(scratch, 'vnc.sock');
   const args = vncArguments({ display: '0', authFile: join(scratch, 'Xauthority'), socketPath });

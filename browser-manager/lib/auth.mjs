@@ -64,6 +64,20 @@ export function instanceLabel(value) {
   return value.trim();
 }
 
+export const DESKTOP_VIEWPORT = Object.freeze({ mode: 'desktop', width: 1440, height: 900 });
+
+/** Two explicit display modes, never arbitrary native command/geometry arguments. */
+export function browserViewport(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, 'Invalid browser viewport');
+  if (value.mode === 'desktop' && Object.keys(value).length === 1) return { ...DESKTOP_VIEWPORT };
+  if (value.mode !== 'phone' || Object.keys(value).some(key => !['mode', 'width', 'height'].includes(key)) ||
+      !Number.isInteger(value.width) || value.width < 320 || value.width > 500 ||
+      !Number.isInteger(value.height) || value.height < 480 || value.height > 900) {
+    throw new HttpError(400, 'Choose Desktop mode or a phone viewport 320–500 pixels wide and 480–900 pixels high');
+  }
+  return { mode: 'phone', width: value.width, height: value.height };
+}
+
 export function startUrl(value) {
   if (value === undefined) return undefined;
   try {

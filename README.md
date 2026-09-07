@@ -750,7 +750,7 @@ It is single-owner, not a multi-tenant service: separate profiles isolate browse
 but are not separate OS security boundaries. These browsers have the host user's normal
 network and filesystem access. Only that owner should have Cloudflare Access permission.
 
-The dashboard and VNC WebSocket both require a verified Cloudflare Access
+The dashboard and browser-view WebSocket both require a verified Cloudflare Access
 JWT for the configured audience and owner. Mutations require the expected Origin. The local
 CLI uses an owner-only Unix socket, not a public bearer token. VNC uses private Unix sockets,
 not public ports; unknown instance names cannot become arbitrary network or filesystem targets.
@@ -836,7 +836,7 @@ fail closed, not accept an arbitrary replacement service identity.
 ### 2. Install on the browser host
 
 Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
-desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox`) and a current
+desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3 dbus libglib2.0-bin at-spi2-core python3-dbus`) and a current
 [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
 with `--token-file` support. Do not disable the Chrome sandbox to make installation pass.
 
@@ -911,12 +911,34 @@ desktop stay in that remote desktop's persistent host-side profile; they are not
 the local viewer.
 
 Use **Back** beside the desktop title to go back in the remote browser's history. The separate
-top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.
+top-left arrow returns to the browser-manager dashboard instead. Back follows the active remote
+Chrome window/tab's native toolbar state, including navigation from other viewers. It is disabled
+while disconnected or when the native state is unavailable. Foreground viewers refresh this
+read-only state every 500 ms after the previous read completes; background polling pauses.
+Each desktop uses its own private accessibility bus; no browsing history URLs are returned and
+no remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
+Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
+the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
+480–900 pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
+the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
+viewers of that same browser also see the change; separate browser instances are unaffected.
+The Phone button follows the actual shared framebuffer in every connected viewer, not a cached
+metadata response. A second viewer can toggle the current mode without refreshing or reconnecting;
+local Fit scaling and viewer-window resizing do not change the shared mode.
+Tabs, page state, and logins remain in place: switching modes does not restart or reload the
+browser. The mode survives viewer reconnects, but a browser/service restart starts in Desktop
+mode. Phone changes the viewport, not the browser's user agent; it is not an iOS emulator.
 **Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
-input also work directly. Each viewer scales independently instead of resizing other viewers'
-desktop. Fullscreen is available where the viewing browser supports it. This is a remote
-desktop, so the website inside it keeps the host desktop layout rather than becoming mobile.
+input also work directly. **Fit to screen** scales independently for each viewer; only the
+explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
+viewing browser supports it.
+
+VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
+reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
+stronger compression; changing connection hints updates the live connection. Browsers without
+these hints, including Safari, keep high quality. These are browser hints, not a throughput test.
+
 Disconnected viewers retry automatically while their tab is visible and focused, waiting
 1, 2, 4, 8, then at most 10 seconds between failed attempts. Returning to the tab reconnects
 immediately, including after phone suspension; background retries pause. A successful connection
@@ -945,10 +967,68 @@ A small native VNC regression checks that the real server accepts Unix-socket co
 and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
 `BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
 on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
-It checks desktop/phone layout, real VNC input, reconnect, and profile retention. Screenshots
+It checks desktop/phone layout, real VNC input, native phone-width reflow and restoration,
+phone-mode navigation, reconnect, and profile retention. Screenshots
 go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
 printed temporary directory and all test desktops are stopped. New E2E findings should get
 the smallest practical regression at the layer responsible, not a new proof framework.
+
+### Native browsers on the personal Mac
+
+`https://mac-browsers.cc-games.dev` is an independent browser manager on the personal
+Mac, not the optional AWS Mac instance. Chrome renders webpages, stores its profiles and
+uses the Mac's network locally. The AWS browser list at `browsers.cc-games.dev` is separate;
+there is no profile synchronization or automatic federation. The Mac has its own tunnel
+and Access application/audience. Never run its connector with the AWS browser tunnel token:
+Cloudflare would load-balance requests between two different machines' browser lists.
+
+The Mac backend starts installed, sandboxed **native headed Chrome** with a dedicated
+profile per browser. It streams webpage images and accepts only bounded tab, navigation,
+pointer, key and explicit text commands through an authenticated WebSocket. Browser-manager
+supplies the tabs and address bar; Chrome's native toolbar, macOS file dialogs, Touch ID and
+the rest of the Mac desktop are not streamed. Downloads are disabled in managed Mac browsers.
+Chrome debugging uses inherited private pipes, never a listening debug port or public CDP
+proxy. No Screen Recording or Accessibility grant is requested. The normal Chrome profile
+and existing OpenClaw services are not touched, and website logins must be made in the new
+managed profiles. Profiles are private but are not separate OS security boundaries.
+
+Terraform runs only on the jumpbox. After reviewing/applying the full plan, export
+`terraform output -raw browser_manager_mac_env` into a private environment file. The Mac's
+connector credential is stored in Secrets Manager as `browser-manager-mac-tunnel-token`;
+it is also sensitive Terraform state. Transfer that token and public environment file over
+the existing authenticated SSH connection, owned by the Mac user and mode `0600`. Do not
+print tokens or place them in Git, command arguments, browser profiles or LaunchAgent XML.
+For later credential retrieval, the Mac's existing SSO administrator session can assume
+`browser-manager-mac-connector`, which can read only that connector secret. No AWS
+credentials are required by the running browser-manager or tunnel process.
+
+Install as the logged-in Mac user from a full checkout at a permanent path (the deployed
+path is `/Users/ejcampbell/src/aws-browser-manager`). Existing Chrome and Node.js 22.13+
+are prerequisites; `brew install cloudflared` supplies the connector. From `browser-manager`:
+
+```bash
+npm ci --ignore-scripts
+npm run build
+node scripts/install-macos.mjs /absolute/private/browser-manager.env /absolute/private/tunnel-token
+browserctl start personal --url https://example.com
+```
+
+The installer owns only the user LaunchAgents `com.ejc3.browser-manager` and
+`com.ejc3.browser-manager-tunnel`. They restart on that user's login, not before FileVault
+unlock; logout or sleep makes the Mac URL unavailable. It does not change power settings.
+State stays under `~/.local/state/browser-manager`, configuration under
+`~/.config/browser-manager`. Rerun the installer after rebuilding to update only these
+services; previously running managed browsers are restored and their profiles retained.
+Always use this GUI LaunchAgent startup path: Chrome started directly under SSH on this
+Mac cannot access Keychain (`errSecInteractionNotAllowed`) and cannot persist encrypted
+cookies. Do not substitute an unencrypted password store or a mock Keychain. If macOS
+requests Keychain authorization, the owner must approve it in their GUI login session.
+Open the Mac URL on your phone and sign in as the same configured owner. Multiple viewers
+of one named browser share its selected tab and input; different names have separate profiles.
+
+`npm test`, `npm run typecheck`, and `npm run build` also run on macOS; the native Linux
+VNC test is skipped there. The Mac backend and authenticated page-transport regressions
+cover private pipes, bounded actions, profile isolation and immediate session expiry.
 
 ## File map
 
@@ -962,7 +1042,7 @@ the smallest practical regression at the layer responsible, not a new proof fram
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
-| Private browser desktops | `browser-manager/`, `browser-manager.tf` |
+| Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
 

@@ -10,6 +10,7 @@ import { createInstanceManager } from './lib/instances.mjs';
 
 process.umask(0o077);
 const config = readConfig();
+config.transport = process.platform === 'darwin' ? 'page' : 'vnc';
 const stateDir = resolve(process.env.BM_STATE_DIR || join(homedir(), '.local/state/browser-manager'));
 await mkdir(stateDir, { recursive: true, mode: 0o700 });
 const info = await lstat(stateDir);

@@ -3,7 +3,8 @@ import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promi
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { launchDesktop } from './desktop.mjs';
-import { instanceLabel } from './auth.mjs';
+import { launchMacDesktop } from './macos-desktop.mjs';
+import { browserViewport, DESKTOP_VIEWPORT, HttpError, instanceLabel } from './auth.mjs';
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const MAX_INSTANCES = 32;
@@ -48,7 +49,9 @@ async function profileAvailable(profile) {
 }
 
 /** Single-owner lifecycle and desired state. The optional launcher is a deterministic test seam. */
-export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launch = launchDesktop } = {}) {
+export function createInstanceManager({ stateDir, browserBin, baseUrl }, {
+  launch = process.platform === 'darwin' ? launchMacDesktop : launchDesktop,
+} = {}) {
   if (typeof stateDir !== 'string' || !isAbsolute(stateDir) || resolve(stateDir) !== stateDir) {
     throw new Error('Browser state directory must be an absolute normalized path');
   }
@@ -66,6 +69,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
   const stateFile = join(stateDir, 'instances.json');
   const publicRow = (r) => ({
     name: r.name, label: r.label ?? r.name, url: `${origin.origin}/browsers/${r.name}`, state: r.state,
+    viewport: { ...(r.viewport ?? DESKTOP_VIEWPORT) },
     createdAt: r.createdAt, ...(r.error ? { error: r.error } : {}),
   });
   const enqueue = (operation) => {
@@ -130,6 +134,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
       if (closed) { await desktop.close(); throw new Error('Browser manager is closed'); }
       record.desktop = desktop;
       record.runtimeDir = runtimeDir;
+      record.viewport = { ...DESKTOP_VIEWPORT };
       record.state = 'running';
       void desktop.closed.then(() => enqueue(async () => {
         if (record.desktop !== desktop) return;
@@ -263,10 +268,44 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
         return publicRow(record);
       });
     },
+    setViewport(name, value) {
+      checkedName(name);
+      const viewport = browserViewport(value);
+      return enqueue(async () => {
+        assertOpen();
+        const record = records.get(name);
+        if (!record) throw new HttpError(404, 'Unknown browser');
+        if (record.state !== 'running' || !record.desktop) throw new HttpError(409, 'Start this browser before changing its display');
+        // Always apply an explicit request: it can recover a previous partially failed native resize.
+        await record.desktop.resize(viewport);
+        record.viewport = viewport;
+        // Display geometry is live state: viewer reconnects retain it; a new desktop starts wide.
+        return publicRow(record);
+      });
+    },
+    async getNavigation(name) {
+      checkedName(name);
+      const record = records.get(name);
+      if (!record) throw new HttpError(404, 'Unknown browser');
+      const desktop = record.desktop;
+      if (closed || record.state !== 'running' || !desktop) return { canGoBack: null };
+      try {
+        const state = await desktop.getNavigation();
+        // A late snapshot from a stopped/replaced desktop must never enable navigation.
+        return { canGoBack: !closed && record.state === 'running' && record.desktop === desktop &&
+          typeof state?.canGoBack === 'boolean' ? state.canGoBack : null };
+      } catch { return { canGoBack: null }; }
+    },
     getSocket(name) {
       checkedName(name);
       const record = records.get(name);
       return !closed && record?.state === 'running' ? record.desktop?.socketPath ?? null : null;
+    },
+    getPage(name) {
+      checkedName(name);
+      const record = records.get(name);
+      return !closed && record?.state === 'running' && record.desktop?.transport === 'page'
+        ? record.desktop : null;
     },
     async close() {
       if (closing) return closing;
