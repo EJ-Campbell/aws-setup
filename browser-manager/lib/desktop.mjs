@@ -54,13 +54,15 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
   const resizeAbort = new AbortController();
   let resizeTail = Promise.resolve();
   let navigationRead;
+  let navigationWait;
+  let navigationResolve;
   const close = () => {
     if (closing) return closing;
     closing = (async () => {
       signal.removeEventListener('abort', aborted);
       resizeAbort.abort();
       await resizeTail;
-      await navigationRead;
+      navigationResolve?.({ canGoBack: null });
       const browser = children.find(({ label }) => label === 'Browser');
       if (browser) {
         // Chromium handles SIGINT as normal AttemptExit; SIGTERM takes the shorter SessionEnding
@@ -81,12 +83,12 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
   const aborted = () => failed.reject(new Error('Desktop start cancelled'));
   signal.addEventListener('abort', aborted, { once: true });
   if (signal.aborted) aborted();
-  function launch(label, bin, args, env, extraPipe = false) {
+  function launch(label, bin, args, env, stdio = 'ignore') {
     if (signal.aborted) throw new Error('Desktop start cancelled');
     const child = spawn(bin, args, {
       env,
       detached: true,
-      stdio: extraPipe ? ['ignore', 'ignore', 'ignore', 'pipe'] : 'ignore',
+      stdio,
     });
     const done = new Promise((resolve) => {
       child.once('error', () => {
@@ -110,7 +112,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
     const x = launch('Xvfb', '/usr/bin/Xvfb', [
       '-displayfd', '3', '-screen', '0', `${desktopMode}x24`, '-nolisten', 'tcp',
       '-auth', authFile, '-noreset',
-    ], process.env, true);
+    ], process.env, ['ignore', 'ignore', 'ignore', 'pipe']);
     const display = await Promise.race([
       failed.promise,
       delay(15_000, undefined, { ref: false }).then(() => { throw new Error('Desktop display timed out'); }),
@@ -133,7 +135,7 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
     // Chromium depends on the native bus lifetime; individual metadata query failures are optional.
     const bus = launch('Accessibility bus', '/usr/bin/dbus-daemon', [
       '--session', '--nofork', `--address=${env.DBUS_SESSION_BUS_ADDRESS}`, '--print-address=3',
-    ], env, true);
+    ], env, ['ignore', 'ignore', 'ignore', 'pipe']);
     try {
       await Promise.race([
         new Promise((resolve, reject) => {
@@ -155,15 +157,43 @@ export async function launchDesktop({ runtimeDir, profile, browserBin, url, sign
       `--force-device-scale-factor=${VNC_PIXEL_RATIO}`,
       '--start-maximized', '--window-size=1440,900', url,
     ], env);
+    let navigationReader;
     const getNavigation = () => {
       if (closing || signal.aborted || resizeAbort.signal.aborted) return Promise.resolve({ canGoBack: null });
-      navigationRead ??= execute('/usr/bin/python3', [navigationHelper, String(browser.pid)], {
-        env, timeout: 2_000, killSignal: 'SIGKILL', maxBuffer: 1024, signal: resizeAbort.signal,
-      }).then(({ stdout }) => {
-        const value = JSON.parse(stdout).canGoBack;
-        return { canGoBack: !closing && !signal.aborted && typeof value === 'boolean' ? value : null };
-      }).catch(() => ({ canGoBack: null })).finally(() => { navigationRead = undefined; });
-      return navigationRead;
+      if (!navigationRead) {
+        navigationRead = new Promise(resolve => { navigationResolve = resolve; })
+          .finally(() => { navigationRead = undefined; navigationResolve = undefined; });
+        navigationWait = Promise.race([navigationRead, delay(2_000, { canGoBack: null }, { ref: false })]);
+        if (!navigationReader) {
+          // Keep the AT-SPI client alive until AFTER Chrome exits (the shared close path above).
+          // Removing its last listener during Chromium's re-entrant key dispatch can crash Chrome.
+          navigationReader = launch('Native navigation reader', '/usr/bin/python3',
+            [navigationHelper, String(browser.pid)], env, ['pipe', 'pipe', 'ignore']);
+          let output = '';
+          navigationReader.stdout.on('data', chunk => {
+            output += chunk.toString('utf8');
+            if (output.length > 1024) {
+              output = '';
+              navigationReader.stdout.pause();
+              failed.reject(new Error('Native navigation response exceeded its limit'));
+              return;
+            }
+            if (!output.endsWith('\n')) return;
+            try {
+              const value = JSON.parse(output).canGoBack;
+              navigationResolve?.({ canGoBack: !closing && !signal.aborted && typeof value === 'boolean' ? value : null });
+            } catch { navigationResolve?.({ canGoBack: null }); }
+            output = '';
+          });
+          navigationReader.once('exit', () => navigationResolve?.({ canGoBack: null }));
+          navigationReader.once('error', () => navigationResolve?.({ canGoBack: null }));
+          navigationReader.stdin.on('error', () => failed.reject(new Error('Native navigation reader unavailable')));
+        }
+        navigationReader.stdin.write('read\n');
+      }
+      // A slow read is unknown, not a reason to disconnect/recreate the AT-SPI subscription.
+      // Keep the single in-flight request so repeated callers cannot queue unbounded work.
+      return navigationWait;
     };
     let activeMode = desktopMode;
     const modes = new Map();
