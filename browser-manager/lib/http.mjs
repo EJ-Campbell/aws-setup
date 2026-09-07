@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { WebSocketServer, createWebSocketStream } from 'ws';
-import { HttpError, instanceLabel, instanceName, requireOrigin, startUrl } from './auth.mjs';
+import { browserViewport, HttpError, instanceLabel, instanceName, requireOrigin, startUrl } from './auth.mjs';
 
 const json = (res, status, body) => {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
@@ -45,9 +45,13 @@ export function createApi({ manager, baseUrl, local = false }) {
     if (req.method !== 'POST') throw new HttpError(404, 'Unknown API route');
     if (!local) requireOrigin(req, baseUrl);
     const data = await readBody(req);
-    const action = /^\/api\/browsers\/([a-z0-9-]+)\/(start|stop|rename)$/.exec(path);
+    const action = /^\/api\/browsers\/([a-z0-9-]+)\/(start|stop|rename|viewport)$/.exec(path);
     if (path !== '/api/browsers' && !action) throw new HttpError(404, 'Unknown API route');
     const name = instanceName(action ? action[1] : data.name);
+    if (action?.[2] === 'viewport') {
+      browserViewport(data);
+      json(res, 200, { browser: await manager.setViewport(name, data) }); return true;
+    }
     if (action?.[2] === 'rename') {
       if (Object.keys(data).some(key => key !== 'label')) throw new HttpError(400, 'Unsupported rename field');
       const label = instanceLabel(data.label);

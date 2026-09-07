@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, open, realpath, rename, rm } from 'node:fs/promi
 import { isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { launchDesktop } from './desktop.mjs';
-import { instanceLabel } from './auth.mjs';
+import { browserViewport, DESKTOP_VIEWPORT, HttpError, instanceLabel } from './auth.mjs';
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const MAX_INSTANCES = 32;
@@ -66,6 +66,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
   const stateFile = join(stateDir, 'instances.json');
   const publicRow = (r) => ({
     name: r.name, label: r.label ?? r.name, url: `${origin.origin}/browsers/${r.name}`, state: r.state,
+    viewport: { ...(r.viewport ?? DESKTOP_VIEWPORT) },
     createdAt: r.createdAt, ...(r.error ? { error: r.error } : {}),
   });
   const enqueue = (operation) => {
@@ -130,6 +131,7 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
       if (closed) { await desktop.close(); throw new Error('Browser manager is closed'); }
       record.desktop = desktop;
       record.runtimeDir = runtimeDir;
+      record.viewport = { ...DESKTOP_VIEWPORT };
       record.state = 'running';
       void desktop.closed.then(() => enqueue(async () => {
         if (record.desktop !== desktop) return;
@@ -260,6 +262,21 @@ export function createInstanceManager({ stateDir, browserBin, baseUrl }, { launc
           }
           throw error;
         }
+        return publicRow(record);
+      });
+    },
+    setViewport(name, value) {
+      checkedName(name);
+      const viewport = browserViewport(value);
+      return enqueue(async () => {
+        assertOpen();
+        const record = records.get(name);
+        if (!record) throw new HttpError(404, 'Unknown browser');
+        if (record.state !== 'running' || !record.desktop) throw new HttpError(409, 'Start this browser before changing its display');
+        // Always apply an explicit request: it can recover a previous partially failed native resize.
+        await record.desktop.resize(viewport);
+        record.viewport = viewport;
+        // Display geometry is live state: viewer reconnects retain it; a new desktop starts wide.
         return publicRow(record);
       });
     },

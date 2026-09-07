@@ -43,8 +43,8 @@ for bm_path in "$bm_project" "$bm_config_dir" "$bm_node" "${bm_cloudflared:-/usr
 done
 [[ -f $bm_project/.next/BUILD_ID ]] || fail 'Build the application first: npm ci && npm run build.'
 [[ -f $bm_project/server.mjs && -x $bm_project/bin/browserctl.mjs ]] || fail 'The application or browserctl entry point is missing.'
-for bm_program in /usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/openbox; do
-  [[ -x $bm_program ]] || fail 'Install the desktop prerequisites: xvfb x11vnc openbox.'
+for bm_program in /usr/bin/Xvfb /usr/bin/x11vnc /usr/bin/openbox /usr/bin/xrandr /usr/bin/wmctrl /usr/bin/xprop /usr/bin/python3; do
+  [[ -x $bm_program ]] || fail 'Install the desktop prerequisites: xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3.'
 done
 
 # Parse data, never source it as shell code. Restrict EnvironmentFile to application

@@ -808,7 +808,7 @@ file path. A public URL cannot work until both this apply and the host installat
 ### 2. Install on the browser host
 
 Use Linux with Node.js 22.13+ and an installed, sandbox-capable Chromium/Chrome. Install the
-desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox`) and a current
+desktop prerequisites (`sudo apt-get install xvfb x11vnc openbox x11-xserver-utils x11-utils wmctrl python3`) and a current
 [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
 with `--token-file` support. Do not disable the Chrome sandbox to make installation pass.
 
@@ -861,10 +861,18 @@ and does not restart the browser. Older browsers initially display their stable 
 Use **Back** beside the desktop title to go back in the remote browser's history. The separate
 top-left arrow returns to the browser-manager dashboard instead. Back is disabled while disconnected.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
+Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
+the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
+480–900 pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
+the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
+viewers of that same browser also see the change; separate browser instances are unaffected.
+Tabs, page state, and logins remain in place: switching modes does not restart or reload the
+browser. The mode survives viewer reconnects, but a browser/service restart starts in Desktop
+mode. Phone changes the viewport, not the browser's user agent; it is not an iOS emulator.
 **Keyboard** opens explicit text/paste and special-key controls; desktop keyboards and pointer
-input also work directly. Each viewer scales independently instead of resizing other viewers'
-desktop. Fullscreen is available where the viewing browser supports it. This is a remote
-desktop, so the website inside it keeps the host desktop layout rather than becoming mobile.
+input also work directly. **Fit to screen** scales independently for each viewer; only the
+explicit **Phone** toggle resizes the shared desktop. Fullscreen is available where the
+viewing browser supports it.
 Disconnected viewers retry automatically while their tab is visible and focused, waiting
 1, 2, 4, 8, then at most 10 seconds between failed attempts. Returning to the tab reconnects
 immediately, including after phone suspension; background retries pause. A successful connection
@@ -893,7 +901,8 @@ A small native VNC regression checks that the real server accepts Unix-socket co
 and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
 `BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
 on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
-It checks desktop/phone layout, real VNC input, reconnect, and profile retention. Screenshots
+It checks desktop/phone layout, real VNC input, native phone-width reflow and restoration,
+phone-mode navigation, reconnect, and profile retention. Screenshots
 go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
 printed temporary directory and all test desktops are stopped. New E2E findings should get
 the smallest practical regression at the layer responsible, not a new proof framework.
