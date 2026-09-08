@@ -242,6 +242,14 @@ jumpbox. Nothing on a dev server can reach a jumpbox at all -- there is no key, 
 delegation of any kind. `pbox` launches the parallel boxes itself with a tag-scoped IAM
 grant (`parallel-box-launch.tf`); the forced-command key it used to carry is gone.
 
+The metal, Next.js, and temporary-compute roles use a shared SSM connectivity policy
+without account-wide Parameter Store reads. Application parameter access is explicit;
+the metal role retains its intended runner SSH key access, but cannot send commands to
+AMI builders. Next.js can read only its two Cloudflare connector credentials and the
+dev-only hop key through its setup policy, not the Cloudflare control-plane API token.
+The separate Cloudflare Access service-token workflow is unchanged. Runner credential
+retirement is a separate, canary-gated rollout; this dev-host change does not complete it.
+
 SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude's
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
 daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
