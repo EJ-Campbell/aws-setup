@@ -223,6 +223,17 @@ resource "aws_sns_topic_policy" "cost_alerts" {
         Principal = { Service = "budgets.amazonaws.com" }
         Action    = "SNS:Publish"
         Resource  = aws_sns_topic.cost_alerts.arn
+      },
+      {
+        Sid       = "AllowSecurityDeliveryHealthAlarms"
+        Effect    = "Allow"
+        Principal = { Service = "cloudwatch.amazonaws.com" }
+        Action    = "SNS:Publish"
+        Resource  = aws_sns_topic.cost_alerts.arn
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+          ArnLike      = { "aws:SourceArn" = "arn:aws:cloudwatch:us-west-1:${data.aws_caller_identity.current.account_id}:alarm:security-delivery-*" }
+        }
       }
     ]
   })

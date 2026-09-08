@@ -902,6 +902,108 @@ The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive sear
 searches to the repository, prefer `rg`, and move large scans/builds to ARM or the parallel
 box.
 
+## Security monitoring rollout
+
+`security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
+foundation in both accounts across all 17 currently enabled regions (34 account/region
+pairs). The foundation records organization-wide management events and object access
+to the Terraform-state and dev-script buckets, enables external Access Analyzer and
+base GuardDuty, and records traffic for the three active VPCs. It sets future EBS
+encryption and IMDSv2 defaults and blocks public snapshot sharing. It does **not**
+migrate existing disks, restrict the required public SSH/ET access, remove Cloudflare
+service-token access, or change the verified backup pipeline.
+
+Roll out the foundation first with `local.security_posture_enabled = false`.
+After delivery acceptance and a usage/cost review, enable that single bootstrap gate
+for Config, Security Hub CSPM foundational checks and Inspector EC2/Lambda scanning:
+main account `us-west-1`, `us-west-2`, `us-east-1`, and recovery account `us-west-1`,
+`us-east-1`. The final recovery vault is in `us-east-1` and must not be omitted.
+Config records global IAM once per account; EC2 instances, interfaces and volumes use
+daily recording to bound runner churn, so those posture checks can lag by 24 hours.
+Daily recording produces a configuration item only when the last recorded state has
+changed; it is not a daily charge for every unchanged resource. Other supported
+resources are recorded continuously. This uses the existing CSPM API, not the newer
+Security Hub Essentials bundle. See [Config recording](https://docs.aws.amazon.com/config/latest/developerguide/select-resources.html)
+and [CSPM pricing](https://aws.amazon.com/security-hub/cspm/pricing/).
+
+GuardDuty uses the pinned provider's `aws_cloudcontrolapi_resource` for the single
+`AWS::GuardDuty::Detector`, because its typed detector feature enum predates
+`AI_PROTECTION` and `AI_ANALYST`. This is still Terraform-managed, without a second
+CloudFormation stack or provisioning script. The initial request explicitly disables
+the current optional feature set, including AI and runtime-agent features; it never
+relies on missing fields meaning disabled. Refresh postconditions inspect live feature
+properties and fail on unexpected enrollment. Regional handler support must still be
+verified during deployment: schema validation is not proof that each regional service
+accepts every feature. Do not silently omit an unsupported feature or accept an
+unreviewed provider upgrade. See [CreateDetector defaults](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_CreateDetector.html)
+and [Cloud Control resource](https://registry.terraform.io/providers/hashicorp/aws/5.100.0/docs/resources/cloudcontrolapi_resource).
+The pinned generic resource has no import handler. Preserve versioned Terraform state;
+if its state entry is lost, recover the reviewed state version rather than creating a
+second detector. A failed live-property postcondition requires an administrator to
+diagnose and review a repair or future typed-resource migration; it does not perform
+automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
+
+The foundation expands to 360 managed Terraform resource instances plus one existing
+SNS topic-policy update; the posture gate adds 45 more. These are source counts, not
+a substitute for the fresh plan. Many are free control settings or permissions, not
+individually billed workloads. No existing compute, volume or backup resource should
+be replaced by this rollout.
+
+Security findings and high-risk IAM, network, KMS and backup changes forward to the
+existing confirmed `cost-alerts` SNS topic. Normal processing/checkpoint cleanup does
+not page the owner; deletion attempts against legacy/final backup history do. Every
+regional forwarder has an encrypted 14-day dead-letter queue. A five-minute read-only
+watchdog checks failed deliveries and queued events in all 34 pairs, with independent
+missing-heartbeat and Lambda-error alarms. It never consumes or deletes queued events.
+The S3 audit archive has 90-day **governance** retention and one-year expiry; privileged
+administrators can bypass governance, unlike the recovery vault's compliance lock.
+Config/Session Manager records use a separate versioned bucket. Only standard SSM shell
+sessions are transcribed; SSH, Eternal Terminal and SSM port forwarding are not.
+
+An apply is not delivery proof. Require a fresh empty plan, then read back trail logging
+status and recent digest/log objects, all three flow-log delivery statuses/objects,
+regional detector/feature/analyzer configuration, event targets and DLQ policies,
+three clean watchdog executions, and five healthy delivery alarms. Confirm SNS metrics
+and the actual email for a known event. A GuardDuty sample finding is a **synthetic
+service write** and sends a real notification; use it only as an explicitly authorized
+acceptance canary, not as a read-only check. Without an observed matching event, record
+the end-to-end alert path as unproven. A later posture rollout also requires Config
+recording/delivery, enabled CSPM standards and Inspector coverage checks; managed/agentless
+scan coverage is not established merely by enabling the service.
+
+### Incremental monitoring cost
+
+September 8, 2026 rate checks put the watchdog's CloudWatch component around **$8.06 per
+30-day month**, not the whole monitoring bill: 622,080 metric queries (including the
+higher São Paulo rate), four custom metrics and five standard alarms. The trail's
+rotating customer key adds about $1/month. The first management-event trail copy has
+no CloudTrail event charge; selected S3 data events cost $0.10 per 100,000 events.
+Lambda, SQS, SNS, KMS requests, S3 storage/requests and flow-log delivery are additional.
+See [CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/),
+[CloudTrail pricing](https://aws.amazon.com/cloudtrail/pricing/) and
+[KMS pricing](https://aws.amazon.com/kms/pricing/).
+
+Usage-based rates in the primary region include GuardDuty management analysis at
+$4.40/million events and flow/DNS analysis at $1.10/GB, plus flow-log delivery to S3 at
+$0.335/GB. The deferred posture stage adds Config at $0.003/continuous or $0.012/daily
+configuration item and CSPM at $0.001/security check. Security Hub service-linked
+Config rule evaluations are not separately charged. Recent measured EC2 usage
+(777.46 instance-hours over September 1–7, both accounts) and ten covered functions
+including the new watchdog imply roughly **$10–13/month for Inspector** if that usage
+continues; agentless scanning can also create billable temporary EBS snapshots.
+See [GuardDuty](https://aws.amazon.com/guardduty/pricing/),
+[Config](https://aws.amazon.com/config/pricing/), [CSPM](https://aws.amazon.com/security-hub/cspm/pricing/)
+and [Inspector pricing](https://aws.amazon.com/inspector/pricing/).
+
+For scale only, an assumed month with one million GuardDuty events, 5 GB analyzed logs,
+5 GB flow-log delivery, 1,000 daily and 2,000 continuous Config items, and 10,000 CSPM
+checks would be about **$59–62** including the above fixed components and projected
+Inspector, before storage/API charges. Those event/configuration volumes are examples,
+not measured forecasts or a spending cap. Review Cost Explorer usage types and GuardDuty
+usage statistics after the first complete week; initial Config inventory, rapid runner
+churn or unusually noisy network activity can raise the bill. The existing account-wide
+cost alerts remain useful, but do not enforce a monitoring-only budget limit.
+
 ## Private browser manager
 
 `browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
@@ -1242,7 +1344,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Kids' environment | `nextjs-dev.tf`, `nextjs-user-data.tf`, `cloudflare.tf` |
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
-| Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
