@@ -1,0 +1,26 @@
+name: Runner Release Freshness
+
+# A public release check, never a PR execution or infrastructure deployment.
+on:
+  schedule:
+    - cron: '17 9 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  runner-release-freshness:
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main' && github.repository == 'ejc3/aws'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Freshness checker regression tests (offline)
+        run: python3 -S -B scripts/test-runner-release-freshness.py
+
+      - name: Check the pinned runner against public stable releases
+        run: python3 -S -B scripts/check-runner-release-freshness.py
