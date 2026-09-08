@@ -736,6 +736,9 @@ has separate deployment gates; merging source is not evidence that a gate is liv
    The runner release and asset checksums are pinned and automatic updates disabled;
    review each release bump before GitHub's 30-day update deadline (immediately for
    required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
+   A daily main-only `Runner Release Freshness` workflow fails when a newer stable
+   version exists; it never upgrades or deploys automatically. Keep its scheduled
+   runs and GitHub failure notifications enabled.
 4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
    the remaining controller EC2 launch resources after all launched resources carry
    the required tags. The old CI authority is retired separately, only after the
