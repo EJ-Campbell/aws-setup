@@ -1100,6 +1100,16 @@ the end-to-end alert path as unproven. A later posture rollout also requires Con
 recording/delivery, enabled CSPM standards and Inspector coverage checks; managed/agentless
 scan coverage is not established merely by enabling the service.
 
+September 8, 2026 deployment receipt: infrastructure revision `80bbd3a` was applied and
+a fresh full Terraform plan reported no changes. Readback verified 34 base-only GuardDuty
+detectors, 70 routes (68 regional forwarding targets, the central SNS target and the
+watchdog schedule target), three clean watchdog executions and five healthy delivery
+alarms. The RSA-2048 signature of one initial main-account `us-west-1` CloudTrail digest
+was verified; it referenced zero log files, and no event-log bodies were read. Event-log
+hashes/full-chain integrity, actual email receipt, an SSM session transcript and a
+flow-log object from the quiet `us-west-2` VPC remain unproven; this is not yet complete
+end-to-end delivery acceptance.
+
 ### Incremental monitoring cost
 
 September 8, 2026 rate checks put the watchdog's CloudWatch component around **$8.06 per
