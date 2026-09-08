@@ -573,6 +573,20 @@ its termination before considering the bump accepted. Release rollout is progres
 also confirm the selected version is supported for `ejc3/fcvm`. Never bypass a checksum
 or re-enable automatic updates to work around an unreviewed wrapper change.
 
+The `Runner Release Freshness` workflow checks this source pin daily at 09:17 UTC,
+only on `ejc3/aws` main, using a GitHub-hosted runner and the anonymous public release
+API. Its checkout token is read-only and not persisted; it has no repository secrets,
+AWS credentials, OIDC, PR trigger, or auto-upgrade/deploy step. A newer stable release
+immediately fails the run with the first missed release's 30-day deadline and the
+update procedure; malformed/unavailable/truncated history also fails visibly.
+Failures use normal GitHub Actions notifications, whose delivery depends on the
+operator's notification settings. This is a reminder, not guaranteed paging or a
+substitute for critical-release monitoring: [scheduled runs can be delayed or dropped,
+and public-repository inactivity can disable schedules](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Check that the scheduled run stays enabled and recent. The check only reads git/public
+releases, not deployed SSM, so a committed but unapplied pin still needs the deployment
+and trusted-job acceptance above.
+
 This publication does not remove the old PAT permission: a job host can still read that
 PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
 own-credential deletion, single-job exit, and EC2 termination, then verify old boots are
