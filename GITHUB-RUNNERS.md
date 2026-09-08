@@ -156,14 +156,14 @@ it is suppressed while GitHub is unreachable, where `online` is 0 by constructio
 `runner-pat-unusable` covers the gap.
 
 **Registration.** The instance's user_data lives in SSM (`/github-runner/user-data`,
-Advanced tier, base64 — too big for Lambda's 4 KB env limit). On boot it sets up the box
-(btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads the PAT from SSM
-(`/github-runner/pat`, decrypted), exchanges it for a short-lived **registration token** via
-`POST /repos/ejc3/fcvm/actions/runners/registration-token`, and runs
+Advanced tier, base64+gzip — too big for Lambda's 4 KB env limit). On boot it sets up the box
+(btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads only its controller-
+brokered **registration token** from `/github-runner/bootstrap/<instance-id>`, and runs
 `config.sh --url https://github.com/ejc3/fcvm --token <reg> --name runner-<instance-id>
---labels self-hosted,Linux,<ARM64|X64> --unattended --replace`. The PAT itself never leaves
-AWS; what touches `config.sh` is the ephemeral registration token derived from it, and
-xtrace is switched off before either is read so neither lands in the cloud-init log.
+--labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate`. The controller
+uses the PAT to call GitHub's registration-token endpoint; bootstrap has no PAT fallback.
+Xtrace is switched off before reading the short-lived token. Older boots may still be
+running the prior PAT-reading script until the separately verified drain.
 
 After `config.sh`, bootstrap reads the identity GitHub assigned from
 `/opt/actions-runner/.runner` (camelCase keys: `agentName` must equal `runner-<instance-id>`
@@ -173,7 +173,9 @@ table `github-runner-registration`, keyed by the instance ARN, with `State=regis
 `attribute_not_exists(InstanceArn)`. The runner service starts only after that write is
 accepted, or after a consistent read following a lost answer returns that exact registered
 item. If the cleanup Lambda got there first and the row says `State=reaping`, bootstrap
-deregisters the runner from GitHub and does not start the service. Registration and reaping
+does not start the service and requests termination; controller cleanup owns GitHub
+deregistration. Even after a successful claim, the token parameter must be deleted before
+service startup. Registration and reaping
 compete for one conditional create, so exactly one of them wins.
 
 The launcher tags every new instance `RunnerRegistrationProtocol=ddb-v1`, which says which
@@ -481,11 +483,12 @@ and the webhook Lambda stays the single authority on the cap.
 
 ## Controller-first credential migration
 
-The controller can consume both the current PAT-reading user data and the next
-instance-bound bootstrap. This stage deliberately leaves the existing user-data
-parameter, runner PAT grant, broad runner SSM attachment, and controller launch
-resource permissions unchanged. It is preparation, **not completion of credential
-retirement**. The independent `iam:PassRole` escalation is closed now: both controller
+The controller can consume both legacy PAT-reading user data and the instance-bound
+bootstrap now published by this source. Publication follows verified controller
+deployment; it is not bundled with runner PAT-grant retirement. The runner PAT grant,
+broad runner SSM attachment, and controller EC2 resource permissions deliberately remain
+until real CI acceptance and old-boot drain. This is **not completion of credential
+retirement**. The independent `iam:PassRole` escalation is closed: both controller
 Lambdas may pass only `github-runner-instance-role`, only to EC2. Explicit denies
 protect against another policy allowing any other role or service. The existing
 launcher already uses exactly `github-runner-profile`, so this does not change jobs.
@@ -527,13 +530,61 @@ retirement of the old runner PAT/SSM grant and broad controller launch permissio
 Keep a fresh reviewed plan between those gates. A token broker cannot be proved by an
 IAM-only fixture check or by an additive apply that still serves the old script.
 
+### Instance-bound, single-job bootstrap
+
+New user data fetches only `/github-runner/bootstrap/<its-instance-id>`, with no PAT
+fallback. It admits credential polling for at most three minutes and 36 attempts;
+each AWS command has a twelve-second timeout (plus at most two seconds to kill a stuck
+process), so an in-flight request may finish after the polling admission deadline.
+It preserves the existing NVMe/IPv6 gates, validates GitHub's exact `.runner` identity,
+and conditionally claims the same instance-ARN DynamoDB row before starting any service.
+
+Bootstrap downloads runner `2.337.0` and verifies its architecture-specific SHA-256
+against the [official release asset digests](https://github.com/actions/runner/releases/tag/v2.337.0)
+before extraction. A failed download or checksum never reaches registration.
+Registration uses `--ephemeral --disableupdate`, so automatic updates cannot replace the
+verified wrapper. The credential is unset from the shell and its SSM
+parameter must be successfully deleted before service installation/start; an uncertain
+delete never starts a job. The service drop-in disables systemd restarts, bounds unknown
+GitHub service-wrapper failures, and requests poweroff on service exit. The controller's
+instance-initiated shutdown setting turns that into termination. Any failure in the
+registration tail attempts bounded credential deletion and requests poweroff; earlier
+NVMe/IPv6/download failures retain the controller's existing startup/lease reaping.
+Controller cleanup remains the fallback if a shutdown request fails.
+
+Verified against released runner `v2.337.0`, source commit
+[`397b032`](https://github.com/actions/runner/tree/397b032cbf865e9c3ddfab89d533ec19325e1273):
+[`Runner.cs`](https://github.com/actions/runner/blob/397b032cbf865e9c3ddfab89d533ec19325e1273/src/Runner.Listener/Runner.cs#L523)
+returns success after an ephemeral job, and
+[`RunnerService.js`](https://github.com/actions/runner/blob/397b032cbf865e9c3ddfab89d533ec19325e1273/src/Misc/layoutbin/RunnerService.js#L74)
+stops on that exit. The environment setting stops unknown/signal exits after one
+failure; known retry/update exits remain capped at ten consecutive attempts. The
+standard `runsvc.sh` waits for that wrapper, allowing systemd's post-stop hook to run.
+
+This is a reviewed update cadence, not a permanent version freeze. GitHub's
+[runner update policy](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#runner-software-updates-on-self-hosted-runners)
+requires an upgrade within 30 days of any new release (including patch releases),
+and can stop assigning jobs immediately for a required critical security update.
+Monitor `actions/runner` releases. Before that deadline, update `RUNNER_VERSION` and
+both official Linux asset digests together, verify the downloaded packages, rerun the
+released wrapper's success/known-retry/unknown/signal exit tests and the offline bootstrap
+suite, then review and Terraform-publish the new user data. Verify one trusted job and
+its termination before considering the bump accepted. Release rollout is progressive;
+also confirm the selected version is supported for `ejc3/fcvm`. Never bypass a checksum
+or re-enable automatic updates to work around an unreviewed wrapper change.
+
+This publication does not remove the old PAT permission: a job host can still read that
+PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
+own-credential deletion, single-job exit, and EC2 termination, then verify old boots are
+drained before removing the legacy grants. Retest the non-secret IAM canaries afterward.
+
 ## What crosses the boundary (secrets inventory)
 
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
 |--|--|--|--|--|
 | **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` until the separate runner cutoff | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
-| **Registration token** | minted at boot, never persisted | GitHub-issued, ephemeral | the booting runner only | GitHub API, single use, ~1h TTL |
+| **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
