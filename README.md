@@ -1070,6 +1070,11 @@ sampled every ten minutes with a fifteen-minute lookback, preserving the approve
 CloudWatch retrieval budget. Central delivery metrics are still sampled every five
 minutes. Independent missing-heartbeat and Lambda-error alarms cover observer failure.
 It never consumes or deletes queued events.
+Both the regional audit rule and the central notification rule use
+`ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`: forwarding to a custom bus does
+not provide a documented exemption from the read-only management-event rule state.
+Their event patterns stay unchanged, and the watchdog checks both states. See
+[AWS read-only management-event routing](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-service-event-cloudtrail-management.html).
 The S3 audit archive has 90-day **governance** retention and one-year expiry; privileged
 administrators can bypass governance, unlike the recovery vault's compliance lock.
 Config/Session Manager records use a separate versioned bucket. Only standard SSM shell

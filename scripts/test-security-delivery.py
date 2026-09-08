@@ -156,7 +156,7 @@ class Events:
     def describe_rule(self, **kwargs):
         self.factory.rule_reads.append((self.account, self.region, kwargs))
         name, bus = kwargs["Name"], kwargs.get("EventBusName")
-        response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name == "security-forward-audit" else "ENABLED",
+        response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name in ("security-forward-audit", "security-alerts-notify") else "ENABLED",
                     "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
         if name == "security-delivery-health":
             response["ScheduleExpression"] = "rate(5 minutes)"
@@ -321,6 +321,18 @@ class DeliveryTests(unittest.TestCase):
                 self.factory.rules = {(MAIN, "us-east-1", rule): lambda response: dict(response, State=invalid)}
                 result = self.inspect()
                 self.assertGreaterEqual(result["errors"], 1)
+                self.assertEqual(result["failures"], 0)
+                self.assertEqual(result["depth"], 0)
+
+    def test_central_notifications_require_read_only_management_state(self):
+        # Forwarding CloudTrail onto a custom bus is not a documented exemption
+        # from the read-only management-event state requirement on its rule.
+        for state in ("ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS", "ENABLED", "DISABLED"):
+            with self.subTest(state=state):
+                self.factory.rules = {(MAIN, "us-west-1", "security-alerts-notify"):
+                    lambda response: dict(response, State=state)}
+                result = self.inspect(region="us-west-1")
+                self.assertEqual(result["errors"] == 0, state == "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
                 self.assertEqual(result["failures"], 0)
                 self.assertEqual(result["depth"], 0)
 
@@ -699,6 +711,12 @@ class TerraformSafetyTests(unittest.TestCase):
             self.assertIn('"security-forward-findings", "security-forward-audit"', policy)
             self.assertNotIn(":rule/security-forward-*", policy)
 
+    def test_central_rule_accepts_forwarded_management_reads_without_broadening_pattern(self):
+        rule = block(TERRAFORM, "aws_cloudwatch_event_rule", "security_notify")
+        self.assertRegex(rule, r'\bstate\s*=\s*"ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"')
+        self.assertRegex(rule, r'event_pattern\s*=\s*jsonencode\(\{ account = local\.security_account_ids \}\)')
+        self.assertNotIn("is_enabled", rule)
+
     @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free semantic fixtures run above")
     def test_actual_shipped_event_patterns_match_fixtures_and_default_size_quota(self):
         start = re.search(r"security_event_patterns\s*=\s*\{", REGIONAL).end() - 1
@@ -735,6 +753,10 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(json.loads(result.stdout.strip())), {
             "security-forward-findings": "ENABLED", "security-forward-audit": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"})
+        central = block(TERRAFORM, "aws_cloudwatch_event_rule", "security_notify")
+        central_state = re.search(r'^\s*state\s*=\s*(.+)$', central, re.M)
+        self.assertIsNotNone(central_state)
+        self.assertEqual(self.native_json_value(central_state.group(1)), "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
 
     def test_posture_covers_both_source_regions_and_final_recovery_region(self):
         expected = {"security_main_us_west_1", "security_main_us_west_2",
