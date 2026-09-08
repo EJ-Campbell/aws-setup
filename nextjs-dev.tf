@@ -69,7 +69,21 @@ resource "aws_iam_role" "nextjs_dev" {
 # piece that was missing, so it could never register.
 resource "aws_iam_role_policy_attachment" "nextjs_dev_ssm" {
   role       = aws_iam_role.nextjs_dev.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = aws_iam_policy.ssm_managed_instance.arn
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Read metadata only, never another copy of either secret payload in state.
+# cloudflare-tunnel-* also matches Terraform's control-plane API token.
+data "aws_secretsmanager_secret" "nextjs_connector" {
+  for_each = toset([
+    "cloudflare-tunnel-credentials",
+    "cloudflare-dolphin-tunnel-credentials",
+  ])
+  name = each.value
 }
 
 resource "aws_iam_instance_profile" "nextjs_dev" {
@@ -90,16 +104,14 @@ resource "aws_iam_role_policy" "nextjs_dev" {
         Resource = "${aws_s3_bucket.dev_scripts.arn}/user-data/nextjs.sh"
       },
       {
-        # Tunnel credentials plus the hop key, named narrowly rather than by a broad prefix.
+        # Connector credentials and the dev-only hop key. The separate Access
+        # service-token resources and their consumers are deliberately unchanged.
         Sid    = "ReadOwnSecrets"
         Effect = "Allow"
         Action = "secretsmanager:GetSecretValue"
         Resource = [
-          "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-tunnel-*",
-          # dolphin-labs.dev runs a separate tunnel, so it has separate credentials. This
-          # does NOT match the cloudflare-tunnel-* prefix above, and omitting it fails the
-          # box at boot rather than at first publish.
-          "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:cloudflare-dolphin-tunnel-*",
+          data.aws_secretsmanager_secret.nextjs_connector["cloudflare-tunnel-credentials"].arn,
+          data.aws_secretsmanager_secret.nextjs_connector["cloudflare-dolphin-tunnel-credentials"].arn,
           # Hop key for reaching the other dev servers. Grants nothing beyond them: its
           # public half is never installed on the jumpbox. See dev-hop-key.tf.
           aws_secretsmanager_secret.dev_hop.arn,
