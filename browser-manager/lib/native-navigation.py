@@ -12,11 +12,7 @@ NATIVE_CONTAINERS = {
 }
 
 
-def navigation(pid):
-    session = dbus.SessionBus()
-    launcher = session.get_object('org.a11y.Bus', '/org/a11y/bus')
-    address = launcher.GetAddress(dbus_interface='org.a11y.Bus', timeout=.3)
-    bus = dbus.bus.BusConnection(str(address))
+def navigation(pid, bus, subscriptions):
     daemon = bus.get_object('org.freedesktop.DBus', '/org/freedesktop/DBus')
     root = bus.get_object('org.a11y.atspi.Registry', '/org/a11y/atspi/accessible/root')
     applications = []
@@ -28,10 +24,13 @@ def navigation(pid):
         return None
     name, path = applications[0]
     registry = bus.get_object('org.a11y.atspi.Registry', '/org/a11y/atspi/registry')
-    # Chromium defers active-window accessibility state until a reader subscribes. This read-only
-    # subscription is scoped to this application and disappears when this short-lived client exits.
-    registry.RegisterEvent('window:activate', dbus.Array([], signature='s'), name,
-                           dbus_interface='org.a11y.atspi.Registry', timeout=.3)
+    # Chromium defers active-window state until a reader subscribes. Keep this connection alive:
+    # last-client teardown can erase Chromium's key-listener iterator during a re-entrant key event.
+    if name not in subscriptions:
+        # RegisterEvent is not idempotent; a timeout may still have installed the subscription.
+        subscriptions.add(name)
+        registry.RegisterEvent('window:activate', dbus.Array([], signature='s'), name,
+                               dbus_interface='org.a11y.atspi.Registry', timeout=.3)
     app = bus.get_object(name, path)
     frames = []
     for child, subpath in app.GetChildren(dbus_interface=ACCESSIBLE, timeout=.3):
@@ -63,9 +62,31 @@ def navigation(pid):
     return buttons[0] if not queue and len(buttons) == 1 else None
 
 
+class NavigationReader:
+    """Own one bus connection until the parent stops it after Chromium exits."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.session = None
+        self.bus = None
+        self.subscriptions = set()
+
+    def read(self):
+        try:
+            if self.session is None:
+                self.session = dbus.SessionBus()
+            if self.bus is None:
+                launcher = self.session.get_object('org.a11y.Bus', '/org/a11y/bus')
+                address = launcher.GetAddress(dbus_interface='org.a11y.Bus', timeout=.3)
+                self.bus = dbus.bus.BusConnection(str(address))
+            return navigation(self.pid, self.bus, self.subscriptions)
+        except Exception:
+            # Ordinary metadata failures must never close or replace a subscribed connection.
+            return None
+
+
 if __name__ == '__main__':
-    try:
-        result = navigation(int(sys.argv[1]))
-    except Exception:
-        result = None
-    print(json.dumps({'canGoBack': result}))
+    reader = NavigationReader(int(sys.argv[1]))
+    for request in sys.stdin:
+        result = reader.read() if request == 'read\n' else None
+        print(json.dumps({'canGoBack': result}), flush=True)

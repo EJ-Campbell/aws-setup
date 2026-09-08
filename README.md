@@ -198,7 +198,7 @@ historical and must not be reused. Terraform creates its VNC password.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1`, persistent Spot `c7gd.metal` | 400 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 50 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.medium` | 100 GB encrypted EBS root, protected by AWS Backup | Always-on kids' development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` | `us-west-2d`, one-time Spot, normally 96 or 192 vCPU | Protected 100 GB EBS each at `/mnt/work`; roots are disposable | Temporary fan-out compute, two independent boxes so two jobs can run at once. Each terminates after 30 idle minutes; `pbox` recreates them. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. Four healthy runners per architecture maximum; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
@@ -755,11 +755,10 @@ Terraform.
   volume, and the `jumpbox-2` root with daily, weekly, and monthly retention.
 - The parallel box's persistent `/mnt/work` volume is protected from Terraform destroy but
   is **not backed up**. `prevent_destroy` is not a backup; keep important results elsewhere.
-- The primary backup vault uses governance Vault Lock.
-- Existing weekly/monthly recovery points copy to the original `us-east-1` vault.
-  Its AWS-managed encryption key cannot support the old direct staging copy path;
-  September's five cross-account copies failed. The new recovery pipeline below
-  repairs that path without replacing live disks or removing existing backups.
+- The legacy primary vault keeps its governance Vault Lock. Existing primary and
+  original `us-east-1` history retain their lifecycles; neither receives new scheduled
+  fleet copies. The active recovery pipeline below replaces the old staging-copy
+  path without replacing live disks or deleting that existing history.
 - Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
   `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
   through SNS/email.
@@ -767,31 +766,136 @@ Terraform.
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
 
-`backup-security.tf` adds `ejc3-backup-dr-cmk` in `us-east-1` and the
-`ejc3-backup-recovery` logically air-gapped vault in `dev-staging`. The hourly
-`fleet-backup-recovery` controller copies only the five configured fleet volumes:
-local recovery point → customer-key-encrypted DR copy → AWS-owned-key-encrypted
-staging copy. Job events accelerate the hourly reconciliation. Initial copies
-retain 30 days; annual scheduled copies retain 365 days. The new staging vault is
-immediately compliance-locked. Ordinary vault locks and existing backup schedules
-remain unchanged during this additive stage.
+The active backup pipeline keeps **one new long-term history**, in the recovery account's
+`ejc3-backup-recovery` logically air-gapped vault in **us-east-1**, separate from the
+source account and region. It is immediately compliance-locked and uses an AWS-owned
+key. The already-created empty west1 air-gapped vault remains untouched and receives
+no new copies. Empty vaults have no backup-storage charge.
 
-Before switching the two existing plans to the new DR destination, require recent
-COMPLETED points for all five exact source ARNs in local, new DR, and staging vaults;
-verify the DR key ARN and zero recovery gaps. Preserve all old points and the
-unmanaged `fcvm-backups` vault, including its indefinitely retained snapshots.
-Ordinary compliance locks are a separate reviewed apply with a three-day grace.
-Do not describe this as absolute protection against AWS account closure.
+`fleet-backup-recovery` copies only the five configured fleet volumes. Unencrypted
+ARM, x86 and jumpbox-home snapshots go directly to the final vault. The aws/ebs-encrypted
+Next.js and jumpbox-2 roots first copy to `ejc3-backup-dr-cmk` in the main account's
+us-east-1 region, then across accounts within that region. Live disks are not migrated.
+Final retention uses the original UTC backup date: the first of a month gets 365 days,
+other Sundays 30 days, and other days 7 days. This does not depend on temporary-copy TTLs.
 
-The staging plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
+Daily backup plans write to the unlocked `ejc3-backup-processing` vault
+with **no expiration while a copy is pending**. Only confirmed final copies permit
+source cleanup. The controller keeps the latest CMK checkpoint for each encrypted root
+until a verified successor exists: deleting every checkpoint would force expensive
+full transfers again. Older checkpoints are removed only with complete copy lineage.
+Recovery-point deletion is granted only by those two temporary-vault policies. AWS
+Backup also forwards the underlying EC2 deletion using the controller's credentials;
+that permission requires Backup in `aws:CalledVia`, our snapshot owner and pipeline
+tags. Direct EC2 deletion remains explicitly denied. The two untagged bootstrap CMK
+seeds were removed after verification; their exact-snapshot exceptions are disabled
+by the completed cutover. The controller cannot
+delete legacy history or final recovery points. Copy failures retain pending
+data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
+
+The September 8, 2026 cutover followed five successful detached-volume restore tests
+(including validation and test-volume removal), verified final-copy lineage for all
+five new captures, and actual removal of all seven disposable processing/bootstrap
+snapshots. Both current CMK checkpoints, ten final points, and all 97 legacy points
+and their lifecycles were preserved. The two fleet selections now use the daily
+processing plans; the old plans remain for history but no longer select fleet volumes.
+Both rollout gates stay true. Monthly restore tests remain scheduled for the eighth
+at 12:00 UTC; the past one-off definitions are retained only for audit.
+
+For a genuinely new deployment, cold bootstrap must start with both cleanup and
+selection-cutover gates false. Do not reset the gates on this deployed pipeline. Bootstrap
+leaves the existing daily/weekly/monthly plans and their selections unchanged; it seeds
+from their latest recovery points and has no recovery-point deletion permission.
+Roll out with fresh full Terraform plans in this order:
+
+1. Apply the new destination/controller with both gates false. Require recent
+   COMPLETED final points for all five exact source ARNs, both required CMK checkpoints
+   encrypted with `alias/fleet-backup-dr`, and completed job-to-point lineage.
+2. Set `backup_initial_capture_at` in `backup-restore-canary.tf` to a future UTC minute
+   and apply the one-off processing capture. It backs up the same five volumes into
+   the processing vault with no expiration and the required provenance tag, without
+   moving either existing backup selection. Keep both cleanup and cutover gates false.
+3. Set `backup_initial_restore_at` in `backup-restore-canary.tf` to a UTC minute at
+   least 30 minutes in the future. Once step 1 has verified all five initial final
+   copies, steps 2 and 3 may be applied together and run in parallel: restoring from
+   the final vault does not depend on the new processing capture finishing. These
+   are date/year crons, not recurring tests. The restore plan selects the latest
+   completed point per volume, which may be a newer copy arriving during capture;
+   record the actual recovery-point ARNs used by its jobs and verify their copy lineage.
+4. Before enabling any recovery-point cleanup, require both independent checks:
+   the five new processing captures have exact COMPLETED final copies and both CMK
+   successor checkpoints; and all five initial restore jobs are COMPLETED, validation
+   SUCCESSFUL, with test resources successfully deleted. Metadata verification does
+   not prove guest data or boot integrity. Inspect copy/restore logs; do not infer
+   success from Terraform apply.
+   If a restore attempt fails, repair the evidenced cause, retain its job history,
+   and set a new future `backup_initial_restore_at` for the same one-off plan.
+   The controller checks a current-attempt job for every configured source volume.
+   Rescheduling does not clear a preceding failure: the new job must complete,
+   validate, and delete its test resource first. Missing or unfinished current jobs
+   alarm after the one-hour start window plus one hour of propagation grace.
+   Older jobs still receive validation/cleanup, and their failures remain in AWS
+   job history and logs. Require all five jobs from the new attempt to pass.
+5. Set only `backup_recovery_cleanup_enabled=true` and apply the two temporary-vault
+   cleanup grants and controller update. Existing selections must remain unchanged.
+   Verify the five processing captures and superseded CMK checkpoints actually disappear,
+   not merely that deletion returned HTTP 200; keep each newest checkpoint. A permission
+   failure must retain data, not lead to a broad identity-policy deletion grant.
+   AWS can return HTTP 200 yet leave a point `EXPIRED` when its forwarded EC2 call
+   fails authorization. Inspect the recovery point's status message and CloudTrail;
+   after repair, the controller retries only expired points with the same complete
+   final-copy lineage (and a strictly newer verified successor for CMK checkpoints).
+   An expired processing retry also checks its provenance tag. Errors remain visible
+   until the point disappears. Verify underlying snapshot absence as well.
+6. Only after that cleanup acceptance succeeds, set `backup_recovery_cutover_enabled=true`
+   and apply the two changed selections plus the controller's acceptance handoff.
+   Their preconditions reject cutover while cleanup is disabled; replacement creates
+   the new selection before removing the old one. This verified handoff retires the
+   one-off health check so eventual AWS job-history expiration cannot create a false
+   alarm; monthly per-volume restore checks and historical test-volume cleanup continue.
+   Verify an EBS `copySnapshot` event reports incremental copying on a
+   subsequent cycle before claiming measured incremental-transfer savings. Keep the
+   past one-off capture and restore definitions for audit; their explicit years prevent
+   recurring test jobs.
+
+Main-account us-east-1 EBS `copySnapshot` completion events are retained for seven days
+in CloudWatch Logs `/aws/events/fleet-backup-copy-snapshots`. Correlate each event's
+source and destination snapshot IDs with Backup copy-job lineage before using its
+`detail.incremental` value as evidence for the CMK checkpoint leg. This log does not
+recover old events or prove the service-owned final air-gapped storage leg.
+
+Existing recovery points keep their original lifecycles and age out normally; switching
+selections does not shorten them. Never bulk-delete old history. Preserve the unmanaged
+`fcvm-backups` vault's two indefinitely retained snapshots. Do not add compliance locks
+to the temporary processing/checkpoint vaults. Final-vault immutability is not absolute
+protection against AWS account closure.
+
+The recovery plan `fleet_monthly_detached_ebs` runs on the eighth at 12:00 UTC. It
 restores encrypted, detached test volumes only: no instance launch, volume attach,
-or administrator role. Validation checks metadata/isolation, not filesystem contents
-or bootability. AWS Backup cleans up after the two-hour validation window; the
-controller checks expected per-volume jobs and backs up cleanup after four hours.
+or administrator role. Both initial and monthly tests explicitly use the recovery
+account's us-east-1 `alias/aws/ebs` key: copied restore metadata can still reference
+the original source-account key. This changes only test volumes, not live disks or
+the final vault's AWS-owned encryption. Validation checks metadata/isolation, not
+filesystem contents or bootability. The restore role also needs `kms:ReEncryptFrom`
+on the final vault's exact service-owned source key, through EC2 in the recovery
+region. Without it, EC2 initially returns a volume ID but the volume disappears
+when asynchronous key authorization fails. The pinned provider does not expose
+the air-gapped key, and its standard-vault data source rejects this vault type.
+`backup_recovery_source_key_arn` therefore pins the exact public key ARN verified
+with `DescribeBackupVault`; the vault has `prevent_destroy`. Recheck the pin against
+live vault metadata after any deliberate vault recovery/replacement. It does not
+grant access to every key in other accounts.
+AWS Backup starts cleanup after successful validation (or the two-hour validation
+window); the controller checks expected per-volume jobs and backs up cleanup after four hours.
 Require a real successful restore/validation/cleanup cycle before claiming recovery
-testing is proven. Five tests cost about $9 plus roughly $0.11 per hour retaining
-all restored volumes; the new air-gapped storage starts around $44/month for the
-current written snapshot baseline, plus retained changed blocks and API usage.
+testing is proven. Five east1 tests cost $7.50 plus roughly $0.094 per hour retaining
+all restored volumes. At September 7 pricing and measured written snapshot sizes,
+east1 air-gapped storage starts around $39.85/month (693 GiB at $0.0575), plus roughly
+$5.78 for the two rolling CMK checkpoints (115.5 GiB at $0.05). These are baseline
+estimates, not a fixed bill: changed blocks, temporary-source lifetime, old history
+aging out, transfer, KMS/API usage and restore tests add cost. A one-day source TTL
+would retain nearly a continuous extra baseline; cleanup after verified completion
+avoids that steady-state design, but slow or failed copies still accrue storage.
 
 The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive searches across
 `/home/ubuntu` or `/tmp`; one such scan saturated both disks and made SSH unusable. Scope
@@ -989,12 +1093,15 @@ top-left arrow returns to the browser-manager dashboard instead. Back follows th
 Chrome window/tab's native toolbar state, including navigation from other viewers. It is disabled
 while disconnected or when the native state is unavailable. Foreground viewers refresh this
 read-only state every 500 ms after the previous read completes; background polling pauses.
-Each desktop uses its own private accessibility bus; no browsing history URLs are returned and
-no remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
+Each desktop uses its own private accessibility bus and one persistent native reader, kept alive
+until Chrome exits. Repeatedly subscribing and disconnecting short-lived readers can crash
+Chromium's ATK keyboard-event handler, including on versions 151 and 153. A slow read returns
+unknown without tearing down the subscription. No browsing history URLs are returned and no
+remote-debugging endpoint is exposed. Host accessibility preferences are not changed.
 On a phone, use **Fit to screen**, or turn it off for an actual-size scrollable desktop.
 Use **Phone** to switch the remote browser itself to a narrow, responsive layout. On a phone,
 the size follows the viewer's available width and height when tapped (bounded to 320–500 ×
-480–900 pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
+480–900 logical CSS pixels); desktop viewers use a 390 × 844 preset. Tap **Phone** again to return to
 the 1440 × 900 desktop. This changes only the selected browser's shared display, so other
 viewers of that same browser also see the change; separate browser instances are unaffected.
 The Phone button follows the actual shared framebuffer in every connected viewer, not a cached
@@ -1008,10 +1115,24 @@ input also work directly. **Fit to screen** scales independently for each viewer
 explicit **Phone** toggle resizes the shared desktop. **Fullscreen** is shown only where the
 viewing browser supports it.
 
+In the Linux VNC viewer, swipe with one finger to scroll the remote page or the panel
+where the swipe starts. A quick swipe has a short glide; touching again stops it. Reduced-motion
+preferences disable the glide. Tap normally to click; to drag an item, tap once, then touch
+and drag within a moment. Long-press and multitouch gestures keep noVNC's existing behavior.
+Mouse input is unchanged. VNC carries discrete wheel steps, so this improves touch handling
+but cannot promise pixel-for-pixel scrolling or a native phone's frame rate over the network.
+
 In the Linux VNC viewer, **Fit** stays visible but is greyed out when fitting and actual size
 are already the same (less than one pixel of difference), or while disconnected. It re-enables
 when the shared display or available viewer space changes, including rotation and opening the
 keyboard, and retains its on/off setting.
+
+The Linux VNC browser renders at fixed 2× density: a 390 × 844 Phone viewport has a
+780 × 1688 framebuffer, while Desktop has 2880 × 1800 pixels. Text and browser controls
+keep their logical size; **Fit** off means logical actual size, not one physical framebuffer
+pixel per CSS pixel. This supplies more detail on high-density screens at four times the
+source pixel count; it is not lossless or full native density on every phone. Existing
+desktops pick up the density change when restarted.
 
 VNC uses 24-bit true color with high JPEG quality (9/9) by default. When the viewing browser
 reports Data Saver, a 2G/3G connection, or a positive downlink below 2 Mbps, it uses quality 6/9 and
@@ -1046,7 +1167,8 @@ A small native VNC regression checks that the real server accepts Unix-socket co
 and owns no IPv4 or IPv6 TCP listeners; it does not need Chrome or the full UI. After building,
 `BM_BROWSER_BIN=/absolute/path/to/chrome npm run test:live` runs two real sandboxed desktops and the production UI
 on loopback with an ephemeral signed test identity; it does not add a production auth bypass.
-It checks desktop/phone layout, real VNC input, native phone-width reflow and restoration,
+It checks desktop/phone layout, 2× rendering with unchanged logical sizes, real VNC input
+including small-target clicks with Fit on and off, native phone-width reflow and restoration,
 phone-mode navigation, reconnect, and profile retention. Screenshots
 go to `~/browser-manager-ui-artifacts`, never Git; test-only profiles are retained under the
 printed temporary directory and all test desktops are stopped. New E2E findings should get

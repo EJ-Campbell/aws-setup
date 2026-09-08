@@ -1,7 +1,9 @@
 """Reconcile only the configured fleet's backup copies; never alter source volumes.
 
-The hourly pass repairs lost EventBridge deliveries and seeds an empty encrypted DR
-vault from recent local recovery points. Copies are idempotent; failed copies back off.
+The hourly pass repairs lost EventBridge deliveries. Unencrypted sources copy directly;
+only the explicitly allowed encrypted sources use the customer-key intermediary.
+The recovery account owns GFS history. Cleanup is separately gated and requires exact
+copy lineage; existing primary-vault history is read-only and never removed here.
 Restore validation checks detached encrypted EBS metadata, not guest contents/bootability.
 Monthly per-volume checks do not rely on best-effort events or a successful scheduler.
 """
@@ -32,30 +34,85 @@ def latest(points, resource):
                key=lambda point: point["CreationDate"], default=None)
 
 
-def copy_point(client, point, source_vault, destination, jobs, role, now):
+def final_retention(point):
+    """GFS is based on capture time, never an intermediate TTL or retry date."""
+    captured = point["CreationDate"].astimezone(timezone.utc)
+    return 365 if captured.day == 1 else 30 if captured.weekday() == 6 else 7
+
+
+def verified_copy(point, destination_points, jobs, destination, retention, key=None, source_vault=None, now=None,
+                  expired_checkpoint_lineage=False):
+    """A completed job alone is not proof that its exact recovery point is usable."""
+    # Cleanup can reconstruct an already-copied chain through an EXPIRED CMK
+    # checkpoint. This is historical metadata only, never a usable final/copy
+    # source; ordinary copy/health callers retain the COMPLETED-only default.
+    if expired_checkpoint_lineage and key is None:
+        raise ValueError("Expired lineage requires an exact checkpoint key")
+    statuses = {"COMPLETED", "EXPIRED"} if expired_checkpoint_lineage else {"COMPLETED"}
+    for job in jobs:
+        if (job.get("State") != "COMPLETED"
+                or job.get("SourceRecoveryPointArn") != point["RecoveryPointArn"]
+                or job.get("DestinationBackupVaultArn") != destination
+                or (source_vault is not None and job.get("SourceBackupVaultArn") != source_vault)
+                or job.get("ResourceArn") != point["ResourceArn"]):
+            continue
+        copied = next((candidate for candidate in destination_points
+                       if candidate["RecoveryPointArn"] == job.get("DestinationRecoveryPointArn")), None)
+        if (copied is None or copied.get("Status") not in statuses
+                or copied.get("ResourceType") != "EBS" or copied.get("IsEncrypted") is not True
+                or copied.get("ResourceArn") != point["ResourceArn"]
+                or copied.get("CreationDate") != point["CreationDate"]
+                or (key is not None and copied.get("EncryptionKeyArn") != key)):
+            continue
+        actual_retention = copied.get("Lifecycle", {}).get("DeleteAfterDays")
+        if retention is not None and (actual_retention is None or actual_retention < retention):
+            continue
+        delete_at = copied.get("CalculatedLifecycle", {}).get("DeleteAt")
+        if now is not None and ((delete_at is not None and delete_at <= now)
+                                or (actual_retention is not None and actual_retention > 0
+                                    and copied["CreationDate"] + timedelta(days=actual_retention) <= now)):
+            continue
+        return copied
+    return None
+
+
+def copy_point(client, point, source_vault, destination, jobs, role, now, retention_days):
     """Only retry a terminal failure, after six hours, at most three times per point."""
+    if point.get("Status") != "COMPLETED":
+        raise ValueError("Cannot copy a non-completed recovery point: " + point["RecoveryPointArn"])
     matching = [job for job in jobs
                 if job.get("SourceRecoveryPointArn") == point["RecoveryPointArn"]
                 and job.get("DestinationBackupVaultArn") == destination]
-    if any(job["State"] in {"CREATED", "RUNNING", "COMPLETED"} for job in matching):
-        return "already-covered"
+    for job in matching:
+        if job["State"] in {"CREATED", "RUNNING"}:
+            if job["CreationDate"] < now - timedelta(hours=24):
+                raise RuntimeError("Copy pending more than 24h: " + point["ResourceArn"])
+            return "in-flight"
+        if job["State"] == "COMPLETED":
+            # The caller already checked destination metadata. Allow propagation,
+            # but never treat missing/incorrect destination data as success.
+            if job.get("CompletionDate", job["CreationDate"]) < now - timedelta(hours=2):
+                raise RuntimeError("Completed copy has no verified destination: " + point["ResourceArn"])
+            return "awaiting-destination"
     if len(matching) >= 3:
         raise RuntimeError("Copy exhausted three attempts for " + point["ResourceArn"])
     if matching and max(job["CreationDate"] for job in matching) > now - timedelta(hours=6):
         return "backoff"
-    retention = int(point.get("Lifecycle", {}).get("DeleteAfterDays", 30))
-    # Retain the original annual copies; weekly and initial seed copies keep 30 days.
-    retention = 365 if retention >= 365 else 30
+    if retention_days is not None and point["CreationDate"] + timedelta(days=retention_days) <= now:
+        raise RuntimeError("Copy retention window already elapsed; retaining pending source: " + point["ResourceArn"])
     token = hashlib.sha256((point["RecoveryPointArn"] + destination + str(len(matching))).encode()).hexdigest()[:50]
-    result = client.start_copy_job(
+    request = dict(
         RecoveryPointArn=point["RecoveryPointArn"], SourceBackupVaultName=source_vault,
         DestinationBackupVaultArn=destination, IamRoleArn=role,
-        IdempotencyToken=token, Lifecycle={"DeleteAfterDays": retention})
+        IdempotencyToken=token)
+    if retention_days is not None:
+        request["Lifecycle"] = {"DeleteAfterDays": retention_days}
+    result = client.start_copy_job(**request)
     jobs.append({"SourceRecoveryPointArn": point["RecoveryPointArn"],
                  "DestinationBackupVaultArn": destination, "State": "CREATED",
                  "CreationDate": now, "CopyJobId": result["CopyJobId"]})
     print(json.dumps({"action": "copy-started", "resource": point["ResourceArn"],
-                      "copy_job_id": result["CopyJobId"], "retention_days": retention}))
+                      "copy_job_id": result["CopyJobId"], "retention_days": retention_days}))
     return "started"
 
 
@@ -175,48 +232,256 @@ def failed_job_event(event):
     return detail.get(field) in {"FAILED", "EXPIRED", "ABORTED", "PARTIAL"}
 
 
+def canary_test_start(config):
+    """A reviewed retry changes the one-off schedule, not past job history."""
+    if not config.get("canary_plan_arn"):
+        return None
+    value = config.get("canary_start_at")
+    try:
+        scheduled = datetime.strptime(value, "%Y-%m-%dT%H:%M:00Z").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid initial restore canary schedule") from None
+    if scheduled.strftime("%Y-%m-%dT%H:%M:00Z") != value:
+        raise ValueError("Invalid initial restore canary schedule")
+    return scheduled
+
+
+def canary_restore_health(stage, config, now):
+    """A retry only clears each source's failure after that source fully passes.
+
+    Attribute jobs with the per-resource API supported by the Lambda SDK. Do not
+    filter by recovery-point age: moving the retry date must not hide old failures.
+    The initial untried wave gets its one-hour start window plus one hour of
+    propagation grace, but a known failure never receives that grace again.
+    """
+    scheduled = canary_test_start(config)
+    accepted = config.get("canary_accepted", False)
+    if not isinstance(accepted, bool):
+        raise ValueError("Invalid initial restore canary acceptance")
+    # Only the reviewed production cutover retires this one-off health check.
+    # AWS eventually expires job history; age alone must never count as success.
+    # The handler still validates/cleans old jobs and enforces monthly health.
+    if scheduled is None or accepted is True:
+        return []
+    errors = []
+    for resource in sorted(set(config["volumes"])):
+        jobs = pages(stage, "list_restore_jobs_by_protected_resource", "RestoreJobs",
+                     ResourceArn=resource)
+        matching = [job for job in jobs
+                    if job.get("IamRoleArn") == config["restore_role"]
+                    and job.get("ResourceType") == "EBS"
+                    and job.get("CreatedBy", {}).get("RestoreTestingPlanArn") == config["canary_plan_arn"]]
+        current = max((job for job in matching if job["CreationDate"] >= scheduled),
+                      key=lambda item: item["CreationDate"], default=None)
+        if (current is not None and current.get("Status") == "COMPLETED"
+                and current.get("ValidationStatus") == "SUCCESSFUL"
+                and current.get("DeletionStatus") == "SUCCESSFUL"):
+            continue
+        failed = max((job for job in matching
+                      if job.get("Status") in {"FAILED", "ABORTED"}
+                      or job.get("ValidationStatus") in {"FAILED", "TIMED_OUT"}
+                      or job.get("DeletionStatus") == "FAILED"),
+                     key=lambda item: item["CreationDate"], default=None)
+        if failed is not None:
+            errors.append("Initial restore canary failed; no successful current-wave replacement: "
+                          + resource + " (" + failed["RestoreJobId"] + ")")
+        elif now >= scheduled + timedelta(hours=2):
+            if current is None:
+                errors.append("Initial restore canary missing since " + scheduled.isoformat() + ": " + resource)
+            else:
+                errors.append("Initial restore canary incomplete after 2h: " + resource
+                              + " (" + current["RestoreJobId"] + "; restore=" + str(current.get("Status"))
+                              + ", validation=" + str(current.get("ValidationStatus"))
+                              + ", deletion=" + str(current.get("DeletionStatus")) + ")")
+    return errors
+
+
+def checkpoint_origin(point, jobs, config):
+    return next((job for job in jobs
+                 if job.get("State") == "COMPLETED"
+                 and job.get("DestinationBackupVaultArn") == config["dr_vault_arn"]
+                 and job.get("DestinationRecoveryPointArn") == point["RecoveryPointArn"]
+                 and job.get("SourceBackupVaultArn") in {
+                     config["primary_vault_arn"], config["processing_vault_arn"]}
+                 and job.get("SourceRecoveryPointArn")
+                 and job.get("ResourceArn") == point["ResourceArn"]), None)
+
+
+def expired_cleanup_candidates(primary, dr, config, pending_raw, dr_raw, stage_points,
+                               primary_jobs, dr_jobs, confirmed_intermediates, now):
+    """Retry failed deletion only with independently surviving exact copy proof.
+
+    EXPIRED remains unhealthy while present. Do not copy it, accept it as a final
+    destination, or remove a newest/unproven CMK checkpoint to make alarms green.
+    """
+    cleanup, errors = [], []
+    for point in pending_raw:
+        if (point.get("Status") != "EXPIRED" or point.get("ResourceType") != "EBS"
+                or point.get("ResourceArn") not in config["volumes"]):
+            continue
+        try:
+            final = None
+            if point.get("IsEncrypted") is False:
+                final = verified_copy(point, stage_points, primary_jobs, config["stage_vault_arn"],
+                                      final_retention(point), source_vault=config["processing_vault_arn"], now=now)
+            elif (point.get("IsEncrypted") is True and point.get("EncryptionKeyArn")
+                  and point["ResourceArn"] in config["cmk_hop_volumes"]):
+                intermediate = verified_copy(point, dr_raw, primary_jobs, config["dr_vault_arn"],
+                                             None, config["dr_key"], config["processing_vault_arn"], now,
+                                             expired_checkpoint_lineage=True)
+                if intermediate is not None:
+                    final = verified_copy(intermediate, stage_points, dr_jobs, config["stage_vault_arn"],
+                                          final_retention(point), source_vault=config["dr_vault_arn"], now=now)
+            if final is not None:
+                tags = primary.list_tags(ResourceArn=point["RecoveryPointArn"]).get("Tags", {})
+                if (tags.get("BackupPipeline") != "fleet-processing-v2"
+                        or not tags.get("aws:backup:source-resource")):
+                    raise ValueError("Expired processing point lacks pipeline provenance: " + point["RecoveryPointArn"])
+                cleanup.append((primary, config["processing_vault"], point))
+        except Exception as error:
+            errors.append(str(error))
+    for point in dr_raw:
+        if (point.get("Status") != "EXPIRED" or point.get("ResourceType") != "EBS"
+                or point.get("ResourceArn") not in config["cmk_hop_volumes"]
+                or point.get("IsEncrypted") is not True or point.get("EncryptionKeyArn") != config["dr_key"]):
+            continue
+        try:
+            newest = latest(dr_raw, point["ResourceArn"])
+            successor = latest(confirmed_intermediates, point["ResourceArn"])
+            if (point["RecoveryPointArn"] == newest["RecoveryPointArn"] or successor is None
+                    or successor["CreationDate"] <= point["CreationDate"]):
+                continue
+            final = verified_copy(point, stage_points, dr_jobs, config["stage_vault_arn"],
+                                  final_retention(point), source_vault=config["dr_vault_arn"], now=now)
+            if final is not None and checkpoint_origin(point, primary_jobs, config) is not None:
+                cleanup.append((dr, config["dr_vault"], point))
+        except Exception as error:
+            errors.append(str(error))
+    return cleanup, errors
+
+
 def reconcile(primary, dr, stage, config, now):
     allowed = set(config["volumes"])
+    hop_volumes = set(config["cmk_hop_volumes"])
+    if not hop_volumes <= allowed or config["processing_vault"] == config["primary_vault"]:
+        raise ValueError("Invalid processing-vault or encrypted-volume boundary")
     primary_points = usable(pages(primary, "list_recovery_points_by_backup_vault", "RecoveryPoints",
-                                   BackupVaultName=config["primary_vault"]), allowed)
-    dr_points = usable(pages(dr, "list_recovery_points_by_backup_vault", "RecoveryPoints",
-                            BackupVaultName=config["dr_vault"]), allowed)
+                                 BackupVaultName=config["primary_vault"]), allowed)
+    pending_raw = pages(primary, "list_recovery_points_by_backup_vault", "RecoveryPoints",
+                        BackupVaultName=config["processing_vault"])
+    dr_raw = pages(dr, "list_recovery_points_by_backup_vault", "RecoveryPoints",
+                   BackupVaultName=config["dr_vault"])
+    pending_points = usable(pending_raw, allowed)
+    dr_points = usable(dr_raw, allowed)
     stage_points = usable(pages(stage, "list_recovery_points_by_backup_vault", "RecoveryPoints",
                                BackupVaultName=config["stage_vault"]), allowed)
-    since = now - timedelta(days=14)
+    # AWS retains copy-job history for a finite period. Missing lineage always
+    # blocks cleanup; it is not evidence that an old point can be deleted.
+    since = now - timedelta(days=90)
     primary_jobs = pages(primary, "list_copy_jobs", "CopyJobs", ByCreatedAfter=since)
     dr_jobs = pages(dr, "list_copy_jobs", "CopyJobs", ByCreatedAfter=since)
     missing = []
     errors = []
+    for point in pending_raw + dr_raw:
+        if (point.get("ResourceArn") in allowed and point.get("ResourceType") == "EBS"
+                and point.get("Status") in {"EXPIRED", "PARTIAL", "DELETING"}):
+            # DeleteRecoveryPoint can return 200 but leave EXPIRED behind. Never
+            # filter those out silently and report a successful cleanup.
+            errors.append("Processing recovery point remains " + point["Status"] + ": " + point["RecoveryPointArn"])
+
+    sources = [(point, config["processing_vault"], True) for point in pending_points]
     for resource in sorted(allowed):
-        source = latest(primary_points, resource)
-        intermediate = latest(dr_points, resource)
+        # Processing points normally disappear after verification. A fresh final
+        # point therefore satisfies daily capture health without a retained local
+        # snapshot. Only bootstrap a recent legacy point newer than this pipeline.
+        source = latest(primary_points + pending_points + dr_points + stage_points, resource)
         destination = latest(stage_points, resource)
         if source is None or source["CreationDate"] < now - timedelta(hours=48):
-            missing.append("local backup older than 48h: " + resource)
-            continue
-        if intermediate is None or intermediate["CreationDate"] < now - timedelta(days=8):
-            missing.append("encrypted DR copy missing/older than 8d: " + resource)
-            try:
-                copy_point(primary, source, config["primary_vault"], config["dr_vault_arn"],
-                           primary_jobs, config["copy_role"], now)
-            except Exception as error:
-                errors.append(str(error))
-        if destination is None or destination["CreationDate"] < now - timedelta(days=8):
-            missing.append("cross-account copy missing/older than 8d: " + resource)
-    # Eight days includes every new weekly/monthly point but stays inside the 14-day
-    # copy-job deduplication window, avoiding repeats after AWS expires job history.
+            missing.append("daily capture missing/older than 48h: " + resource)
+        if destination is None or destination["CreationDate"] < now - timedelta(hours=48):
+            missing.append("cross-account copy missing/older than 48h: " + resource)
+        seed = latest(primary_points, resource)
+        current = latest(pending_points + dr_points + stage_points, resource)
+        if (seed is not None and seed["CreationDate"] >= now - timedelta(hours=48)
+                and (current is None or seed["CreationDate"] > current["CreationDate"])):
+            sources.append((seed, config["primary_vault"], False))
+
+    confirmed_sources = []
+    for source, vault, processing in sources:
+        try:
+            source_vault_arn = config["processing_vault_arn"] if processing else config["primary_vault_arn"]
+            if source.get("IsEncrypted") is False:
+                final = verified_copy(source, stage_points, primary_jobs,
+                                      config["stage_vault_arn"], final_retention(source), source_vault=source_vault_arn, now=now)
+                if final is None:
+                    copy_point(primary, source, vault, config["stage_vault_arn"],
+                               primary_jobs, config["copy_role"], now, final_retention(source))
+            elif (source.get("IsEncrypted") is True and source["ResourceArn"] in hop_volumes
+                  and source.get("EncryptionKeyArn")):
+                intermediate = verified_copy(source, dr_points, primary_jobs,
+                                             config["dr_vault_arn"], None, config["dr_key"], source_vault_arn, now)
+                if intermediate is None:
+                    # New pending points have no TTL; inherit it. Legacy seeds
+                    # need an explicit bridge TTL so short legacy retention cannot
+                    # expire them before the second leg finishes.
+                    copy_point(primary, source, vault, config["dr_vault_arn"],
+                               primary_jobs, config["copy_role"], now, None if processing else 365)
+                    final = None
+                else:
+                    final = verified_copy(intermediate, stage_points, dr_jobs,
+                                          config["stage_vault_arn"], final_retention(source), source_vault=config["dr_vault_arn"], now=now)
+            else:
+                raise ValueError("Unexpected source encryption; refusing copy: " + source["RecoveryPointArn"])
+            if processing and final is not None:
+                confirmed_sources.append(source)
+        except Exception as error:
+            errors.append(str(error))
+
+    confirmed_intermediates = []
     for point in dr_points:
-        if point["CreationDate"] < now - timedelta(days=8):
-            continue
-        if not point.get("IsEncrypted") or point.get("EncryptionKeyArn") != config["dr_key"]:
+        if (point["ResourceArn"] not in hop_volumes or point.get("IsEncrypted") is not True
+                or point.get("EncryptionKeyArn") != config["dr_key"]):
             errors.append("DR recovery point is not encrypted with the expected customer key: " + point["RecoveryPointArn"])
             continue
         try:
-            copy_point(dr, point, config["dr_vault"], config["stage_vault_arn"],
-                       dr_jobs, config["copy_role"], now)
+            final = verified_copy(point, stage_points, dr_jobs, config["stage_vault_arn"],
+                                  final_retention(point), source_vault=config["dr_vault_arn"], now=now)
+            if final is not None:
+                origin = checkpoint_origin(point, primary_jobs, config)
+                if origin is None:
+                    errors.append("Missing first-leg lineage; retaining CMK checkpoint: " + point["RecoveryPointArn"])
+                else:
+                    confirmed_intermediates.append(point)
+            else:
+                copy_point(dr, point, config["dr_vault"], config["stage_vault_arn"],
+                           dr_jobs, config["copy_role"], now, final_retention(point))
         except Exception as error:
             errors.append(str(error))
+
+    if config.get("cleanup_enabled") is True:
+        cleanup = [(primary, config["processing_vault"], point) for point in confirmed_sources]
+        for point in confirmed_intermediates:
+            newest = latest(dr_points, point["ResourceArn"])
+            successor = latest(confirmed_intermediates, point["ResourceArn"])
+            # Never remove the latest CMK checkpoint. A strictly newer verified
+            # successor keeps EBS incremental-copy lineage and the rolling baseline.
+            if (point["RecoveryPointArn"] != newest["RecoveryPointArn"]
+                    and successor["CreationDate"] > point["CreationDate"]):
+                cleanup.append((dr, config["dr_vault"], point))
+        expired, expired_errors = expired_cleanup_candidates(
+            primary, dr, config, pending_raw, dr_raw, stage_points,
+            primary_jobs, dr_jobs, confirmed_intermediates, now)
+        cleanup.extend(expired)
+        errors.extend(expired_errors)
+        for client, vault, point in cleanup:
+            try:
+                client.delete_recovery_point(BackupVaultName=vault, RecoveryPointArn=point["RecoveryPointArn"])
+                # This is a request, not proof of deletion. The next inventory
+                # confirms absence and alarms on EXPIRED/PARTIAL/DELETING remnants.
+                print(json.dumps({"action": "processing-deletion-requested", "vault": vault,
+                                  "recovery_point": point["RecoveryPointArn"]}))
+            except Exception as error:
+                errors.append(str(error))
     return missing, errors
 
 
@@ -230,19 +495,29 @@ def handler(event, context):
     stage_session = boto3.Session(aws_access_key_id=credentials['AccessKeyId'],
                                  aws_secret_access_key=credentials['SecretAccessKey'],
                                  aws_session_token=credentials['SessionToken'])
-    stage = stage_session.client("backup", region_name=config["primary_region"])
-    stage_ec2 = stage_session.client("ec2", region_name=config["primary_region"])
+    stage = stage_session.client("backup", region_name=config["stage_region"])
+    stage_ec2 = stage_session.client("ec2", region_name=config["stage_region"])
     sns = boto3.client("sns", region_name=config["primary_region"])
     if failed_job_event(event):
         sns.publish(TopicArn=config["topic"], Subject="AWS Backup job requires attention",
                     Message=json.dumps(event, default=str))
     try:
+        canary_test_start(config)
         missing, errors = reconcile(primary, dr, stage, config, now)
         # The periodic pass also handles a missed restore-completed event.
-        for job in pages(stage, "list_restore_jobs", "RestoreJobs",
-                         ByCreatedAfter=now - timedelta(days=40),
-                         ByRestoreTestingPlanArn=config["restore_plan_arn"]):
+        restore_jobs = []
+        restore_errors = []
+        plans = {config["restore_plan_arn"]}
+        if config.get("canary_plan_arn"):
+            plans.add(config["canary_plan_arn"])
+        for plan in sorted(plans):
+            restore_jobs.extend(job for job in pages(stage, "list_restore_jobs", "RestoreJobs",
+                                ByCreatedAfter=now - timedelta(days=40), ByRestoreTestingPlanArn=plan)
+                                if job.get("CreatedBy", {}).get("RestoreTestingPlanArn") == plan)
+        for job in restore_jobs:
             if job.get("IamRoleArn") == config["restore_role"]:
+                # Prior attempts remain in AWS job history and still receive safe
+                # validation/cleanup, independently of current-wave health.
                 recent = job.get("CompletionDate", now) > now - timedelta(hours=4)
                 try:
                     if recent and job.get("DeletionStatus") != "SUCCESSFUL":
@@ -257,7 +532,8 @@ def handler(event, context):
                     errors.append(str(error))
         # Query current metadata after validation so a just-validated job can count
         # as healthy. Missing/failed monthly tests remain visible if events vanish.
-        restore_errors = monthly_restore_health(stage, config, now)
+        restore_errors.extend(canary_restore_health(stage, config, now))
+        restore_errors.extend(monthly_restore_health(stage, config, now))
         errors.extend(restore_errors)
         boto3.client("cloudwatch", region_name=config["primary_region"]).put_metric_data(
             Namespace="FleetBackup", MetricData=[

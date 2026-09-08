@@ -191,7 +191,7 @@ resource "aws_backup_plan" "jumpbox" {
 resource "aws_backup_selection" "jumpbox" {
   count        = local.jumpbox_admin_iam_needed ? 1 : 0
   name         = "jumpbox-home-volume"
-  plan_id      = aws_backup_plan.jumpbox[0].id
+  plan_id      = local.backup_recovery_cutover_enabled ? aws_backup_plan.processing["jumpbox"].id : aws_backup_plan.jumpbox[0].id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
   resources = compact([
@@ -202,6 +202,13 @@ resource "aws_backup_selection" "jumpbox" {
     var.enable_jumpbox ? aws_ebs_volume.jumpbox_home[0].arn : "",
     var.enable_jumpbox_2 ? "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:volume/${aws_instance.jumpbox_2[0].root_block_device[0].volume_id}" : "",
   ])
+  lifecycle {
+    create_before_destroy = true
+    precondition {
+      condition     = !local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled
+      error_message = "Verify temporary-copy cleanup before switching the jumpbox backup selection."
+    }
+  }
 }
 
 # ============================================

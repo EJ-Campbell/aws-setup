@@ -28,5 +28,8 @@ jobs:
       - name: Backup copy and restore safety
         run: python3 -S -B scripts/test-backup-recovery.py
 
+      - name: Backup Terraform topology boundaries
+        run: python3 -S -B scripts/test-backup-topology.py
+
       - name: Runner user_data IPv6 gate
         run: bash scripts/test-runner-userdata.sh

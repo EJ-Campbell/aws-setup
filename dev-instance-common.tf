@@ -657,7 +657,7 @@ resource "aws_backup_plan" "dev_servers" {
 
 resource "aws_backup_selection" "dev_servers" {
   name         = "dev-server-persistent-volumes"
-  plan_id      = aws_backup_plan.dev_servers.id
+  plan_id      = local.backup_recovery_cutover_enabled ? aws_backup_plan.processing["dev"].id : aws_backup_plan.dev_servers.id
   iam_role_arn = "arn:aws:iam::928413605543:role/AWSBackupDefaultServiceRole"
 
   # compact() drops the Next.js entry when that box is disabled, rather than passing an
@@ -667,4 +667,11 @@ resource "aws_backup_selection" "dev_servers" {
     local.x86_persistent_volume_arn,
     local.nextjs_root_volume_arn,
   ])
+  lifecycle {
+    create_before_destroy = true
+    precondition {
+      condition     = !local.backup_recovery_cutover_enabled || local.backup_recovery_cleanup_enabled
+      error_message = "Verify temporary-copy cleanup before switching the dev backup selection."
+    }
+  }
 }

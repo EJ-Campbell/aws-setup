@@ -9,6 +9,7 @@ import { watchVncQuality } from "../../../lib/vnc-quality.mjs";
 import { createNavigationState } from "../../../lib/navigation-state.mjs";
 import { frameViewport } from "../../../lib/frame-viewport.mjs";
 import { canFitViewport } from "../../../lib/fit-viewport.mjs";
+import { attachTouchScroll } from "../../../lib/touch-scroll.mjs";
 
 type Connection = "connecting" | "connected" | "disconnected" | "error";
 const keys = { enter: 0xff0d, tab: 0xff09, escape: 0xff1b, backspace: 0xff08, control: 0xffe3, alt: 0xffe9, left: 0xff51 };
@@ -47,20 +48,26 @@ export default function Desktop({ name }: { name: string }) {
   const phoneMode = currentViewport?.mode === "phone";
 
   useEffect(() => {
+    if (!connected || !foreground || !screen.current) return;
+    return attachTouchScroll(screen.current);
+  }, [connected, foreground, fit, frame?.width, frame?.height]);
+
+  useEffect(() => {
     const target = screen.current;
-    if (!target) return;
+    const container = target?.parentElement;
+    if (!target || !container) return;
     const changed = () => {
-      setFrame(readFrameViewport(target));
-      const canvas = target.querySelector("canvas");
-      const bounds = target.getBoundingClientRect();
-      setCanFit(canFitViewport(canvas?.width, canvas?.height, bounds.width, bounds.height));
+      const logical = readFrameViewport(target);
+      setFrame(logical);
+      const bounds = container.getBoundingClientRect();
+      setCanFit(canFitViewport(logical?.width, logical?.height, bounds.width, bounds.height));
     };
     // Shared resizes arrive over VNC before (and independently of) metadata requests.
     // Observe only the actual framebuffer; fitting/scaling this viewer changes CSS, not these attributes.
     const observer = new MutationObserver(changed);
     observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ["width", "height"] });
     const resize = new ResizeObserver(changed);
-    resize.observe(target);
+    resize.observe(container);
     changed();
     return () => { observer.disconnect(); resize.disconnect(); };
   }, [name]);
@@ -148,6 +155,8 @@ export default function Desktop({ name }: { name: string }) {
         const next = new RFBClient(screen.current, url.href, { shared: true });
         rfb = next;
         stopQuality = watchVncQuality(next);
+        // Keep noVNC responsible for both rendering and pointer scaling. The target fills the
+        // viewer for Fit, or is sized to logical CSS pixels for natural-size HiDPI rendering.
         next.scaleViewport = true;
         // Scaling is local: one viewer must not resize another viewer's desktop.
         next.resizeSession = false;
@@ -208,7 +217,6 @@ export default function Desktop({ name }: { name: string }) {
     };
   }, [name]);
 
-  useEffect(() => { if (client.current) client.current.scaleViewport = fit; }, [fit, connection]);
   useEffect(() => {
     setCanFullscreen(Boolean(document.fullscreenEnabled && workspace.current?.requestFullscreen));
     const changed = () => setFullscreen(document.fullscreenElement === workspace.current);
@@ -327,7 +335,7 @@ export default function Desktop({ name }: { name: string }) {
       {(viewportError || metadataError) && <p className="viewport-error" role="alert">{viewportError || metadataError}</p>}
 
       <section className="desktop-display" aria-label={`${label} remote desktop`}>
-        <div ref={screen} className="vnc-screen" />
+        <div ref={screen} className="vnc-screen" style={!fit && currentViewport ? { width: currentViewport.width, height: currentViewport.height } : undefined} />
         {!connected && <div className={`connection-overlay${keyboard ? " compact" : ""}`}><div className="connection-card">
           {connection === "connecting" ? <span className="spinner" aria-hidden="true" /> : <Icon name="browser" size={32} />}
           <h2>{connection === "connecting" ? "Connecting to your desktop" : "Desktop disconnected"}</h2>
@@ -342,7 +350,7 @@ export default function Desktop({ name }: { name: string }) {
         <div className="keyboard-input-row"><label className="sr-only" htmlFor="remote-text">Text for the remote desktop</label><textarea id="remote-text" ref={textInput} value={text} onChange={(event) => setText(event.target.value)} onFocus={() => client.current?.blur()} placeholder="Type or paste text here…" autoCapitalize="none" autoCorrect="off" spellCheck={false} rows={2} maxLength={4096} /><div className="text-actions"><button className="button primary" disabled={!connected || !text} onClick={() => sendText(false)}>Type text</button><button className="button" disabled={!connected || !text} onClick={() => sendText(true)}>Paste text</button></div></div>
         <div className="keyboard-bottom"><div className="special-keys" aria-label="Remote keyboard shortcuts"><button className="button key" disabled={!connected} onClick={() => { shortcut("l"); setFeedback("Address bar selected in the remote browser."); }}>Address bar</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.tab, "Tab")}>Tab</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.escape, "Escape")}>Esc</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.backspace, "Backspace")}>Backspace</button><button className="button key" disabled={!connected} onClick={() => sendKey(keys.enter, "Enter")}>Enter ↵</button></div><p className="input-note">Paste updates the remote clipboard. New lines in typed text send Enter.</p></div>
       </section>}
-      <footer className="desktop-footer"><span role="status">{feedback || "Closing this tab leaves the browser running."}</span><span className="desktop-footer-private"><Icon name="lock" size={12} /> Private connection</span></footer>
+      <footer className="desktop-footer"><span role="status">{feedback || "Swipe to scroll. To drag, tap once, then touch and drag."}</span><span className="desktop-footer-private"><Icon name="lock" size={12} /> Private connection</span></footer>
     </main>
   );
 }
