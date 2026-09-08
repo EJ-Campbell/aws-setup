@@ -715,9 +715,12 @@ def case_controller_recognizes_real_terraform_user_data_document():
     source = TF_FILE.read_text()
     script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
     wire = base64.b64encode(gzip.compress(script.encode())).decode()
-    # This PR is the controller-first stage, not the PAT consumer cutover.
-    assert webhook(FakeEC2())["user_data_protocol"](wire) == (False, True)
-    assert 'PAT=$(aws ssm get-parameter --name /github-runner/pat' in script
+    # Broker publication is separate from retiring the old instance-role grant.
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (True, True)
+    assert '/github-runner/pat' not in script
+    legacy_grants = (TF_FILE.parent / 'runner-vpc.tf').read_text()
+    assert 'AmazonSSMManagedInstanceCore' in legacy_grants
+    assert 'Resource = aws_ssm_parameter.github_runner_pat[0].arn' in legacy_grants
 
 
 def case_registration_credential_is_brokered_only_after_instance_exists():
