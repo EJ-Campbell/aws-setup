@@ -1253,23 +1253,56 @@ chown -R ubuntu:ubuntu /opt/actions-runner
 
 # Do not xtrace either token into cloud-init or the serial console.
 set +x
-PAT=$(aws ssm get-parameter --name /github-runner/pat --with-decryption --query 'Parameter.Value' --output text --region us-west-1 2>/dev/null || echo "")
-if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
-  REG_TOKEN=$(curl -s -X POST -H "Authorization: token $PAT" \
-    https://api.github.com/repos/ejc3/fcvm/actions/runners/registration-token | jq -r '.token')
+BOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"
+REG_TOKEN=""
+bootstrap_ssm() {
+  # Bound credential operations, including SDK credential discovery and retry.
+  AWS_MAX_ATTEMPTS=1 timeout --kill-after=2 12 aws ssm "$@" \
+    --region "$REGION" --cli-connect-timeout 3 --cli-read-timeout 5
+}
+runner_bootstrap_exit() {
+  local status=$?
+  trap - EXIT
+  unset REG_TOKEN
+  if [ "$status" -ne 0 ]; then
+    echo "FATAL: runner bootstrap failed; deleting its credential and requesting disposable-host shutdown"
+    bootstrap_ssm delete-parameter --name "$BOOTSTRAP_PARAM" >/dev/null 2>&1 || true
+    systemctl --no-block poweroff || true
+  fi
+  exit "$status"
+}
+trap runner_bootstrap_exit EXIT
+
+# The controller can only tag the credential after RunInstances returns the id.
+# Bound the publication/SSM IAM propagation race; no reusable PAT fallback.
+BOOTSTRAP_DEADLINE=$((SECONDS + 180))
+for BOOTSTRAP_ATTEMPT in $(seq 1 36); do
+  if [ "$SECONDS" -ge "$BOOTSTRAP_DEADLINE" ]; then break; fi
+  REG_TOKEN=$(bootstrap_ssm get-parameter --name "$BOOTSTRAP_PARAM" --with-decryption \
+    --query 'Parameter.Value' --output text 2>/dev/null || true)
+  if [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != "None" ]; then
+    break
+  fi
+  sleep 5
+done
+if [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != "None" ]; then
   RUNNER_NAME="runner-$INSTANCE_ID"
   sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace
+    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral
+  unset REG_TOKEN
 
   # `.runner` is the identity GitHub assigned, written by config.sh with
   # camelCase keys (the runner serialises RunnerSettings through
   # VssCamelCasePropertyNamesContractResolver). Refuse to start when config
   # wrote anything other than this instance's name, or no positive id.
-  RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
+  if ! RUNNER_ID=$(jq -er --arg expected "$RUNNER_NAME" '
     select(.agentName == $expected)
     | .agentId
     | select(type == "number" and . > 0 and floor == .)
-  ' .runner)
+  ' .runner); then
+    echo "FATAL: configured runner identity does not match this instance; refusing to start runner service"
+    exit 1
+  fi
 
   IDENTITY_DOCUMENT=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" \
     http://169.254.169.254/latest/dynamic/instance-identity/document)
@@ -1321,16 +1354,36 @@ if [ -n "$PAT" ] && [ "$PAT" != "placeholder" ]; then
          and .Item.RunnerName.S == $runner_name
          and .Item.RunnerId.N == $runner_id' >/dev/null; then
       echo "FATAL: cleanup won or registration ownership is unknown; refusing to start runner service"
-      curl -fsS -X DELETE -H "Authorization: token $PAT" \
-        "https://api.github.com/repos/ejc3/fcvm/actions/runners/$RUNNER_ID" || true
+      # The controller owns GitHub deregistration now; no PAT is available on
+      # the job host. Its cleanup pass removes the offline orphan after reap.
       exit 1
     fi
   fi
 
+  # Jobs must never inherit a still-readable registration credential. Failure
+  # to delete is a hard gate, not a warning followed by service startup.
+  if ! bootstrap_ssm delete-parameter --name "$BOOTSTRAP_PARAM"; then
+    echo "FATAL: bootstrap credential deletion failed; refusing to start runner service"
+    exit 1
+  fi
   ./svc.sh install ubuntu
+  RUNNER_SERVICE=$(tr -d '\r\n' < .service)
+  if [[ ! "$RUNNER_SERVICE" =~ ^actions\.runner\.[A-Za-z0-9_.-]+\.service$ ]]; then
+    echo "FATAL: invalid runner service identity; refusing to start runner service"
+    exit 1
+  fi
+  mkdir -p "/etc/systemd/system/$RUNNER_SERVICE.d"
+  cat > "/etc/systemd/system/$RUNNER_SERVICE.d/ephemeral.conf" <<'EPHEMERAL_SERVICE'
+[Service]
+Restart=no
+Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1
+ExecStopPost=+/usr/bin/systemctl --no-block poweroff
+EPHEMERAL_SERVICE
+  systemctl daemon-reload
   ./svc.sh start
+  trap - EXIT
 else
-  echo "FATAL: no usable GitHub runner PAT; refusing to register this runner"
+  echo "FATAL: no instance-bound registration credential; refusing to register this runner"
   exit 1
 fi
 EOF
@@ -1367,14 +1420,14 @@ resource "aws_ssm_parameter" "runner_user_data" {
     Name = "github-runner-user-data"
   }
 
-  # This user data claims a registration row before it starts the runner
-  # service. The webhook Lambda reads this parameter fresh on every launch, so
-  # a launch between this write and the grant would boot a claiming bootstrap
-  # with no PutItem permission: it fails closed and deregisters, at the cost of
-  # a metal spot box-hour and a delayed job. The parameter therefore lands
-  # after the table and the grant, not merely before the webhook that reads it.
+  # Never publish a broker-only document until its compatible controller and
+  # instance-bound credential/claim grants exist. PAT/SSM retirement remains a
+  # separate apply after trusted CI acceptance and old-boot drain: a dependency
+  # graph cannot observe cloud-init or prove a runner finished its job.
   depends_on = [
     aws_dynamodb_table.runner_registration,
+    aws_iam_role_policy.runner_bootstrap,
+    aws_lambda_function.runner_webhook,
     aws_iam_role_policy.runner,
   ]
 }
