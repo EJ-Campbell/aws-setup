@@ -755,11 +755,10 @@ Terraform.
   volume, and the `jumpbox-2` root with daily, weekly, and monthly retention.
 - The parallel box's persistent `/mnt/work` volume is protected from Terraform destroy but
   is **not backed up**. `prevent_destroy` is not a backup; keep important results elsewhere.
-- The primary backup vault uses governance Vault Lock.
-- Existing weekly/monthly recovery points copy to the original `us-east-1` vault.
-  Its AWS-managed encryption key cannot support the old direct staging copy path;
-  September's five cross-account copies failed. The new recovery pipeline below
-  repairs that path without replacing live disks or removing existing backups.
+- The legacy primary vault keeps its governance Vault Lock. Existing primary and
+  original `us-east-1` history retain their lifecycles; neither receives new scheduled
+  fleet copies. The active recovery pipeline below replaces the old staging-copy
+  path without replacing live disks or deleting that existing history.
 - Daily cost reports, AWS Budget notifications, runner-count/age alarms, the
   `runner-scale-up-starved` alarm, EC2 spend alarms, and instance-status alarms publish
   through SNS/email.
@@ -767,7 +766,7 @@ Terraform.
   provide two administration recovery paths.
 - Terraform state is encrypted in S3 and locked with DynamoDB.
 
-The intended steady state has **one long-term history**, in the recovery account's
+The active backup pipeline keeps **one new long-term history**, in the recovery account's
 `ejc3-backup-recovery` logically air-gapped vault in **us-east-1**, separate from the
 source account and region. It is immediately compliance-locked and uses an AWS-owned
 key. The already-created empty west1 air-gapped vault remains untouched and receives
@@ -780,7 +779,7 @@ us-east-1 region, then across accounts within that region. Live disks are not mi
 Final retention uses the original UTC backup date: the first of a month gets 365 days,
 other Sundays 30 days, and other days 7 days. This does not depend on temporary-copy TTLs.
 
-After cutover, daily backup plans write to the unlocked `ejc3-backup-processing` vault
+Daily backup plans write to the unlocked `ejc3-backup-processing` vault
 with **no expiration while a copy is pending**. Only confirmed final copies permit
 source cleanup. The controller keeps the latest CMK checkpoint for each encrypted root
 until a verified successor exists: deleting every checkpoint would force expensive
@@ -789,11 +788,22 @@ Recovery-point deletion is granted only by those two temporary-vault policies. A
 Backup also forwards the underlying EC2 deletion using the controller's credentials;
 that permission requires Backup in `aws:CalledVia`, our snapshot owner and pipeline
 tags. Direct EC2 deletion remains explicitly denied. The two untagged bootstrap CMK
-seeds have exact-snapshot exceptions that retire at cutover. The controller cannot
+seeds were removed after verification; their exact-snapshot exceptions are disabled
+by the completed cutover. The controller cannot
 delete legacy history or final recovery points. Copy failures retain pending
 data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
 
-Cold bootstrap must start with both cleanup and selection-cutover gates false. Bootstrap
+The September 8, 2026 cutover followed five successful detached-volume restore tests
+(including validation and test-volume removal), verified final-copy lineage for all
+five new captures, and actual removal of all seven disposable processing/bootstrap
+snapshots. Both current CMK checkpoints, ten final points, and all 97 legacy points
+and their lifecycles were preserved. The two fleet selections now use the daily
+processing plans; the old plans remain for history but no longer select fleet volumes.
+Both rollout gates stay true. Monthly restore tests remain scheduled for the eighth
+at 12:00 UTC; the past one-off definitions are retained only for audit.
+
+For a genuinely new deployment, cold bootstrap must start with both cleanup and
+selection-cutover gates false. Do not reset the gates on this deployed pipeline. Bootstrap
 leaves the existing daily/weekly/monthly plans and their selections unchanged; it seeds
 from their latest recovery points and has no recovery-point deletion permission.
 Roll out with fresh full Terraform plans in this order:
