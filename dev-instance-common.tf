@@ -40,10 +40,14 @@ resource "aws_iam_instance_profile" "dev_server" {
   role = aws_iam_role.dev_server.name
 }
 
-# SSM managed instance (for dev server itself)
+# Preserve agent/session connectivity without account-wide Parameter Store reads.
 resource "aws_iam_role_policy_attachment" "dev_server_ssm" {
   role       = aws_iam_role.dev_server.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = aws_iam_policy.ssm_managed_instance.arn
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Dev server permissions
@@ -65,20 +69,6 @@ resource "aws_iam_role_policy" "dev_server" {
         Condition = {
           StringEquals = {
             "ssm:resourceTag/Role" = "github-runner"
-          }
-        }
-      },
-      {
-        Sid    = "SSMSendCommandToAMIBuilders"
-        Effect = "Allow"
-        Action = "ssm:SendCommand"
-        Resource = [
-          "arn:aws:ssm:us-west-1::document/AWS-RunShellScript",
-          "arn:aws:ec2:us-west-1:928413605543:instance/*"
-        ]
-        Condition = {
-          StringEquals = {
-            "ssm:resourceTag/Name" = "ami-builder-temp"
           }
         }
       },
