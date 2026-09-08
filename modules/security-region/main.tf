@@ -23,17 +23,33 @@ locals {
   # feature enum predates AI_PROTECTION/AI_ANALYST; use its existing Cloud Control
   # resource, not a provisioner, provider upgrade, or a second detector owner.
   # RUNTIME_MONITORING covers EKS too; AWS rejects specifying both runtime names.
-  guardduty_optional_features = [
+  guardduty_base_optional_features = [
     "S3_DATA_EVENTS", "EKS_AUDIT_LOGS", "EBS_MALWARE_PROTECTION",
     "RDS_LOGIN_EVENTS", "LAMBDA_NETWORK_LOGS", "RUNTIME_MONITORING",
-    "AI_PROTECTION", "AI_ANALYST",
+    "AI_PROTECTION",
   ]
+  # Investigation (AI_ANALYST) is documented in only these ten Regions. Sending
+  # even DISABLED for it elsewhere makes GuardDuty reject CreateDetector.
+  # https://docs.aws.amazon.com/guardduty/latest/ug/guardduty-investigation.html
+  # AI_PROTECTION is separate and remains explicitly disabled in all 17 Regions.
+  guardduty_ai_analyst_regions = [
+    "ap-northeast-1", "ca-central-1", "eu-central-1", "eu-north-1",
+    "eu-west-1", "eu-west-2", "eu-west-3", "us-east-1", "us-east-2", "us-west-2",
+  ]
+  guardduty_reviewed_regions = [
+    "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    "ap-southeast-1", "ap-southeast-2", "ca-central-1", "eu-central-1",
+    "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3", "sa-east-1",
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+  ]
+  guardduty_optional_features = concat(local.guardduty_base_optional_features,
+  contains(local.guardduty_ai_analyst_regions, data.aws_region.current.name) ? ["AI_ANALYST"] : [])
   guardduty_runtime_agents = ["EKS_ADDON_MANAGEMENT", "ECS_FARGATE_AGENT_MANAGEMENT", "EC2_AGENT_MANAGEMENT"]
 }
 
-# The live regional CloudFormation schema accepts current feature names. All
-# optional features are disabled in the initial request, with no auto-enrollment
-# interval between detector creation and separate UpdateDetector calls.
+# CloudFormation's schema accepts names syntactically, not regionally. Disable
+# every supported optional feature in the initial request using the documented
+# mapping above; never drop more names as a fallback after a create failure.
 resource "aws_cloudcontrolapi_resource" "guardduty" {
   type_name = "AWS::GuardDuty::Detector"
   desired_state = jsonencode({
@@ -50,6 +66,10 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
   })
   lifecycle {
     prevent_destroy = true
+    precondition {
+      condition     = contains(local.guardduty_reviewed_regions, data.aws_region.current.name)
+      error_message = "GuardDuty feature availability must be reviewed before adding another Region; do not infer unsupported features from a failed create."
+    }
     # The generic provider refreshes properties, not desired_state. Assert the
     # actual service response so drift cannot silently look like a clean plan.
     postcondition {

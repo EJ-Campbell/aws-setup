@@ -998,8 +998,8 @@ do not prove existing hosts or disks have been remediated.
 ## Security monitoring rollout
 
 The owner approved the monitoring foundation on September 8, 2026, at approximately
-$9/month fixed plus metered usage. It remains unapplied while the final review and
-fresh-plan gates are completed; approval is not evidence of live delivery. Config,
+$9/month fixed plus metered usage. Deployment requires the reviewed-plan, regional
+compatibility and delivery gates below; approval is not evidence of live delivery. Config,
 Security Hub and Inspector remain disabled and require separate approval.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
@@ -1029,9 +1029,16 @@ GuardDuty uses the pinned provider's `aws_cloudcontrolapi_resource` for the sing
 `AWS::GuardDuty::Detector`, because its typed detector feature enum predates
 `AI_PROTECTION` and `AI_ANALYST`. This is still Terraform-managed, without a second
 CloudFormation stack or provisioning script. The initial request explicitly disables
-the current optional feature set, including AI and runtime-agent features; it never
-relies on missing fields meaning disabled. Refresh postconditions inspect live feature
-properties and fail on unexpected enrollment. Regional handler support must still be
+every regionally supported optional feature, including AI Protection and runtime agents.
+`AI_ANALYST` is specified only in the ten regions where AWS currently offers GuardDuty
+Investigation; the explicit regional list lives in the module. The September 8
+single-region compatibility check confirmed that requesting this unavailable feature
+in `us-west-1` is rejected even with status `DISABLED`; no detector was created.
+See [GuardDuty Investigation availability](https://docs.aws.amazon.com/guardduty/latest/ug/guardduty-investigation.html).
+Supported features must be present and disabled in live readback. A documented
+unavailable feature may be absent or disabled, but any unexpected enabled feature or
+nested agent still fails the postconditions. Missing fields are never a blanket
+substitute for disabling supported features. Regional handler support must still be
 verified during deployment: schema validation is not proof that each regional service
 accepts every feature. Do not silently omit an unsupported feature or accept an
 unreviewed provider upgrade. See [CreateDetector defaults](https://docs.aws.amazon.com/guardduty/latest/APIReference/API_CreateDetector.html)

@@ -4,7 +4,7 @@
 
 locals {
   # Bootstrap visibility and verify delivery/cost before enabling workload posture.
-  # Once approved, enable this one gate for all five durable account/regions below.
+  # Only after separate posture approval, enable this gate for all five account/regions.
   # This does not gate future-volume encryption or change any existing disk.
   security_posture_enabled = false
 

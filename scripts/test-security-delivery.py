@@ -37,6 +37,12 @@ SNS_TOPIC = "arn:aws:sns:us-west-1:" + MAIN + ":cost-alerts"
 NOW = datetime.datetime(2026, 9, 7, 12, tzinfo=datetime.timezone.utc)
 COUNTERS = ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"]
 REGIONAL_RULES = ("security-forward-findings", "security-forward-audit")
+GUARDDUTY_BASE_FEATURES = {"S3_DATA_EVENTS", "EKS_AUDIT_LOGS", "EBS_MALWARE_PROTECTION",
+                         "RDS_LOGIN_EVENTS", "LAMBDA_NETWORK_LOGS", "RUNTIME_MONITORING", "AI_PROTECTION"}
+# AWS GuardDuty Investigation preview availability, reviewed 2026-09-08:
+# https://docs.aws.amazon.com/guardduty/latest/ug/guardduty-investigation.html
+GUARDDUTY_ANALYST_REGIONS = {"us-east-1", "us-east-2", "us-west-2", "ca-central-1",
+                           "eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3", "ap-northeast-1"}
 # Independently reviewed fixtures. The optional native-HCL test below compares
 # these to the exact Terraform map used by both EventBridge and the watchdog.
 API_DETAILS = [
@@ -823,12 +829,14 @@ class TerraformSafetyTests(unittest.TestCase):
                         **({"jumpbox": "jumpbox-role"} if jumpbox else {})})
 
     def test_guardduty_all_current_optional_features_are_disabled_at_creation(self):
-        features = re.search(r'guardduty_optional_features\s*=\s*\[([^]]+)\]', REGIONAL)
+        features = re.search(r'guardduty_base_optional_features\s*=\s*\[([^]]+)\]', REGIONAL)
         self.assertIsNotNone(features)
-        self.assertEqual(set(re.findall(r'"([A-Z0-9_]+)"', features.group(1))),
-                         {"S3_DATA_EVENTS", "EKS_AUDIT_LOGS", "EBS_MALWARE_PROTECTION",
-                          "RDS_LOGIN_EVENTS", "LAMBDA_NETWORK_LOGS", "RUNTIME_MONITORING",
-                          "AI_PROTECTION", "AI_ANALYST"})
+        self.assertEqual(set(re.findall(r'"([A-Z0-9_]+)"', features.group(1))), GUARDDUTY_BASE_FEATURES)
+        regions = re.search(r'guardduty_ai_analyst_regions\s*=\s*\[([^]]+)\]', REGIONAL)
+        self.assertIsNotNone(regions)
+        self.assertEqual(set(re.findall(r'"([a-z0-9-]+)"', regions.group(1))), GUARDDUTY_ANALYST_REGIONS)
+        self.assertRegex(REGIONAL, re.compile(r'guardduty_optional_features\s*=\s*concat\(\s*local\.guardduty_base_optional_features,\s*'
+            r'contains\(local\.guardduty_ai_analyst_regions, data\.aws_region\.current\.name\)\s*\?\s*\["AI_ANALYST"\]\s*:\s*\[\]', re.S))
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
         self.assertIn('type_name = "AWS::GuardDuty::Detector"', detector)
         self.assertRegex(detector, r'Enable\s*=\s*true')
@@ -840,6 +848,109 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertIn('jsondecode(self.properties).Enable == true', detector)
         self.assertIn('name, "MISSING") == "DISABLED"', detector)
         self.assertIn('feature.Status == "DISABLED"', detector)
+
+    def test_guardduty_region_matrix_covers_exactly_the_declared_regions(self):
+        reviewed = re.search(r'guardduty_reviewed_regions\s*=\s*\[([^]]+)\]', REGIONAL)
+        self.assertIsNotNone(reviewed)
+        self.assertEqual(set(re.findall(r'"([a-z0-9-]+)"', reviewed.group(1))), set(REGIONS))
+        self.assertEqual(len(REGIONS), 17)
+        self.assertEqual(len(GUARDDUTY_ANALYST_REGIONS), 10)
+        self.assertTrue(GUARDDUTY_ANALYST_REGIONS.issubset(REGIONS))
+        self.assertNotIn("us-west-1", GUARDDUTY_ANALYST_REGIONS)
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        self.assertIn("contains(local.guardduty_reviewed_regions, data.aws_region.current.name)", detector)
+
+    @staticmethod
+    def expanded_guardduty_expression(expression):
+        """Inline only actual GuardDuty locals into an isolated console fixture."""
+        for _ in range(20):
+            reference = re.search(r'local\.(guardduty_[a-z_]+)', expression)
+            if not reference:
+                return expression
+            name = reference.group(1)
+            assignment = re.search(r'^  ' + re.escape(name) + r'\s*=\s*(.*?)(?=^  [a-z_]+\s*=|^\})', REGIONAL, re.M | re.S)
+            if not assignment:
+                raise AssertionError("Missing GuardDuty local " + name)
+            body = re.sub(r'(?m)^\s*#.*$', '', assignment.group(1)).strip()
+            expression = expression.replace(reference.group(0), '(' + body + ')')
+        raise AssertionError("GuardDuty local expansion exceeded its bound")
+
+    def native_json_value(self, expression):
+        expression = re.sub(r'(?m)^\s*#.*$', '', expression)
+        expression = re.sub(r'(?<=[\w"\]})])\n(?=\s*["\w][^\n]*=)', ', ', expression)
+        with tempfile.TemporaryDirectory(prefix="security-guardduty-native-") as directory:
+            result = subprocess.run([os.environ["SECURITY_TEST_TERRAFORM"], "console", "-no-color"],
+                input="jsonencode(" + " ".join(expression.splitlines()) + ")\n", text=True,
+                capture_output=True, timeout=15, cwd=directory,
+                env={"CHECKPOINT_DISABLE": "1", "TF_CLI_CONFIG_FILE": "/dev/null", "TF_IN_AUTOMATION": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(json.loads(result.stdout.strip()))
+
+    def native_guardduty_desired_states(self):
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        desired = detector.split("desired_state = ", 1)[1].split("\n  lifecycle", 1)[0]
+        desired = self.expanded_guardduty_expression(desired).replace("data.aws_region.current.name", "region")
+        return self.native_json_value('{for region in ' + json.dumps(REGIONS) + ' : region => jsondecode(' + desired + ')}')
+
+    @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free regional matrix guard runs above")
+    def test_actual_guardduty_desired_state_disables_every_supported_feature_in_all_regions(self):
+        states = self.native_guardduty_desired_states()
+        self.assertEqual(set(states), set(REGIONS))
+        for region, state in states.items():
+            with self.subTest(region=region):
+                self.assertIs(state["Enable"], True)
+                self.assertEqual(state["FindingPublishingFrequency"], "FIFTEEN_MINUTES")
+                features = state["Features"]
+                expected = GUARDDUTY_BASE_FEATURES | ({"AI_ANALYST"} if region in GUARDDUTY_ANALYST_REGIONS else set())
+                self.assertEqual({feature["Name"] for feature in features}, expected)
+                self.assertEqual(len(features), len(expected))
+                self.assertTrue(all(feature["Status"] == "DISABLED" for feature in features))
+                runtime = next(feature for feature in features if feature["Name"] == "RUNTIME_MONITORING")
+                self.assertEqual({agent["Name"]: agent["Status"] for agent in runtime["AdditionalConfiguration"]}, {
+                    "EKS_ADDON_MANAGEMENT": "DISABLED", "ECS_FARGATE_AGENT_MANAGEMENT": "DISABLED", "EC2_AGENT_MANAGEMENT": "DISABLED"})
+                self.assertEqual(len(runtime["AdditionalConfiguration"]), 3)
+                self.assertTrue(all("AdditionalConfiguration" not in feature for feature in features if feature["Name"] != "RUNTIME_MONITORING"))
+                self.assertNotIn("DataSources", state)
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        region_guard = re.search(r'precondition\s*\{\s*condition\s*=(.*?)\n\s*error_message', detector, re.S).group(1)
+        region_guard = self.expanded_guardduty_expression(region_guard).replace("data.aws_region.current.name", "region")
+        guarded = self.native_json_value('{for region in ' + json.dumps(REGIONS + ["af-south-1", "future-region-1"]) + ' : region => ' + region_guard + '}')
+        self.assertEqual(guarded, {**{region: True for region in REGIONS}, "af-south-1": False, "future-region-1": False})
+
+    @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free disabled-feature guard runs above")
+    def test_actual_guardduty_feature_readback_allows_only_documented_absence(self):
+        states = self.native_guardduty_desired_states()
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        conditions = re.findall(r'postcondition\s*\{\s*condition\s*=(.*?)\n\s*error_message\s*=\s*"([^"]+)"', detector, re.S)
+        expression = next(value for value, message in conditions if message.startswith("GuardDuty optional"))
+        for region in ("us-west-1", "us-east-1"):
+            good = states[region]
+            fixtures = [("all supported disabled", good, True)]
+            for name in [feature["Name"] for feature in good["Features"]]:
+                missing = copy.deepcopy(good)
+                missing["Features"] = [feature for feature in missing["Features"] if feature["Name"] != name]
+                enabled = copy.deepcopy(good)
+                next(feature for feature in enabled["Features"] if feature["Name"] == name)["Status"] = "ENABLED"
+                fixtures.extend([(name + " missing", missing, False), (name + " enabled", enabled, False)])
+            for name in ("AI_ANALYST", "UNREVIEWED_FUTURE_FEATURE"):
+                for status in ("DISABLED", "ENABLED"):
+                    added = copy.deepcopy(good)
+                    added["Features"] = [feature for feature in added["Features"] if feature["Name"] != name]
+                    added["Features"].append({"Name": name, "Status": status})
+                    fixtures.append((name + " " + status, added, status == "DISABLED"))
+            for invalid in (None, [], {}):
+                malformed = copy.deepcopy(good)
+                malformed["Features"] = invalid
+                fixtures.append(("malformed features", malformed, False))
+            rendered_cases = {}
+            for index, (label, properties, expected) in enumerate(fixtures):
+                rendered = self.expanded_guardduty_expression(expression).replace("data.aws_region.current.name", json.dumps(region))
+                rendered = rendered.replace("self.properties", json.dumps(json.dumps(properties)))
+                rendered_cases[str(index)] = (label, rendered, expected)
+            actual = self.native_json_value('{' + ','.join(json.dumps(index) + ' = (' + rendered + ')' for index, (_, rendered, _) in rendered_cases.items()) + '}')
+            for index, (label, _, expected) in rendered_cases.items():
+                with self.subTest(region=region, case=label):
+                    self.assertIs(actual[index], expected)
 
     def test_guardduty_nested_agent_postcondition_is_strict(self):
         detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
