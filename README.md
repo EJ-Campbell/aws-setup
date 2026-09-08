@@ -752,6 +752,14 @@ orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.m
 for the protocol and failure behavior. An additive apply alone does not close the old
 PAT or CI escalation paths.
 
+The temporary runner IAM fixture source is removed for cost cleanup, independently of
+those still-required acceptance gates. Apply only a fresh plan deleting its two canary
+hosts and two non-credential parameters, then verify their absence; a merge alone does
+not stop billing. Before any later cutoff, recreate fresh Terraform-managed fixtures
+and repeat the required checks. The checker/tests and [exact cleanup/recreation scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance)
+are retained; this cleanup does not retire runner PAT permissions or authorize skipping
+real broker-job acceptance.
+
 The repository also manages:
 
 - a private CodeArtifact npm repository in `us-west-2`;
