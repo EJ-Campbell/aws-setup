@@ -725,11 +725,17 @@ has separate deployment gates; merging source is not evidence that a gate is liv
 2. Deploy the backward-compatible runner controller and expiry cleanup. Its
    `iam:PassRole` grant is independently restricted to the existing runner role and
    EC2, with explicit denies for other roles/services. Verify the deployed code and
-   full IAM allow/deny cases before changing bootstrap. This source still publishes
-   the existing PAT-reading user data and retains its instance-role permissions.
-3. Publish the instance-bound bootstrap only after controller acceptance, then verify
+   full IAM allow/deny cases before changing bootstrap. The controller-only stage
+   keeps the PAT-reading document and its instance-role permissions intact.
+3. Publish this source's instance-bound bootstrap only after controller acceptance, then verify
    a real trusted CI registration/job and drain instances booted with the old script.
    Non-secret IAM fixtures test authorization, not registration or job execution.
+   New hosts register for one job, delete their bootstrap credential before service
+   startup, and power off when the service ends; EC2 then terminates them. The old
+   PAT grant and broad SSM attachment intentionally still exist in this source.
+   The runner release and asset checksums are pinned and automatic updates disabled;
+   review each release bump before GitHub's 30-day update deadline (immediately for
+   required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
 4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
    the remaining controller EC2 launch resources after all launched resources carry
    the required tags. The old CI authority is retired separately, only after the
