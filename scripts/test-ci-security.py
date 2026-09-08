@@ -52,6 +52,7 @@ class CISecurityTests(unittest.TestCase):
         self.assertIn('terraform init -backend=false -lockfile=readonly', workflow)
         self.assertIn('terraform validate', workflow)
         self.assertIn('persist-credentials: false', workflow)
+        self.assertRegex(workflow, r'(?m)^          fetch-depth: 0$')
         for forbidden in ['id-token:', 'configure-aws-credentials', 'role-to-assume',
                           'secrets.', 'terraform plan', 'terraform apply',
                           'terraform output', 'terraform state']:
