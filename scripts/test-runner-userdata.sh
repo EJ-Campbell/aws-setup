@@ -20,6 +20,8 @@ TF_FILE="$(dirname "$0")/../runner-autoscale.tf"
 [ -f "$TF_FILE" ] || { echo "cannot find runner-autoscale.tf next to $0" >&2; exit 2; }
 VPC_FILE="$(dirname "$0")/../runner-vpc.tf"
 [ -f "$VPC_FILE" ] || { echo "cannot find runner-vpc.tf next to $0" >&2; exit 2; }
+BOOTSTRAP_FILE="$(dirname "$0")/../runner-bootstrap.tf"
+[ -f "$BOOTSTRAP_FILE" ] || { echo "cannot find runner-bootstrap.tf next to $0" >&2; exit 2; }
 
 # `<<-EOF` here only strips tabs and the content starts at column 0, so the body
 # needs no dedent. Terraform's `$${` escape becomes a literal `${` on the host.
@@ -154,18 +156,45 @@ fi
 #        claims this instance ARN in DynamoDB, and only then starts the service.
 echo "registration provenance:"
 TRACE_OFF_LINE=$(grep -n '^set +x$' "$USERDATA" | head -1 | cut -d: -f1)
-PAT_LINE=$(grep -n '^PAT=' "$USERDATA" | head -1 | cut -d: -f1)
+TOKEN_LINE=$(grep -n 'REG_TOKEN=$(bootstrap_ssm' "$USERDATA" | head -1 | cut -d: -f1)
 RUNNER_ID_LINE=$(grep -n '\.agentId' "$USERDATA" | head -1 | cut -d: -f1)
 CLAIM_LINE=$(grep -n 'aws dynamodb put-item' "$USERDATA" | head -1 | cut -d: -f1)
 CONSISTENT_LINE=$(grep -n -- '--consistent-read' "$USERDATA" | head -1 | cut -d: -f1)
 INSTALL_LINE=$(grep -n './svc.sh install' "$USERDATA" | head -1 | cut -d: -f1)
 START_LINE=$(grep -n './svc.sh start' "$USERDATA" | head -1 | cut -d: -f1)
 
-if [ -n "$TRACE_OFF_LINE" ] && [ -n "$PAT_LINE" ] \
-   && [ "$TRACE_OFF_LINE" -lt "$PAT_LINE" ]; then
-    ok "xtrace is disabled before either GitHub token is read"
+if [ -n "$TRACE_OFF_LINE" ] && [ -n "$TOKEN_LINE" ] \
+   && [ "$TRACE_OFF_LINE" -lt "$TOKEN_LINE" ]; then
+    ok "xtrace is disabled before the registration credential is read"
 else
-    bad "GitHub tokens can reach cloud-init xtrace (set+x=$TRACE_OFF_LINE PAT=$PAT_LINE)"
+    bad "registration credential can reach cloud-init xtrace (set+x=$TRACE_OFF_LINE token=$TOKEN_LINE)"
+fi
+
+if ! grep -Eq '^PAT=|ssm get-parameter --name /github-runner/pat|Authorization: token' "$USERDATA" \
+   && grep -q -- '--ephemeral' "$USERDATA" \
+   && grep -q -- '--disableupdate' "$USERDATA" \
+   && grep -q 'BOOTSTRAP_PARAM="/github-runner/bootstrap/\$INSTANCE_ID"' "$USERDATA"; then
+    ok "bootstrap fetches only its instance-bound token and registers an ephemeral runner"
+else
+    bad "bootstrap retains a reusable GitHub credential or omits ephemeral registration"
+fi
+
+if grep -q '^Restart=no$' "$USERDATA" \
+   && grep -q '^Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1$' "$USERDATA" \
+   && grep -q '^ExecStopPost=+/usr/bin/systemctl --no-block poweroff$' "$USERDATA" \
+   && grep -q "InstanceInitiatedShutdownBehavior='terminate'" "$TF_FILE"; then
+    ok "a finished single-job service powers off and EC2 terminates the host"
+else
+    bad "single-job completion can leave an idle runner host or restart the service"
+fi
+
+if grep -q 'AWS_MAX_ATTEMPTS=1 timeout --kill-after=2 12 aws ssm' "$USERDATA" \
+   && grep -q 'BOOTSTRAP_DEADLINE=$((SECONDS + 180))' "$USERDATA" \
+   && grep -q 'for BOOTSTRAP_ATTEMPT in $(seq 1 36)' "$USERDATA" \
+   && grep -q 'trap runner_bootstrap_exit EXIT' "$USERDATA"; then
+    ok "credential polling and failure cleanup are bounded and request shutdown"
+else
+    bad "credential fetch/failure handling can stall bootstrap or leave it running"
 fi
 
 if [ -n "$RUNNER_ID_LINE" ] && [ -n "$CLAIM_LINE" ] \
@@ -189,11 +218,11 @@ else
 fi
 
 # shellcheck disable=SC2016 # Terraform must emit the literal IAM policy variable.
-if grep -q 'dynamodb:LeadingKeys' "$VPC_FILE" \
-   && grep -q '\$${ec2:SourceInstanceARN}' "$VPC_FILE" \
-   && grep -q 'dynamodb:GetItem' "$VPC_FILE" \
-   && grep -q 'dynamodb:PutItem' "$VPC_FILE" \
-   && ! grep -Eq 'dynamodb:(Scan|Query|UpdateItem|DeleteItem)' "$VPC_FILE"; then
+if grep -q 'dynamodb:LeadingKeys' "$BOOTSTRAP_FILE" \
+   && grep -q '\$${ec2:SourceInstanceARN}' "$BOOTSTRAP_FILE" \
+   && grep -q 'dynamodb:GetItem' "$BOOTSTRAP_FILE" \
+   && grep -q 'dynamodb:PutItem' "$BOOTSTRAP_FILE" \
+   && ! grep -Eq 'dynamodb:(Scan|Query|UpdateItem|DeleteItem)' "$BOOTSTRAP_FILE"; then
     ok "runner role can claim only its source-instance ARN row"
 else
     bad "runner role lacks source-instance-scoped registration-table access"
@@ -217,7 +246,7 @@ fi
 # so a launch in that window boots a claiming bootstrap with no PutItem
 # permission: it fails closed, deregisters, and costs a metal spot box-hour.
 if awk '/resource "aws_ssm_parameter" "runner_user_data"/{f=1} f{print} f&&/^\}$/{exit}' \
-     "$TF_FILE" | grep -q 'aws_iam_role_policy.runner,'; then
+     "$TF_FILE" | grep -q 'aws_iam_role_policy.runner_bootstrap,'; then
     ok "user data that claims registration waits for the grant that allows it"
 else
     bad "aws_ssm_parameter.runner_user_data can be written before the runner grant"
@@ -225,10 +254,10 @@ fi
 
 if grep -q 'aws_lambda_function.runner_cleanup,' "$TF_FILE" \
    && grep -q 'aws_iam_role_policy.runner_lambda,' "$TF_FILE" \
-   && grep -q 'aws_iam_role_policy.runner,' "$TF_FILE" \
-   && grep -q 'aws_iam_role_policy.runner_bootstrap_controller,' "$TF_FILE" \
+   && grep -q 'aws_iam_role_policy.runner_bootstrap,' "$TF_FILE" \
+   && grep -q 'aws_lambda_function.runner_webhook,' "$TF_FILE" \
    && grep -q 'WEBHOOK_FUNCTION   = "github-runner-webhook"' "$TF_FILE"; then
-    ok "controller-first activation waits for cleanup and additive IAM; old user data retains its grant"
+    ok "broker user data waits for the controller, cleanup, and additive IAM"
 else
     bad "Terraform rollout can activate ddb-v1 before both protocol participants"
 fi
@@ -239,19 +268,112 @@ echo "registration interleavings:"
 REG_TMP=$(mktemp -d)
 trap 'rm -f "$USERDATA"; rm -rf "$REG_TMP"' EXIT
 mkdir -p "$REG_TMP/bin" "$REG_TMP/work"
+
+# Execute the real package block without network access. Good-package cases mock
+# only digest success; the corrupt-package case uses the real checksum utility.
+# Every case checks the selected official digest and requires verification before
+# the fake extractor can run. Actual release packages are verified separately at
+# each reviewed version bump.
+echo "verified runner package:"
+if grep -q '^RUNNER_VERSION="2.337.0"$' "$USERDATA" \
+   && ! grep -q 'actions/runner/releases/latest' "$USERDATA"; then
+    ok "runner version is pinned instead of resolved from mutable latest"
+else
+    bad "runner package can drift away from the reviewed wrapper version"
+fi
+DOWNLOAD_BLOCK="$REG_TMP/download.sh"
+{
+    echo 'set -euo pipefail'
+    sed -n '/^RUNNER_VERSION=/,/^chown -R ubuntu:ubuntu \/opt\/actions-runner$/p' "$USERDATA" \
+      | sed "s|/opt/actions-runner|$REG_TMP/package|g"
+} > "$DOWNLOAD_BLOCK"
+
+download_case() { # scenario arch expected_rc expected_extract
+    local scenario=$1 arch=$2 want_rc=$3 want_extract=$4 rc=0
+    local journal="$REG_TMP/download-$scenario-$arch.log"
+    : > "$journal"
+    (
+      curl() {
+        echo download >> "$JOURNAL"
+        case " $* " in
+          *" https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-$RUNNER_ARCH-2.337.0.tar.gz -o runner.tar.gz ") : ;;
+          *) return 90 ;;
+        esac
+        [ "$FAKE_SCENARIO" != download_failure ] || return 22
+        printf 'deliberately not a runner archive\n' > runner.tar.gz
+      }
+      sha256sum() {
+        local digest filename
+        read -r digest filename
+        [ "$filename" = runner.tar.gz ] || return 91
+        case "$RUNNER_ARCH:$digest" in
+          arm64:9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393) : ;;
+          x64:70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613) : ;;
+          *) return 91 ;;
+        esac
+        if [ "$FAKE_SCENARIO" = checksum_failure ]; then
+          printf '%s  %s\n' "$digest" "$filename" | command sha256sum "$@"
+          return $?
+        fi
+        echo verified >> "$JOURNAL"
+      }
+      tar() {
+        [ "$*" = 'xzf runner.tar.gz' ] || return 92
+        grep -q '^verified$' "$JOURNAL" || return 92
+        echo extract >> "$JOURNAL"
+      }
+      chown() { :; }
+      export -f curl sha256sum tar chown
+      FAKE_SCENARIO="$scenario" JOURNAL="$journal" RUNNER_ARCH="$arch" \
+        bash "$DOWNLOAD_BLOCK"
+    ) > "$REG_TMP/download-$scenario-$arch.output" 2>&1 || rc=$?
+    local extracted=0
+    grep -q '^extract$' "$journal" && extracted=1
+    if [ "$rc" = "$want_rc" ] && [ "$extracted" = "$want_extract" ] \
+       && { [ "$rc" = 0 ] || grep -q '^FATAL:' "$REG_TMP/download-$scenario-$arch.output"; }; then
+      ok "package $scenario/$arch (rc=$rc extracted=$extracted)"
+    else
+      bad "package $scenario/$arch: got $rc/$extracted expected $want_rc/$want_extract"
+    fi
+}
+download_case verified arm64 0 1
+download_case verified x64 0 1
+download_case checksum_failure arm64 1 0
+download_case download_failure x64 1 0
+download_case unsupported ppc64 1 0
+
 REG_BLOCK="$REG_TMP/registration.sh"
 {
     echo 'set -euo pipefail'
     # shellcheck disable=SC2016 # Replace a literal Terraform interpolation in the extracted text.
     sed -n '/# Do not xtrace either token/,$p' "$USERDATA" \
-      | sed 's/${local\.runner_registration_table_name}/github-runner-registration/g'
+      | sed 's/${local\.runner_registration_table_name}/github-runner-registration/g' \
+      | sed "s|/etc/systemd/system|$REG_TMP/systemd|g"
 } > "$REG_BLOCK"
 
 cat > "$REG_TMP/bin/aws" <<'FAKE_AWS'
 #!/bin/bash
 set -eu
 if [ "$1 $2" = "ssm get-parameter" ]; then
-    echo ghp_test
+    [ "$AWS_MAX_ATTEMPTS" = 1 ] || exit 95
+    echo token-read >> "$JOURNAL"
+    case " $* " in
+      *" --name /github-runner/bootstrap/i-test "*) : ;;
+      *) echo "bootstrap requested someone else's credential: $*" >&2; exit 90 ;;
+    esac
+    [ "$FAKE_SCENARIO" = credential_missing ] && exit 1
+    if [ "$FAKE_SCENARIO" = credential_late ] && [ "$(grep -c '^token-read$' "$JOURNAL")" = 1 ]; then
+        exit 1
+    fi
+    echo registration-token
+elif [ "$1 $2" = "ssm delete-parameter" ]; then
+    [ "$AWS_MAX_ATTEMPTS" = 1 ] || exit 95
+    case " $* " in
+      *" --name /github-runner/bootstrap/i-test "*) : ;;
+      *) echo "bootstrap deletes someone else's credential" >&2; exit 90 ;;
+    esac
+    [ "$FAKE_SCENARIO" = credential_delete_failure ] && exit 1
+    echo delete >> "$JOURNAL"
 elif [ "$1 $2" = "dynamodb put-item" ]; then
     echo put-item >> "$JOURNAL"
     # The claim IS the conditional create. A put without it overwrites a row
@@ -260,7 +382,9 @@ elif [ "$1 $2" = "dynamodb put-item" ]; then
       *" --condition-expression attribute_not_exists(InstanceArn) "*) : ;;
       *) echo "put-item is not a conditional create: $*" >&2; exit 90 ;;
     esac
-    [ "$FAKE_SCENARIO" = bootstrap ] && exit 0
+    case "$FAKE_SCENARIO" in
+      bootstrap|credential_delete_failure|credential_late|invalid_service|install_failure|start_failure) exit 0 ;;
+    esac
     exit 1
 elif [ "$1 $2" = "dynamodb get-item" ]; then
     echo get-item >> "$JOURNAL"
@@ -301,11 +425,11 @@ cat > "$REG_TMP/bin/curl" <<'FAKE_CURL'
 set -eu
 case "$*" in
   *dynamic/instance-identity/document*)
+    if [ "$FAKE_SCENARIO" = wrong_region ]; then
+        printf '%s\n' '{"accountId":"928413605543","region":"us-east-1"}'
+        exit 0
+    fi
     printf '%s\n' '{"accountId":"928413605543","region":"us-west-1"}' ;;
-  *registration-token*)
-    printf '%s\n' '{"token":"registration-token"}' ;;
-  *"-X DELETE"*)
-    echo delete >> "$JOURNAL" ;;
   *)
     echo "unexpected curl call: $*" >&2; exit 91 ;;
 esac
@@ -324,15 +448,53 @@ FAKE_SUDO
 cat > "$REG_TMP/work/config.sh" <<'FAKE_CONFIG'
 #!/bin/bash
 set -eu
+case " $* " in
+  *" --ephemeral "*) : ;;
+  *) echo "registration is not ephemeral" >&2; exit 92 ;;
+esac
+case " $* " in
+  *" --disableupdate "*) : ;;
+  *) echo "registration permits an unverified wrapper update" >&2; exit 92 ;;
+esac
+echo config >> "$JOURNAL"
+[ "$FAKE_SCENARIO" = config_failure ] && exit 1
+if [ "$FAKE_SCENARIO" = invalid_identity ]; then
+    echo '{"agentId":77,"agentName":"runner-someone-else"}' > .runner
+    exit 0
+fi
 printf '{"agentId":77,"agentName":"runner-%s","poolId":1,"poolName":"Default","serverUrl":"https://pipelines.actions.githubusercontent.com/x","gitHubUrl":"https://github.com/ejc3/fcvm","workFolder":"_work"}\n' "$INSTANCE_ID" > .runner
 FAKE_CONFIG
 
 cat > "$REG_TMP/work/svc.sh" <<'FAKE_SVC'
 #!/bin/bash
 set -eu
+if [ "$1" = start ]; then
+    # Installing/enabling must not expose a service without its single-job
+    # shutdown drop-in. This runs before the fake records a successful start.
+    test -f "$FAKE_SYSTEMD_DIR/$(tr -d '\r\n' < .service).d/ephemeral.conf"
+    [ "$FAKE_SCENARIO" = start_failure ] && exit 1
+fi
 echo "svc:$*" >> "$JOURNAL"
+if [ "$1" = install ]; then
+    [ "$FAKE_SCENARIO" = install_failure ] && exit 1
+    if [ "$FAKE_SCENARIO" = invalid_service ]; then
+        echo '../../unsafe.service' > .service
+    else
+        echo "actions.runner.ejc3-fcvm.runner-$INSTANCE_ID.service" > .service
+    fi
+fi
 FAKE_SVC
+cat > "$REG_TMP/bin/systemctl" <<'FAKE_SYSTEMCTL'
+#!/bin/bash
+set -eu
+echo "systemctl:$*" >> "$JOURNAL"
+FAKE_SYSTEMCTL
+cat > "$REG_TMP/bin/sleep" <<'FAKE_SLEEP'
+#!/bin/bash
+exit 0
+FAKE_SLEEP
 chmod +x "$REG_TMP/bin/aws" "$REG_TMP/bin/curl" "$REG_TMP/bin/sudo" \
+  "$REG_TMP/bin/systemctl" "$REG_TMP/bin/sleep" \
   "$REG_TMP/work/config.sh" "$REG_TMP/work/svc.sh" "$REG_BLOCK"
 
 registration_case() { # scenario expected_rc expected_service expected_delete
@@ -343,13 +505,38 @@ registration_case() { # scenario expected_rc expected_service expected_delete
     (
       cd "$REG_TMP/work"
       PATH="$REG_TMP/bin:$PATH" \
-      FAKE_SCENARIO="$scenario" JOURNAL="$journal" \
+      FAKE_SCENARIO="$scenario" JOURNAL="$journal" FAKE_SYSTEMD_DIR="$REG_TMP/systemd" \
       INSTANCE_ID=i-test RUNNER_LABEL=ARM64 TOKEN=imdsv2-token REGION=us-west-1 \
         bash "$REG_BLOCK"
-    ) >/dev/null 2>&1 || rc=$?
+    ) >"$REG_TMP/$scenario.output" 2>&1 || rc=$?
+    if grep -q 'registration-token' "$REG_TMP/$scenario.output"; then
+        bad "$scenario: registration credential leaked to bootstrap output"
+        return
+    fi
+    if [ "$rc" != 0 ] && ! grep -q '^systemctl:--no-block poweroff$' "$journal"; then
+        bad "$scenario: failed bootstrap did not request disposable-host shutdown"
+        return
+    fi
+    if [ "$rc" = 0 ] && grep -q '^systemctl:--no-block poweroff$' "$journal"; then
+        bad "$scenario: successful bootstrap powered off before its job"
+        return
+    fi
+    if [ "$scenario" = credential_missing ] && [ "$(grep -c '^token-read$' "$journal")" != 36 ]; then
+        bad "$scenario: credential polling exceeded or missed the bounded retry gate"
+        return
+    fi
     local service=0 deleted=0
     grep -q '^svc:start$' "$journal" && service=1
     grep -q '^delete$' "$journal" && deleted=1
+    if [ "$service" = 1 ]; then
+        local delete_line start_line
+        delete_line=$(grep -n '^delete$' "$journal" | head -1 | cut -d: -f1)
+        start_line=$(grep -n '^svc:start$' "$journal" | head -1 | cut -d: -f1)
+        if [ -z "$delete_line" ] || [ "$delete_line" -ge "$start_line" ]; then
+            bad "$scenario: service started before credential deletion"
+            return
+        fi
+    fi
     if [ "$rc" = "$want_rc" ] && [ "$service" = "$want_service" ] \
        && [ "$deleted" = "$want_delete" ]; then
         ok "$scenario (rc=$rc service=$service delete=$deleted)"
@@ -358,8 +545,17 @@ registration_case() { # scenario expected_rc expected_service expected_delete
     fi
 }
 
-registration_case bootstrap          0 1 0
-registration_case unknown_registered 0 1 0
+registration_case bootstrap          0 1 1
+registration_case unknown_registered 0 1 1
+registration_case credential_late    0 1 1
+registration_case credential_missing 1 0 1
+registration_case credential_delete_failure 1 0 0
+registration_case invalid_service    1 0 1
+registration_case config_failure     1 0 1
+registration_case invalid_identity   1 0 1
+registration_case wrong_region       1 0 1
+registration_case install_failure    1 0 1
+registration_case start_failure      1 0 1
 registration_case cleanup            1 0 1
 registration_case unread             1 0 1
 # A `registered` row under this ARN that names a different runner id is not

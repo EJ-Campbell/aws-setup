@@ -76,13 +76,8 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
   }
 }
 
-# External access analysis is free; unused/internal access analysis is a separate
-# paid product and is deliberately not enabled by this baseline.
-resource "aws_accessanalyzer_analyzer" "external" {
-  analyzer_name = "security-external-access"
-  type          = "ACCOUNT"
-  tags          = { Managed = "terraform" }
-}
+# Free account-zone analyzers and their service-linked roles are owned separately
+# by security-external-access.tf; this module only forwards their findings.
 
 # Forward useful security events without requiring email confirmation in 34 regions.
 # Public SSH/ET is an explicit operator requirement. Controls continue to evaluate

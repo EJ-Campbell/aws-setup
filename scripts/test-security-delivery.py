@@ -428,9 +428,15 @@ class TerraformSafetyTests(unittest.TestCase):
     def test_posture_staged_off_without_disabling_foundation(self):
         self.assertRegex(TERRAFORM, r'\bsecurity_posture_enabled\s*=\s*false\b')
         self.assertNotRegex(TERRAFORM, r'\bposture_enabled\s*=\s*true\b')
-        for kind, name in (("aws_cloudcontrolapi_resource", "guardduty"),
-                           ("aws_accessanalyzer_analyzer", "external")):
-            self.assertNotIn("posture_enabled", block(REGIONAL, kind, name))
+        self.assertNotIn("posture_enabled", block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty"))
+
+    def test_external_analyzers_have_a_single_separate_owner(self):
+        external = (ROOT / "security-external-access.tf").read_text()
+        self.assertNotIn('resource "aws_accessanalyzer_analyzer"', REGIONAL)
+        self.assertNotIn('resource "aws_accessanalyzer_analyzer"', TERRAFORM)
+        self.assertEqual(external.count('resource "aws_accessanalyzer_analyzer"'), 34)
+        self.assertEqual(external.count('resource "aws_iam_service_linked_role"'), 2)
+        self.assertNotIn("posture_enabled", external)
 
     def test_defaults_have_a_single_separate_owner(self):
         defaults = (ROOT / "modules/security-defaults/main.tf").read_text()

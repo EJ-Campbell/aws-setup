@@ -725,11 +725,17 @@ has separate deployment gates; merging source is not evidence that a gate is liv
 2. Deploy the backward-compatible runner controller and expiry cleanup. Its
    `iam:PassRole` grant is independently restricted to the existing runner role and
    EC2, with explicit denies for other roles/services. Verify the deployed code and
-   full IAM allow/deny cases before changing bootstrap. This source still publishes
-   the existing PAT-reading user data and retains its instance-role permissions.
-3. Publish the instance-bound bootstrap only after controller acceptance, then verify
+   full IAM allow/deny cases before changing bootstrap. The controller-only stage
+   keeps the PAT-reading document and its instance-role permissions intact.
+3. Publish this source's instance-bound bootstrap only after controller acceptance, then verify
    a real trusted CI registration/job and drain instances booted with the old script.
    Non-secret IAM fixtures test authorization, not registration or job execution.
+   New hosts register for one job, delete their bootstrap credential before service
+   startup, and power off when the service ends; EC2 then terminates them. The old
+   PAT grant and broad SSM attachment intentionally still exist in this source.
+   The runner release and asset checksums are pinned and automatic updates disabled;
+   review each release bump before GitHub's 30-day update deadline (immediately for
+   required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
 4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
    the remaining controller EC2 launch resources after all launched resources carry
    the required tags. The old CI authority is retired separately, only after the
@@ -977,10 +983,10 @@ do not prove existing hosts or disks have been remediated.
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
 pairs). The foundation records organization-wide management events and object access
-to the Terraform-state and dev-script buckets, enables external Access Analyzer and
-base GuardDuty, and records traffic for the three active VPCs. The regional EBS,
-IMDS and snapshot-sharing defaults above have a separate owner and are not recreated
-by these monitoring modules. Monitoring does **not**
+to the Terraform-state and dev-script buckets, enables base GuardDuty, and records
+traffic for the three active VPCs. Regional EBS, IMDS and snapshot-sharing defaults
+and the free external-access analyzers have independent owners; these monitoring
+modules do not recreate them. Monitoring does **not**
 migrate existing disks, restrict the required public SSH/ET access, remove Cloudflare
 service-token access, or change the verified backup pipeline.
 
@@ -1014,8 +1020,9 @@ second detector. A failed live-property postcondition requires an administrator 
 diagnose and review a repair or future typed-resource migration; it does not perform
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
-After the separate 102 regional defaults, the monitoring foundation adds 259 managed
-Terraform resource instances plus one existing SNS topic-policy update; the posture
+After the separate 102 regional defaults and 36 external-analysis resources, the
+monitoring foundation adds 225 managed Terraform resource instances plus one existing
+SNS topic-policy update; the posture
 gate adds 45 more. These are source counts, not
 a substitute for the fresh plan. Many are free control settings or permissions, not
 individually billed workloads. No existing compute, volume or backup resource should
@@ -1079,6 +1086,37 @@ not measured forecasts or a spending cap. Review Cost Explorer usage types and G
 usage statistics after the first complete week; initial Config inventory, rapid runner
 churn or unusually noisy network activity can raise the bill. The existing account-wide
 cost alerts remain useful, but do not enforce a monitoring-only budget limit.
+
+## External access findings
+
+`security-external-access.tf` creates 34 external-access analyzers: one `ACCOUNT`
+analyzer named `security-external-access` in each account/region covered by the
+regional defaults above. It reuses the same providers and does not enable regions.
+AWS lists external analysis at [no additional charge](https://aws.amazon.com/iam/access-analyzer/pricing/);
+paid internal-access/unused-access analyzers and paid custom policy checks are not
+enabled. Terraform also owns the two required `AWSServiceRoleForAccessAnalyzer` roles,
+one per account (36 resources total). Each account's analyzers depend on its own role
+to avoid racing first-time service-role creation. Only Access Analyzer can assume
+this read-only, service-owned resource-metadata role; its trust/permissions are defined
+by AWS, not custom grants to operators or workloads. No workload role gains permissions.
+See [service-role boundary](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-using-service-linked-roles.html).
+
+This reports supported resource-policy access from outside the account, including
+public and cross-account sharing. It is not an access-control enforcement or proof
+that all identity-policy escalation paths are closed. Intentional sharing between
+the main and recovery accounts can generate findings because each account is its
+own trust boundary. No findings are automatically archived; inspect their resource,
+principal and policy before deciding whether access is intended. Creating an analyzer
+does not change public SSH, Cloudflare service-token access, disks or backup sharing.
+
+This free stage does not add email delivery. Findings are available through the
+Access Analyzer API; the separately reviewed monitoring stage can forward finding
+events later. After the fresh full plan/apply, verify all 34 analyzers have exactly
+`type=ACCOUNT` and `status=ACTIVE` using `list-analyzers`/`get-analyzer`, then inspect
+active findings with `list-findings`. Allow the documented analysis delay (policy
+changes can take up to 30 minutes); an immediately empty list is not a completed
+security audit. Do not silently create a second analyzer or replace an existing
+one if preflight finds account-level analysis already configured.
 
 ## Private browser manager
 
@@ -1422,6 +1460,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
+| Free external-access findings | `security-external-access.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
