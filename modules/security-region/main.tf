@@ -82,94 +82,108 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
 # Forward useful security events without requiring email confirmation in 34 regions.
 # Public SSH/ET is an explicit operator requirement. Controls continue to evaluate
 # it; no blanket suppression hides unrelated new public administration exposures.
+locals {
+  # Default EventBridge pattern quota is 2,048 characters. Keep findings separate
+  # from CloudTrail events; the detail types are disjoint, so root tampering does
+  # not create duplicate notifications. These exact strings also feed the observer.
+  security_event_patterns = {
+    security-forward-findings = jsonencode({
+      "$or" = [
+        {
+          source        = ["aws.guardduty"]
+          "detail-type" = ["GuardDuty Finding"]
+          detail        = { severity = [{ numeric = [">=", 4] }], service = { archived = [false] } }
+        },
+        {
+          source        = ["aws.access-analyzer"]
+          "detail-type" = ["Access Analyzer Finding"]
+          detail        = { status = ["ACTIVE"] }
+        },
+        {
+          source        = ["aws.securityhub"]
+          "detail-type" = ["Security Hub Findings - Imported"]
+          detail = { findings = {
+            Severity    = { Label = ["HIGH", "CRITICAL"] }
+            RecordState = ["ACTIVE"]
+            Workflow    = { Status = ["NEW"] }
+          } }
+        },
+        {
+          source        = ["aws.inspector2"]
+          "detail-type" = ["Inspector2 Finding"]
+          detail        = { severity = ["HIGH", "CRITICAL"], status = ["ACTIVE"] }
+        },
+      ]
+    })
+    security-forward-audit = jsonencode({
+      "$or" = [
+        {
+          "detail-type" = ["AWS API Call via CloudTrail", "AWS Console Sign In via CloudTrail"]
+          detail        = { userIdentity = { type = ["Root"] } }
+        },
+        {
+          "detail-type" = ["AWS Console Sign In via CloudTrail"]
+          detail        = { eventName = ["ConsoleLogin"], responseElements = { ConsoleLogin = ["Failure"] } }
+        },
+        {
+          "detail-type" = ["AWS API Call via CloudTrail"]
+          detail = {
+            "$or" = [
+              {
+                eventSource = ["cloudtrail.amazonaws.com", "guardduty.amazonaws.com", "config.amazonaws.com", "securityhub.amazonaws.com", "access-analyzer.amazonaws.com"]
+                eventName   = ["StopLogging", "DeleteTrail", "UpdateTrail", "PutEventSelectors", "DeleteDetector", "UpdateDetector", "StopConfigurationRecorder", "DeleteConfigurationRecorder", "DisableSecurityHub", "DeleteAnalyzer"]
+              },
+              {
+                eventSource = ["iam.amazonaws.com"]
+                eventName   = ["CreateUser", "CreateAccessKey", "CreateLoginProfile", "UpdateLoginProfile", "AddUserToGroup", "AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy", "PutUserPolicy", "PutRolePolicy", "PutGroupPolicy", "UpdateAssumeRolePolicy", "DeleteRolePermissionsBoundary", "DeleteUserPermissionsBoundary"]
+              },
+              {
+                eventSource = ["kms.amazonaws.com"]
+                eventName   = ["DisableKey", "ScheduleKeyDeletion", "PutKeyPolicy", "DisableKeyRotation"]
+              },
+              {
+                eventSource = ["backup.amazonaws.com"]
+                eventName   = ["DeleteBackupVault", "DeleteBackupPlan", "DeleteBackupSelection", "UpdateBackupPlan", "PutBackupVaultAccessPolicy", "DeleteBackupVaultAccessPolicy", "PutBackupVaultLockConfiguration", "DeleteBackupVaultLockConfiguration", "UpdateRecoveryPointLifecycle", "UpdateGlobalSettings", "UpdateRegionSettings"]
+              },
+              # Normal processing/checkpoint cleanup deliberately does not page the owner.
+              # Attempts to delete legacy/final history still alert, including denied calls.
+              {
+                eventSource       = ["backup.amazonaws.com"]
+                eventName         = ["DeleteRecoveryPoint"]
+                requestParameters = { backupVaultName = ["ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backup-recovery"] }
+              },
+              {
+                eventSource = ["ec2.amazonaws.com"]
+                eventName   = ["AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules"]
+              }
+            ]
+          }
+        }
+      ]
+    })
+  }
+}
+
+output "event_patterns" { value = local.security_event_patterns }
+
 resource "aws_cloudwatch_event_rule" "findings" {
-  name        = "security-forward-findings"
-  description = "Forward security findings and high-risk control-plane changes to the admin account"
-  event_pattern = jsonencode({
-    "$or" = [
-      {
-        source        = ["aws.guardduty"]
-        "detail-type" = ["GuardDuty Finding"]
-        detail        = { severity = [{ numeric = [">=", 4] }], service = { archived = [false] } }
-      },
-      {
-        source        = ["aws.access-analyzer"]
-        "detail-type" = ["Access Analyzer Finding"]
-        detail        = { status = ["ACTIVE"] }
-      },
-      {
-        source        = ["aws.securityhub"]
-        "detail-type" = ["Security Hub Findings - Imported"]
-        detail = { findings = {
-          Severity    = { Label = ["HIGH", "CRITICAL"] }
-          RecordState = ["ACTIVE"]
-          Workflow    = { Status = ["NEW"] }
-        } }
-      },
-      {
-        source        = ["aws.inspector2"]
-        "detail-type" = ["Inspector2 Finding"]
-        detail        = { severity = ["HIGH", "CRITICAL"], status = ["ACTIVE"] }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail", "AWS Console Sign In via CloudTrail"]
-        detail        = { userIdentity = { type = ["Root"] } }
-      },
-      {
-        "detail-type" = ["AWS Console Sign In via CloudTrail"]
-        detail        = { eventName = ["ConsoleLogin"], responseElements = { ConsoleLogin = ["Failure"] } }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource = ["cloudtrail.amazonaws.com", "guardduty.amazonaws.com", "config.amazonaws.com", "securityhub.amazonaws.com", "access-analyzer.amazonaws.com"]
-          eventName   = ["StopLogging", "DeleteTrail", "UpdateTrail", "PutEventSelectors", "DeleteDetector", "UpdateDetector", "StopConfigurationRecorder", "DeleteConfigurationRecorder", "DisableSecurityHub", "DeleteAnalyzer"]
-        }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource = ["iam.amazonaws.com"]
-          eventName   = ["CreateUser", "CreateAccessKey", "CreateLoginProfile", "UpdateLoginProfile", "AddUserToGroup", "AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy", "PutUserPolicy", "PutRolePolicy", "PutGroupPolicy", "UpdateAssumeRolePolicy", "DeleteRolePermissionsBoundary", "DeleteUserPermissionsBoundary"]
-        }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource = ["kms.amazonaws.com"]
-          eventName   = ["DisableKey", "ScheduleKeyDeletion", "PutKeyPolicy", "DisableKeyRotation"]
-        }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource = ["backup.amazonaws.com"]
-          eventName   = ["DeleteBackupVault", "DeleteBackupPlan", "DeleteBackupSelection", "UpdateBackupPlan", "PutBackupVaultAccessPolicy", "DeleteBackupVaultAccessPolicy", "PutBackupVaultLockConfiguration", "DeleteBackupVaultLockConfiguration", "UpdateRecoveryPointLifecycle", "UpdateGlobalSettings", "UpdateRegionSettings"]
-        }
-      },
-      # Normal processing/checkpoint cleanup deliberately does not page the owner.
-      # Attempts to delete legacy/final history still alert, including denied calls.
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource       = ["backup.amazonaws.com"]
-          eventName         = ["DeleteRecoveryPoint"]
-          requestParameters = { backupVaultName = ["ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backup-recovery"] }
-        }
-      },
-      {
-        "detail-type" = ["AWS API Call via CloudTrail"]
-        detail = {
-          eventSource = ["ec2.amazonaws.com"]
-          eventName   = ["AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules"]
-        }
-      }
-    ]
-  })
+  for_each      = local.security_event_patterns
+  name          = each.key
+  description   = "Forward security findings and high-risk control-plane changes to the admin account"
+  event_pattern = each.value
+  # ENABLED alone excludes read-only management events, including root Get/List.
+  state = each.key == "security-forward-audit" ? "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" : "ENABLED"
+  lifecycle {
+    precondition {
+      condition     = length(each.value) <= 2048
+      error_message = "Security event patterns must fit the default 2,048-character regional quota."
+    }
+  }
 }
 
 resource "aws_cloudwatch_event_target" "central" {
-  rule      = aws_cloudwatch_event_rule.findings.name
+  for_each  = local.security_event_patterns
+  rule      = aws_cloudwatch_event_rule.findings[each.key].name
   target_id = "central-security-alerts"
   arn       = var.central_event_bus_arn
   role_arn  = var.forwarding_role_arn
@@ -200,7 +214,7 @@ resource "aws_sqs_queue_policy" "delivery_failures" {
         Principal = { Service = "events.amazonaws.com" }
         Action    = "sqs:SendMessage"
         Resource  = aws_sqs_queue.delivery_failures.arn
-        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.findings.arn } }
+        Condition = { ArnEquals = { "aws:SourceArn" = [for rule in aws_cloudwatch_event_rule.findings : rule.arn] } }
       },
       {
         Effect    = "Deny"

@@ -36,6 +36,73 @@ MAIN, STAGING = "111111111111", "222222222222"
 SNS_TOPIC = "arn:aws:sns:us-west-1:" + MAIN + ":cost-alerts"
 NOW = datetime.datetime(2026, 9, 7, 12, tzinfo=datetime.timezone.utc)
 COUNTERS = ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"]
+REGIONAL_RULES = ("security-forward-findings", "security-forward-audit")
+# Independently reviewed fixtures. The optional native-HCL test below compares
+# these to the exact Terraform map used by both EventBridge and the watchdog.
+API_DETAILS = [
+    {"eventSource": ["cloudtrail.amazonaws.com", "guardduty.amazonaws.com", "config.amazonaws.com", "securityhub.amazonaws.com", "access-analyzer.amazonaws.com"],
+     "eventName": ["StopLogging", "DeleteTrail", "UpdateTrail", "PutEventSelectors", "DeleteDetector", "UpdateDetector", "StopConfigurationRecorder", "DeleteConfigurationRecorder", "DisableSecurityHub", "DeleteAnalyzer"]},
+    {"eventSource": ["iam.amazonaws.com"],
+     "eventName": ["CreateUser", "CreateAccessKey", "CreateLoginProfile", "UpdateLoginProfile", "AddUserToGroup", "AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy", "PutUserPolicy", "PutRolePolicy", "PutGroupPolicy", "UpdateAssumeRolePolicy", "DeleteRolePermissionsBoundary", "DeleteUserPermissionsBoundary"]},
+    {"eventSource": ["kms.amazonaws.com"],
+     "eventName": ["DisableKey", "ScheduleKeyDeletion", "PutKeyPolicy", "DisableKeyRotation"]},
+    {"eventSource": ["backup.amazonaws.com"],
+     "eventName": ["DeleteBackupVault", "DeleteBackupPlan", "DeleteBackupSelection", "UpdateBackupPlan", "PutBackupVaultAccessPolicy", "DeleteBackupVaultAccessPolicy", "PutBackupVaultLockConfiguration", "DeleteBackupVaultLockConfiguration", "UpdateRecoveryPointLifecycle", "UpdateGlobalSettings", "UpdateRegionSettings"]},
+    {"eventSource": ["backup.amazonaws.com"], "eventName": ["DeleteRecoveryPoint"],
+     "requestParameters": {"backupVaultName": ["ejc3-backup", "ejc3-backup-dr", "fcvm-backups", "ejc3-backup-recovery"]}},
+    {"eventSource": ["ec2.amazonaws.com"],
+     "eventName": ["AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules"]},
+]
+FINDING_BRANCHES = [
+    {"source": ["aws.guardduty"], "detail-type": ["GuardDuty Finding"],
+     "detail": {"severity": [{"numeric": [">=", 4]}], "service": {"archived": [False]}}},
+    {"source": ["aws.access-analyzer"], "detail-type": ["Access Analyzer Finding"],
+     "detail": {"status": ["ACTIVE"]}},
+    {"source": ["aws.securityhub"], "detail-type": ["Security Hub Findings - Imported"],
+     "detail": {"findings": {"Severity": {"Label": ["HIGH", "CRITICAL"]},
+                             "RecordState": ["ACTIVE"], "Workflow": {"Status": ["NEW"]}}}},
+    {"source": ["aws.inspector2"], "detail-type": ["Inspector2 Finding"],
+     "detail": {"severity": ["HIGH", "CRITICAL"], "status": ["ACTIVE"]}},
+]
+ROOT_BRANCH = {"detail-type": ["AWS API Call via CloudTrail", "AWS Console Sign In via CloudTrail"],
+               "detail": {"userIdentity": {"type": ["Root"]}}}
+LOGIN_BRANCH = {"detail-type": ["AWS Console Sign In via CloudTrail"],
+                "detail": {"eventName": ["ConsoleLogin"], "responseElements": {"ConsoleLogin": ["Failure"]}}}
+EXPECTED_PATTERNS = {
+    REGIONAL_RULES[0]: {"$or": FINDING_BRANCHES},
+    REGIONAL_RULES[1]: {"$or": [ROOT_BRANCH, LOGIN_BRANCH,
+        {"detail-type": ["AWS API Call via CloudTrail"], "detail": {"$or": API_DETAILS}}]},
+}
+PATTERNS = {name: json.dumps(pattern, separators=(",", ":")) for name, pattern in EXPECTED_PATTERNS.items()}
+PATTERNS["security-alerts-notify"] = json.dumps({"account": [MAIN, STAGING]})
+
+
+def canonical(value):
+    """Ignore JSON object ordering, never collapse false/0 or true/1."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def matches(pattern, event):
+    """Bounded fixture matcher for only the operators in the reviewed patterns.
+
+    This is not an EventBridge implementation; unsupported operators fail loudly.
+    Native HCL proves the actual deployed expression matches these fixtures.
+    """
+    if isinstance(event, list):
+        return any(matches(pattern, member) for member in event)
+    if isinstance(pattern, dict):
+        if set(pattern) == {"numeric"}:
+            operator, threshold = pattern["numeric"]
+            if operator != ">=":
+                raise AssertionError("Unreviewed numeric operator")
+            return type(event) in (int, float) and event >= threshold
+        if not isinstance(event, dict):
+            return False
+        return all(any(matches(branch, event) for branch in value) if key == "$or"
+                   else key in event and matches(value, event[key]) for key, value in pattern.items())
+    if isinstance(pattern, list):
+        return any(matches(option, event) for option in pattern)
+    return type(pattern) is type(event) and pattern == event
 
 
 class Config:
@@ -83,10 +150,12 @@ class Events:
     def describe_rule(self, **kwargs):
         self.factory.rule_reads.append((self.account, self.region, kwargs))
         name, bus = kwargs["Name"], kwargs.get("EventBusName")
-        response = {"Name": name, "State": "ENABLED",
+        response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name == "security-forward-audit" else "ENABLED",
                     "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
         if name == "security-delivery-health":
             response["ScheduleExpression"] = "rate(5 minutes)"
+        else:
+            response["EventPattern"] = PATTERNS[name] if name in PATTERNS else json.dumps({"account": [MAIN, STAGING]})
         override = self.factory.rules.get((self.account, self.region, name))
         if isinstance(override, Exception):
             raise override
@@ -96,7 +165,7 @@ class Events:
         self.factory.target_reads.append((self.account, self.region, kwargs))
         assert kwargs["Limit"] == 2 and "NextToken" not in kwargs
         rule = kwargs["Rule"]
-        if rule == "security-forward-findings":
+        if rule in REGIONAL_RULES:
             target = {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/security-alerts",
                       "RoleArn": "arn:aws:iam::" + self.account + ":role/security-findings-forward",
                       "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"},
@@ -196,16 +265,18 @@ class DeliveryTests(unittest.TestCase):
         self.module = load(self.factory)
 
     def run_handler(self, regions=None, extra=None):
-        env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS), "SNS_TOPIC_ARN": SNS_TOPIC}
+        env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS), "SNS_TOPIC_ARN": SNS_TOPIC,
+               "EVENT_PATTERNS": json.dumps(PATTERNS)}
         env.update(extra or {})
         output = io.StringIO()
         with patch.dict(os.environ, env), contextlib.redirect_stdout(output):
             values = self.module["handler"]({}, None)
         return values, json.loads(output.getvalue())
 
-    def inspect(self, account=MAIN, region="us-east-1"):
+    def inspect(self, account=MAIN, region="us-east-1", now=NOW):
         return self.module["inspect_region"](CloudWatch(self.factory, account, region),
-            SQS(self.factory, account, region), Events(self.factory, account, region), account, region, MAIN, SNS_TOPIC, NOW)
+            SQS(self.factory, account, region), Events(self.factory, account, region), account, region, MAIN, SNS_TOPIC, now,
+            {name: canonical(json.loads(value)) for name, value in PATTERNS.items()})
 
     def test_complete_empty_failure_metrics_are_healthy(self):
         values, log = self.run_handler()
@@ -221,8 +292,8 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(requested, 72)
         self.assertEqual(requested * 288 * 30, 622080)
         self.assertEqual(len(self.factory.queue_reads), 35)
-        self.assertEqual(len(self.factory.rule_reads), 36)
-        self.assertEqual(len(self.factory.target_reads), 36)
+        self.assertEqual(len(self.factory.rule_reads), 70)
+        self.assertEqual(len(self.factory.target_reads), 70)
 
     def test_disabled_missing_or_wrong_rule_is_not_a_healthy_quiet_region(self):
         for override in (lambda r: dict(r, State="DISABLED"), lambda r: {},
@@ -236,6 +307,17 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(values["QueuedEvents"], 0)
                 self.assertNotIn("private diagnostic", json.dumps(log))
 
+    def test_audit_read_only_management_state_cannot_be_downgraded(self):
+        for rule, invalid in (("security-forward-audit", "ENABLED"),
+                              ("security-forward-audit", "DISABLED"),
+                              ("security-forward-findings", "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")):
+            with self.subTest(rule=rule, state=invalid):
+                self.factory.rules = {(MAIN, "us-east-1", rule): lambda response: dict(response, State=invalid)}
+                result = self.inspect()
+                self.assertGreaterEqual(result["errors"], 1)
+                self.assertEqual(result["failures"], 0)
+                self.assertEqual(result["depth"], 0)
+
     def test_removed_duplicate_paginated_or_denied_targets_fail_closed(self):
         for override in (lambda r: {"Targets": []}, lambda r: {},
                          lambda r: {"Targets": r["Targets"] * 2}, lambda r: dict(r, NextToken="do-not-follow"),
@@ -246,7 +328,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertGreaterEqual(values["ObserverErrors"], 1)
 
     def test_target_destination_role_dlq_retries_and_payload_are_exact(self):
-        for rule in ("security-forward-findings", "security-alerts-notify", "security-delivery-health"):
+        for rule in (*REGIONAL_RULES, "security-alerts-notify", "security-delivery-health"):
             for key, value in (("Arn", "arn:foreign"), ("RoleArn", "arn:foreign"), ("Id", "other"),
                                ("DeadLetterConfig", {}), ("RetryPolicy", {}), ("Input", "{}"),
                                ("InputTransformer", {})):
@@ -271,7 +353,7 @@ class DeliveryTests(unittest.TestCase):
         self.factory.rules[(MAIN, "us-east-1", "security-forward-findings")] = TimeoutError("unavailable")
         result = self.inspect()
         self.assertEqual(result["errors"], 1)
-        self.assertEqual(len(self.factory.target_reads), 1)
+        self.assertEqual(len(self.factory.target_reads), 2)
         self.assertEqual(len(self.factory.reads), 1)
         self.assertEqual(len(self.factory.queue_reads), 1)
 
@@ -295,6 +377,108 @@ class DeliveryTests(unittest.TestCase):
         self.inspect(account=STAGING, region="us-west-1")
         self.assertEqual(len(self.factory.reads[0][2]["MetricDataQueries"]), 2)
         self.assertEqual(len(self.factory.queue_reads), 1)
+
+    def test_both_epoch_parities_keep_full_topology_and_exact_metric_budget(self):
+        original_datetime = datetime.datetime
+        for offset in (0, 5):
+            instant = NOW + datetime.timedelta(minutes=offset)
+            class Clock(original_datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return instant
+            with self.subTest(offset=offset):
+                self.factory = Factory()
+                self.module = load(self.factory)
+                with patch.dict(self.module, datetime=types.SimpleNamespace(datetime=Clock, timedelta=datetime.timedelta, timezone=datetime.timezone)):
+                    values, log = self.run_handler()
+                self.assertEqual(values["ObserverErrors"], 0)
+                self.assertEqual(log["checked_regions"], 34)
+                self.assertEqual(len(self.factory.rule_reads), 70)
+                self.assertEqual(len(self.factory.target_reads), 70)
+                self.assertEqual(len(self.factory.queue_reads), 35)
+                self.assertEqual(sum(len(call["MetricDataQueries"]) for _, _, call in self.factory.reads), 72)
+                expected_sample = REGIONAL_RULES[int(instant.timestamp()) // 300 % 2]
+                for account, region, call in self.factory.reads:
+                    queried = [dict((d["Name"], d["Value"]) for d in q["MetricStat"]["Metric"]["Dimensions"])["RuleName"]
+                               for q in call["MetricDataQueries"]]
+                    self.assertEqual(queried.count(expected_sample), 2)
+                    self.assertNotIn(REGIONAL_RULES[1 - REGIONAL_RULES.index(expected_sample)], queried)
+                    self.assertEqual(len(queried), 6 if account == MAIN and region == "us-west-1" else 2)
+                    self.assertEqual(call["StartTime"], instant - datetime.timedelta(minutes=15))
+                    self.assertEqual(call["EndTime"], instant)
+
+    def test_alternating_samples_revisit_both_rules_with_five_minute_overlap(self):
+        sampled = []
+        for offset in (0, 5, 10):
+            self.inspect(now=NOW + datetime.timedelta(minutes=offset))
+            request = self.factory.reads[-1][2]
+            sampled.append(request["MetricDataQueries"][0]["MetricStat"]["Metric"]["Dimensions"][0]["Value"])
+        self.assertEqual(set(sampled[:2]), set(REGIONAL_RULES))
+        self.assertEqual(sampled[0], sampled[2])
+        first, third = self.factory.reads[0][2], self.factory.reads[2][2]
+        self.assertEqual(first["EndTime"] - third["StartTime"], datetime.timedelta(minutes=5))
+
+    def test_pattern_object_order_and_whitespace_are_healthy(self):
+        for rule in PATTERNS:
+            pattern = json.loads(PATTERNS[rule])
+            # Reverse object keys recursively, keeping numeric operator arrays in order.
+            def reorder(value):
+                if isinstance(value, dict):
+                    return {key: reorder(value[key]) for key in reversed(value)}
+                return [reorder(item) for item in value] if isinstance(value, list) else value
+            with self.subTest(rule=rule):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda response: dict(response, EventPattern=json.dumps(reorder(pattern), indent=2))}
+                self.assertEqual(self.inspect(region="us-west-1")["errors"], 0)
+
+    def test_missing_malformed_empty_and_changed_patterns_fail_closed(self):
+        for rule in PATTERNS:
+            for invalid in (None, "", "not-json", "{}", "[]", "null", '"text"',
+                            '{"source":["aws.foreign"]}', '{"account":["999999999999"]}',
+                            '{"source":["aws.a"],"source":["aws.b"]}', '{"severity":[NaN]}'):
+                with self.subTest(rule=rule, invalid=invalid):
+                    self.factory.rules = {(MAIN, "us-west-1", rule): lambda response: dict(response, EventPattern=invalid)}
+                    result = self.inspect(region="us-west-1")
+                    self.assertGreaterEqual(result["errors"], 1)
+                    self.assertEqual(result["failures"], 0)
+                    self.assertEqual(result["depth"], 0)
+
+    def test_semantic_pattern_drift_detects_narrowing_broadening_and_scalar_types(self):
+        cases = []
+        for rule in REGIONAL_RULES:
+            removed = copy.deepcopy(EXPECTED_PATTERNS[rule])
+            removed["$or"].pop()
+            added = copy.deepcopy(EXPECTED_PATTERNS[rule])
+            added["$or"].append({"source": ["aws.unreviewed"]})
+            cases.extend([(rule, removed), (rule, added)])
+        archived_number = copy.deepcopy(EXPECTED_PATTERNS[REGIONAL_RULES[0]])
+        archived_number["$or"][0]["detail"]["service"]["archived"] = [0]
+        numeric_reordered = copy.deepcopy(EXPECTED_PATTERNS[REGIONAL_RULES[0]])
+        numeric_reordered["$or"][0]["detail"]["severity"][0]["numeric"] = [4, ">="]
+        cases.extend([(REGIONAL_RULES[0], archived_number), (REGIONAL_RULES[0], numeric_reordered),
+                      ("security-alerts-notify", {"account": [MAIN]}),
+                      ("security-alerts-notify", {"account": [MAIN, STAGING, "999999999999"]})])
+        for rule, pattern in cases:
+            with self.subTest(rule=rule, pattern=pattern):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda response: dict(response, EventPattern=json.dumps(pattern))}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_rule_pattern_and_schedule_modes_cannot_silently_expand(self):
+        for rule in PATTERNS:
+            with self.subTest(rule=rule):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda response: dict(response, ScheduleExpression="rate(1 minute)")}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        self.factory.rules = {(MAIN, "us-west-1", "security-delivery-health"): lambda response: dict(response, EventPattern='{"source":["aws.unreviewed"]}')}
+        self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_invalid_expected_pattern_configuration_fails_before_aws_calls(self):
+        variants = [{}, [], None, {name: value for name, value in PATTERNS.items() if name != REGIONAL_RULES[1]},
+                    dict(PATTERNS, foreign='{"source":["aws.unreviewed"]}'),
+                    dict(PATTERNS, **{REGIONAL_RULES[0]: "{}"})]
+        for invalid in variants:
+            with self.subTest(invalid=invalid), self.assertRaises((ValueError, TypeError)):
+                self.run_handler(extra={"EVENT_PATTERNS": json.dumps(invalid)})
+        self.assertEqual(self.factory.assumed, [])
+        self.assertEqual(self.factory.reads, [])
 
     def test_failure_and_all_queue_states_raise_health_gauges(self):
         def failures(response):
@@ -415,6 +599,137 @@ class DeliveryTests(unittest.TestCase):
 
 
 class TerraformSafetyTests(unittest.TestCase):
+    @staticmethod
+    def event_pattern_fixtures():
+        fixtures = []
+        for severity in (3.9, 4, 8):
+            for archived in (False, True):
+                fixtures.append(({"source": "aws.guardduty", "detail-type": "GuardDuty Finding",
+                    "detail": {"severity": severity, "service": {"archived": archived}}},
+                    REGIONAL_RULES[0] if severity >= 4 and not archived else None))
+        for status in ("ACTIVE", "ARCHIVED", "RESOLVED"):
+            fixtures.append(({"source": "aws.access-analyzer", "detail-type": "Access Analyzer Finding",
+                              "detail": {"status": status}}, REGIONAL_RULES[0] if status == "ACTIVE" else None))
+        for severity in ("HIGH", "CRITICAL", "MEDIUM"):
+            for state in ("ACTIVE", "ARCHIVED"):
+                for workflow in ("NEW", "NOTIFIED", "RESOLVED"):
+                    fixtures.append(({"source": "aws.securityhub", "detail-type": "Security Hub Findings - Imported",
+                        "detail": {"findings": [{"Severity": {"Label": severity}, "RecordState": state,
+                                                "Workflow": {"Status": workflow}}]}},
+                        REGIONAL_RULES[0] if severity in ("HIGH", "CRITICAL") and state == "ACTIVE" and workflow == "NEW" else None))
+            for status in ("ACTIVE", "SUPPRESSED", "CLOSED"):
+                fixtures.append(({"source": "aws.inspector2", "detail-type": "Inspector2 Finding",
+                                  "detail": {"severity": severity, "status": status}},
+                                  REGIONAL_RULES[0] if severity in ("HIGH", "CRITICAL") and status == "ACTIVE" else None))
+        # A finding with the right detail body but a different source must not page.
+        for event, expected in list(fixtures):
+            if expected:
+                wrong_source = copy.deepcopy(event)
+                wrong_source["source"] = "aws.unreviewed"
+                fixtures.append((wrong_source, None))
+        for kind in ("AWS API Call via CloudTrail", "AWS Console Sign In via CloudTrail", "Other Event"):
+            for identity in ("Root", "IAMUser"):
+                fixtures.append(({"detail-type": kind, "detail": {"userIdentity": {"type": identity}, "eventName": "ListBuckets"}},
+                    REGIONAL_RULES[1] if identity == "Root" and kind != "Other Event" else None))
+        for outcome in ("Success", "Failure"):
+            for kind in ("AWS Console Sign In via CloudTrail", "AWS API Call via CloudTrail"):
+                fixtures.append(({"detail-type": kind, "detail": {"eventName": "ConsoleLogin", "responseElements": {"ConsoleLogin": outcome}}},
+                    REGIONAL_RULES[1] if outcome == "Failure" and kind == "AWS Console Sign In via CloudTrail" else None))
+        for details in API_DETAILS:
+            for source in details["eventSource"]:
+                for action in details["eventName"]:
+                    vaults = details.get("requestParameters", {}).get("backupVaultName", [None])
+                    for vault in vaults:
+                        event = {"detail-type": "AWS API Call via CloudTrail",
+                                 "detail": {"eventSource": source, "eventName": action}}
+                        if vault is not None:
+                            event["detail"]["requestParameters"] = {"backupVaultName": vault}
+                        fixtures.append((event, REGIONAL_RULES[1]))
+                        # A root tampering attempt matches multiple original OR
+                        # branches, but the split must still deliver it only once.
+                        root_event = copy.deepcopy(event)
+                        root_event["detail"]["userIdentity"] = {"type": "Root"}
+                        root_event["detail"]["errorCode"] = "AccessDenied"
+                        fixtures.append((root_event, REGIONAL_RULES[1]))
+                        foreign = copy.deepcopy(event)
+                        foreign["detail"]["eventSource"] = "unreviewed.amazonaws.com"
+                        fixtures.append((foreign, None))
+            fixtures.append(({"detail-type": "AWS API Call via CloudTrail", "detail": {
+                "eventSource": details["eventSource"][0], "eventName": "OrdinaryReadOnlyCall"}}, None))
+        for vault in ("processing", "checkpoint", "unrelated", None):
+            fixtures.append(({"detail-type": "AWS API Call via CloudTrail", "detail": {
+                "eventSource": "backup.amazonaws.com", "eventName": "DeleteRecoveryPoint",
+                "requestParameters": {"backupVaultName": vault}}}, None))
+        return fixtures
+
+    def test_split_pattern_semantics_preserve_all_branches_without_duplicate_delivery(self):
+        fixtures = self.event_pattern_fixtures()
+        original = {"$or": FINDING_BRANCHES + [ROOT_BRANCH, LOGIN_BRANCH] + [
+            {"detail-type": ["AWS API Call via CloudTrail"], "detail": details} for details in API_DETAILS]}
+        self.assertGreater(len(fixtures), 250)
+        for event, expected in fixtures:
+            with self.subTest(event=event):
+                self.assertEqual(matches(original, event), expected is not None)
+                self.assertEqual([name for name, pattern in EXPECTED_PATTERNS.items() if matches(pattern, event)],
+                                 [expected] if expected else [])
+
+    def test_shipped_pattern_map_is_the_single_source_for_rules_and_watchdog(self):
+        for name in ("findings",):
+            rule = block(REGIONAL, "aws_cloudwatch_event_rule", name)
+            self.assertRegex(rule, r"for_each\s*=\s*local\.security_event_patterns")
+            self.assertRegex(rule, r"event_pattern\s*=\s*each\.value")
+            self.assertRegex(rule, r"length\(each\.value\)\s*<=\s*2048")
+            self.assertRegex(rule, r'state\s*=\s*each\.key\s*==\s*"security-forward-audit"\s*\?\s*"ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"\s*:\s*"ENABLED"')
+            self.assertNotIn("is_enabled", rule)
+        target = block(REGIONAL, "aws_cloudwatch_event_target", "central")
+        self.assertRegex(target, r"for_each\s*=\s*local\.security_event_patterns")
+        self.assertIn("aws_cloudwatch_event_rule.findings[each.key].name", target)
+        self.assertRegex(REGIONAL, r'output "event_patterns"\s*\{\s*value\s*=\s*local\.security_event_patterns')
+        function = block(TERRAFORM, "aws_lambda_function", "security_delivery_health")
+        self.assertIn("module.security_main_us_west_1.event_patterns", function)
+        self.assertIn("aws_cloudwatch_event_rule.security_notify.event_pattern", function)
+        for name in ("security_delivery_health", "security_delivery_observer_staging"):
+            policy = block(TERRAFORM, "aws_iam_role_policy", name)
+            self.assertIn('"security-forward-findings", "security-forward-audit"', policy)
+            self.assertNotIn(":rule/security-forward-*", policy)
+
+    @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free semantic fixtures run above")
+    def test_actual_shipped_event_patterns_match_fixtures_and_default_size_quota(self):
+        start = re.search(r"security_event_patterns\s*=\s*\{", REGIONAL).end() - 1
+        depth = 0
+        for end in range(start, len(REGIONAL)):
+            depth += (REGIONAL[end] == "{") - (REGIONAL[end] == "}")
+            if not depth:
+                break
+        expression = REGIONAL[start:end + 1]
+        expression = re.sub(r"(?m)^\s*#.*$", "", expression)
+        expression = re.sub(r'(?<=[\w"\]})])\n(?=\s*["\w][^\n]*=)', ', ', expression)
+        with tempfile.TemporaryDirectory(prefix="security-event-patterns-") as directory:
+            result = subprocess.run([os.environ["SECURITY_TEST_TERRAFORM"], "console", "-no-color"],
+                input="jsonencode(" + " ".join(expression.splitlines()) + ")\n", text=True,
+                capture_output=True, timeout=15, cwd=directory,
+                env={"CHECKPOINT_DISABLE": "1", "TF_CLI_CONFIG_FILE": "/dev/null", "TF_IN_AUTOMATION": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(json.loads(result.stdout.strip()))
+        self.assertEqual(set(actual), set(REGIONAL_RULES))
+        for name, encoded in actual.items():
+            with self.subTest(rule=name):
+                self.assertGreater(len(encoded), 0)
+                self.assertLessEqual(len(encoded.encode("utf-8")), 2048)
+                self.assertEqual(canonical(json.loads(encoded)), canonical(EXPECTED_PATTERNS[name]))
+        # Evaluate the actual per-rule state expression, not a duplicated Python
+        # decision: ENABLED alone silently omits root Get/List/Describe events.
+        rule = block(REGIONAL, "aws_cloudwatch_event_rule", "findings")
+        state = re.search(r'^\s*state\s*=\s*(.+)$', rule, re.M).group(1).replace("each.key", "name")
+        with tempfile.TemporaryDirectory(prefix="security-event-rule-state-") as directory:
+            result = subprocess.run([os.environ["SECURITY_TEST_TERRAFORM"], "console", "-no-color"],
+                input='jsonencode({for name in ' + json.dumps(list(REGIONAL_RULES)) + ' : name => ' + state + '})\n',
+                text=True, capture_output=True, timeout=15, cwd=directory,
+                env={"CHECKPOINT_DISABLE": "1", "TF_CLI_CONFIG_FILE": "/dev/null", "TF_IN_AUTOMATION": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(json.loads(result.stdout.strip())), {
+            "security-forward-findings": "ENABLED", "security-forward-audit": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"})
+
     def test_posture_covers_both_source_regions_and_final_recovery_region(self):
         expected = {"security_main_us_west_1", "security_main_us_west_2",
                     "security_main_us_east_1", "security_staging_us_west_1",
@@ -566,7 +881,7 @@ class TerraformSafetyTests(unittest.TestCase):
                     self.assertEqual(result.stdout.strip(), str(expected).lower())
 
     def test_kms_and_backup_tampering_alert_without_routine_cleanup_noise(self):
-        pattern = block(REGIONAL, "aws_cloudwatch_event_rule", "findings")
+        pattern = REGIONAL
         def names_for(source):
             match = re.search(r'eventSource\s*=\s*\["' + re.escape(source) +
                               r'"\]\s*eventName\s*=\s*\[([^]]+)\]', pattern)
@@ -631,7 +946,8 @@ class TerraformSafetyTests(unittest.TestCase):
             self.assertIn('"sqs:GetQueueAttributes"', policy)
             self.assertIn('"cloudwatch:GetMetricData"', policy)
             self.assertIn('"events:DescribeRule", "events:ListTargetsByRule"', policy)
-            self.assertIn(':rule/security-forward-findings', policy)
+            self.assertIn('["security-forward-findings", "security-forward-audit"]', policy)
+            self.assertIn(':rule/${rule}', policy)
             self.assertNotIn('"events:Put', policy)
         self.assertIn('aws_cloudwatch_event_rule.security_notify.arn', main)
         self.assertIn('aws_cloudwatch_event_rule.security_delivery_health.arn', main)

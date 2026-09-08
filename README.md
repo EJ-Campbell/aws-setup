@@ -981,7 +981,7 @@ adds only the missing regional aliases, with the existing recovery-account admin
 These settings have no recurring service subscription and create no detectors, log
 pipelines, keys or compute. Ordinary future storage, copy and KMS usage still costs
 money; in particular copying with a different key can require a full snapshot copy.
-This is separate from the paid monitoring rollout awaiting approval, not evidence
+This is separate from the approved paid monitoring foundation, not evidence
 that security logging/detection is active. Public SSH/ET, Cloudflare Access service-token access and
 the verified backup plans, recovery history and cleanup permissions remain unchanged.
 
@@ -997,8 +997,10 @@ do not prove existing hosts or disks have been remediated.
 
 ## Security monitoring rollout
 
-This paid monitoring rollout remains unapplied pending owner cost approval. Deploying
-the separate free controls does not authorize this stage.
+The owner approved the monitoring foundation on September 8, 2026, at approximately
+$9/month fixed plus metered usage. It remains unapplied while the final review and
+fresh-plan gates are completed; approval is not evidence of live delivery. Config,
+Security Hub and Inspector remain disabled and require separate approval.
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
@@ -1011,7 +1013,7 @@ migrate existing disks, restrict the required public SSH/ET access, remove Cloud
 service-token access, or change the verified backup pipeline.
 
 Roll out the foundation first with `local.security_posture_enabled = false`.
-After delivery acceptance and a usage/cost review, enable that single bootstrap gate
+After delivery acceptance, a usage/cost review and separate owner approval, enable that single bootstrap gate
 for Config, Security Hub CSPM foundational checks and Inspector EC2/Lambda scanning:
 main account `us-west-1`, `us-west-2`, `us-east-1`, and recovery account `us-west-1`,
 `us-east-1`. The final recovery vault is in `us-east-1` and must not be omitted.
@@ -1041,20 +1043,26 @@ diagnose and review a repair or future typed-resource migration; it does not per
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
 After the separate 102 regional defaults, 36 external-analysis resources and two
-global S3 controls, the monitoring foundation adds 225 managed Terraform resource
+global S3 controls, the monitoring foundation adds 293 managed Terraform resource
 instances plus one existing SNS topic-policy update; the posture gate adds 45 more.
 These are source counts, not
 a substitute for the fresh plan. Many are free control settings or permissions, not
 individually billed workloads. No existing compute, volume or backup resource should
 be replaced by this rollout.
 
-Security findings and high-risk IAM, network, KMS and backup changes forward to the
+Security findings, root-account activity (including read-only management calls),
+and high-risk IAM, network, KMS and backup changes forward to the
 existing confirmed `cost-alerts` SNS topic. Normal processing/checkpoint cleanup does
 not page the owner; deletion attempts against legacy/final backup history do. Every
-regional forwarder has an encrypted 14-day dead-letter queue. A five-minute read-only
-watchdog verifies enabled rules and exact targets (destination, execution role, retries
-and DLQ), then checks failed deliveries and queued events in all 34 pairs, with independent
-missing-heartbeat and Lambda-error alarms. It never consumes or deletes queued events.
+region has two disjoint forwarding rules sharing one encrypted 14-day dead-letter
+queue; each event pattern stays within AWS's default 2,048-character limit. A
+five-minute read-only watchdog verifies enabled rules, exact event filters and targets
+(destination, execution role, retries and DLQ), and queued events in all 34 pairs.
+It alternates regional failure-metric queries between the two rules: each rule is
+sampled every ten minutes with a fifteen-minute lookback, preserving the approved
+CloudWatch retrieval budget. Central delivery metrics are still sampled every five
+minutes. Independent missing-heartbeat and Lambda-error alarms cover observer failure.
+It never consumes or deletes queued events.
 The S3 audit archive has 90-day **governance** retention and one-year expiry; privileged
 administrators can bypass governance, unlike the recovery vault's compliance lock.
 Config/Session Manager records use a separate versioned bucket. Only standard SSM shell
