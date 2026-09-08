@@ -587,16 +587,61 @@ Check that the scheduled run stays enabled and recent. The check only reads git/
 releases, not deployed SSM, so a committed but unapplied pin still needs the deployment
 and trusted-job acceptance above.
 
-This publication does not remove the old PAT permission: a job host can still read that
-PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
+The bootstrap-only stage does not remove the old PAT permission: a job host can still
+read that PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
 own-credential deletion, single-job exit, and EC2 termination, then verify old boots are
 drained before removing the legacy grants. Retest the non-secret IAM canaries afterward.
+
+### Runner IAM cutoff
+
+This is a held local handoff as of 2026-09-08, not a deployed boundary. The real broker
+job is still Spot-capacity-blocked; prior temporary fixtures were cleaned up. Merge
+current main before resuming and follow the retained [fixture recreation gates](#temporary-runner-credential-boundary-acceptance)
+for a fresh before/after window. This draft deliberately does not restore those
+resources, the retired shared CI grants, or any superseded account controls.
+
+Do not deploy this stage before the broker bootstrap has passed a real trusted job,
+its own credential deletion, service exit/EC2 termination, and the old-boot drain.
+The unchanged instance-bound producer still grants only its source-instance SSM
+credential and DynamoDB claim. The replacement runner policy explicitly denies every
+non-bootstrap parameter read, plus all batch, history, and recursive-path reads.
+These denies remain effective under an accidentally restored broad SSM Allow. Denying
+only the PAT ARN is insufficient: [an ancestor recursive path can expose a denied child](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-setting-up.html).
+Bootstrap needs only the current value of its own parameter, never those bulk APIs.
+SSM agent/session actions remain through `dev-ssm-managed-instance`; Terraform establishes
+the denies first, creates this attachment before destroying the broad Core attachment,
+and does not change the role/profile or the bootstrap/DynamoDB producer.
+
+The controller's EC2 grants now require the own-account `Purpose=github-runner` images
+already selected by its code, exact runner subnet/security group/keypair/profile, IMDSv2,
+encrypted volumes, and `Role=github-runner` tags on every new instance, volume and ENI.
+Tag-on-create is constrained by [EC2's service-supplied creation context](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html).
+Outside launch, only the existing runner lease/health keys can change. An explicit deny
+rejects every other tag key, including case variants of ownership tags, even under an
+additive broad tag Allow. This prevents adopting an arbitrary dev/admin host or AMI.
+Termination is limited to `Role=github-runner` instances and the existing cleanup
+exception `Name=ami-builder-temp`; the controller cannot assign that Name to an existing
+host. The runner role's IPv6 assignment is limited to tagged runner ENIs in its subnet.
+
+Offline guards and rendered-policy IAM simulations are review evidence, not a real EC2
+launch/SSM-agent test. Require the after-cutoff canaries (own read succeeds; peer single
+and batch reads fail; simulated PAT access is explicitly denied), then another trusted
+broker job to exercise the narrowed launch, IPv6, registration and teardown permissions.
+The same before/after checker also makes strongly consistent DynamoDB `GetItem` calls
+for only the two verified canary instance-ARN keys. It first requires both keys to be
+absent, then requires each own-key read to succeed without an item and each peer-key
+read to return `AccessDenied`. No `PutItem`, `DeleteItem`, scan, or real runner-record
+read is performed; successful reads do not replace the real broker's write/claim gate.
+Keep controller EC2 narrowing separate from PAT retirement if live launch acceptance
+cannot establish that every boot uses the atomic tag protocol; never widen permissions
+to work around an unverified launch failure. Remove the temporary fixtures through their
+reviewed Terraform removal plan after both acceptance stages pass.
 
 ## What crosses the boundary (secrets inventory)
 
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
 |--|--|--|--|--|
-| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` until the separate runner cutoff | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
+| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-lambda-role` after the gated IAM cutoff; legacy job-host access is removed in that stage | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
 | **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
 | **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |

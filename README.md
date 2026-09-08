@@ -732,17 +732,30 @@ has separate deployment gates; merging source is not evidence that a gate is liv
    Non-secret IAM fixtures test authorization, not registration or job execution.
    New hosts register for one job, delete their bootstrap credential before service
    startup, and power off when the service ends; EC2 then terminates them. The old
-   PAT grant and broad SSM attachment intentionally still exist in this source.
+   PAT grant and broad SSM attachment remain during that bootstrap-only stage.
    The runner release and asset checksums are pinned and automatic updates disabled;
    review each release bump before GitHub's 30-day update deadline (immediately for
    required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
    A daily main-only `Runner Release Freshness` workflow fails when a newer stable
    version exists; it never upgrades or deploys automatically. Keep its scheduled
    runs and GitHub failure notifications enabled.
-4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
-   the remaining controller EC2 launch resources after all launched resources carry
-   the required tags. The old CI authority is retired separately, only after the
-   protected `fcvm` AMI workflow has adopted the replacement builder role/profile.
+4. Apply this source's runner IAM cutoff only after those real job/deletion/termination
+   tests and the old-boot drain. Explicit denies prevent reusable parameter reads,
+   including batch/history/ancestor-path bypasses; the shared scoped SSM agent policy
+   replaces AWS's broad Core attachment without a connectivity gap. The controller
+   launches only approved own-account runner images in the exact runner network with
+   the runner profile and atomic ownership tags; existing resources cannot be adopted
+   through tag writes. Run the non-secret IAM canaries again after this cutoff.
+   The shared CI-role retirement and owner-approved AMI publisher from current main
+   are already separate from this held runner change and must remain intact.
+
+Runner cutoff handoff, 2026-09-08: **held, not deployed**. Broker-job acceptance remains
+Spot-capacity-blocked, and the old temporary canaries were removed after their before
+checks. This local draft does not recreate them or restore any shared CI privileges.
+Before resuming, merge current main, review/recreate fresh Terraform fixtures, repeat
+the before checks, prove a trusted broker job/own-token deletion/termination, and verify
+all old-script boots have drained. Only then review and deploy the cutoff and perform
+the after checks plus another trusted job. Do not apply this historical checkout as-is.
 
 Keep each gate in a reviewed Terraform change with a fresh plan. The optional cleanup
 scans only bootstrap metadata/tags after every hard-ceiling termination attempt and
