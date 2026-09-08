@@ -339,10 +339,10 @@ resource "aws_cloudtrail" "security" {
 }
 
 resource "aws_flow_log" "security_main" {
-  for_each = {
-    dev    = local.vpc_id
-    runner = aws_vpc.runner[0].id
-  }
+  for_each = merge(
+    { dev = local.vpc_id },
+    var.enable_github_runner ? { runner = aws_vpc.runner[0].id } : {},
+  )
   vpc_id                   = each.value
   traffic_type             = "ALL"
   log_destination_type     = "s3"
@@ -967,13 +967,18 @@ resource "aws_ssm_document" "security_sessions_west2" {
 }
 
 resource "aws_iam_role_policy" "security_session_logs" {
-  for_each = {
-    jumpbox = aws_iam_role.jumpbox_admin[0].name
-    dev     = aws_iam_role.dev_server.name
-    nextjs  = aws_iam_role.nextjs_dev.name
-    runner  = aws_iam_role.runner[0].name
-    working = aws_iam_role.dev_ebs_only.name
-  }
+  for_each = merge(
+    {
+      dev     = aws_iam_role.dev_server.name
+      nextjs  = aws_iam_role.nextjs_dev.name
+      working = aws_iam_role.dev_ebs_only.name
+    },
+    local.jumpbox_admin_iam_needed ? { jumpbox = aws_iam_role.jumpbox_admin[0].name } : {},
+    var.enable_github_runner ? {
+      runner      = aws_iam_role.runner[0].name
+      ami_builder = aws_iam_role.ami_builder[0].name
+    } : {},
+  )
   name = "write-session-audit-logs"
   role = each.value
   policy = jsonencode({

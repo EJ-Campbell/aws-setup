@@ -1014,7 +1014,7 @@ second detector. A failed live-property postcondition requires an administrator 
 diagnose and review a repair or future typed-resource migration; it does not perform
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
-After the separate 102 regional defaults, the monitoring foundation adds 258 managed
+After the separate 102 regional defaults, the monitoring foundation adds 259 managed
 Terraform resource instances plus one existing SNS topic-policy update; the posture
 gate adds 45 more. These are source counts, not
 a substitute for the fresh plan. Many are free control settings or permissions, not
@@ -1031,7 +1031,10 @@ missing-heartbeat and Lambda-error alarms. It never consumes or deletes queued e
 The S3 audit archive has 90-day **governance** retention and one-year expiry; privileged
 administrators can bypass governance, unlike the recovery vault's compliance lock.
 Config/Session Manager records use a separate versioned bucket. Only standard SSM shell
-sessions are transcribed; SSH, Eternal Terminal and SSM port forwarding are not.
+sessions are transcribed; SSH, Eternal Terminal and SSM port forwarding are not. The
+builder instance role receives only bucket-location/encryption metadata reads and
+transcript-prefix writes, not transcript reads or broader S3 access. Runner/builder
+and shared jumpbox role grants follow their existing optional-resource gates.
 
 An apply is not delivery proof. Require a fresh empty plan, then read back trail logging
 status and recent digest/log objects, all three flow-log delivery statuses/objects,

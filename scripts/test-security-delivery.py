@@ -445,6 +445,62 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertRegex(east1, r'providers\s*=\s*\{ aws = aws\.staging_dr \}')
         self.assertNotIn("aws.security_staging_us_east_1", TERRAFORM)
 
+    def test_optional_runner_and_jumpbox_references_are_gated(self):
+        flow = block(TERRAFORM, "aws_flow_log", "security_main")
+        roles = block(TERRAFORM, "aws_iam_role_policy", "security_session_logs")
+        self.assertRegex(flow, r'var\.enable_github_runner\s*\?\s*\{ runner = aws_vpc\.runner\[0\]\.id \}\s*:\s*\{\}')
+        self.assertRegex(roles, r'var\.enable_github_runner\s*\?\s*\{\s*runner\s*= aws_iam_role\.runner\[0\]\.name\s*ami_builder\s*= aws_iam_role\.ami_builder\[0\]\.name\s*\}\s*:\s*\{\}')
+        self.assertRegex(roles, r'local\.jumpbox_admin_iam_needed\s*\?\s*\{ jumpbox = aws_iam_role\.jumpbox_admin\[0\]\.name \}\s*:\s*\{\}')
+
+    def test_builder_transcript_grant_has_exact_actions_and_resources(self):
+        roles = block(TERRAFORM, "aws_iam_role_policy", "security_session_logs")
+        self.assertRegex(roles, r'ami_builder\s*=\s*aws_iam_role\.ami_builder\[0\]\.name')
+        policy = roles.split("policy = jsonencode(", 1)[1]
+        self.assertEqual(set(re.findall(r'"(s3:[^"]+)"', policy)),
+                         {"s3:GetBucketLocation", "s3:GetEncryptionConfiguration", "s3:PutObject"})
+        self.assertEqual(re.findall(r'^\s*Resource\s*=\s*(.+)$', policy, re.M),
+                         ['aws_s3_bucket.security_config.arn', '"${aws_s3_bucket.security_config.arn}/sessions/*"'])
+        self.assertEqual(re.findall(r'Effect\s*=\s*"([^"]+)"', policy), ["Allow", "Allow"])
+
+    @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free scope guards run above")
+    def test_actual_optional_maps_render_with_absent_counted_resources(self):
+        flow = block(TERRAFORM, "aws_flow_log", "security_main").split("for_each = ", 1)[1].split("\n  vpc_id", 1)[0]
+        roles = block(TERRAFORM, "aws_iam_role_policy", "security_session_logs").split("for_each = ", 1)[1].split("\n  name", 1)[0]
+        for runners in (False, True):
+            for jumpbox in (False, True):
+                with self.subTest(runners=runners, jumpbox=jumpbox):
+                    replacements = {
+                        "var.enable_github_runner": json.dumps(runners),
+                        "local.jumpbox_admin_iam_needed": json.dumps(jumpbox),
+                        "local.vpc_id": json.dumps("vpc-dev"),
+                        "aws_vpc.runner": json.dumps([{"id": "vpc-runner"}] if runners else []),
+                        "aws_iam_role.runner": json.dumps([{"name": "runner-role"}] if runners else []),
+                        "aws_iam_role.ami_builder": json.dumps([{"name": "builder-role"}] if runners else []),
+                        "aws_iam_role.jumpbox_admin": json.dumps([{"name": "jumpbox-role"}] if jumpbox else []),
+                        "aws_iam_role.dev_server.name": json.dumps("dev-role"),
+                        "aws_iam_role.nextjs_dev.name": json.dumps("nextjs-role"),
+                        "aws_iam_role.dev_ebs_only.name": json.dumps("working-role"),
+                    }
+                    expression = '{ flow = ' + flow + ', roles = ' + roles + ' }'
+                    for old, new in replacements.items():
+                        expression = expression.replace(old, new)
+                    # Console reads one expression line; preserve HCL object
+                    # attribute separators while flattening the real map body.
+                    expression = re.sub(r'(?<=[\w"\]])\n(?=\s*\w+\s*=)', ', ', expression)
+                    # Empty, provider/backend-free directory: no AWS credentials or calls.
+                    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                           "TF_CLI_CONFIG_FILE": "/dev/null", "CHECKPOINT_DISABLE": "1"}
+                    with tempfile.TemporaryDirectory(prefix="security-optional-hcl-") as directory:
+                        result = subprocess.run([os.environ["SECURITY_TEST_TERRAFORM"], "console", "-no-color"],
+                            input="jsonencode(" + re.sub(r"\s+", " ", expression) + ")\n",
+                            text=True, capture_output=True, timeout=10, cwd=directory, env=env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    rendered = json.loads(json.loads(result.stdout.strip()))
+                    self.assertEqual(rendered["flow"], {"dev": "vpc-dev", **({"runner": "vpc-runner"} if runners else {})})
+                    self.assertEqual(rendered["roles"], {"dev": "dev-role", "nextjs": "nextjs-role", "working": "working-role",
+                        **({"runner": "runner-role", "ami_builder": "builder-role"} if runners else {}),
+                        **({"jumpbox": "jumpbox-role"} if jumpbox else {})})
+
     def test_guardduty_all_current_optional_features_are_disabled_at_creation(self):
         features = re.search(r'guardduty_optional_features\s*=\s*\[([^]]+)\]', REGIONAL)
         self.assertIsNotNone(features)
