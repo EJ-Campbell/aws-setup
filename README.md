@@ -718,10 +718,30 @@ gh api --method POST repos/ejc3/fcvm/environments/runner-ami-publish/deployment-
 ```
 
 Read back the environment and branch policies before creating/enabling the AWS role.
-There must be no other allowed branch/tag, reviewer, or bypass. The additive producer
-stage creates the builder role/profile and own-instance bootstrap grant first; the
-`fcvm` workflow and runner controller must adopt them before the old CI authority and
-runner PAT grant are retired. An additive apply alone does not close the old path.
+There must be no other allowed branch/tag, reviewer, or bypass. Credential migration
+has separate deployment gates; merging source is not evidence that a gate is live:
+
+1. Create the replacement builder role/profile and own-instance bootstrap grant.
+2. Deploy the backward-compatible runner controller and expiry cleanup. Its
+   `iam:PassRole` grant is independently restricted to the existing runner role and
+   EC2, with explicit denies for other roles/services. Verify the deployed code and
+   full IAM allow/deny cases before changing bootstrap. This source still publishes
+   the existing PAT-reading user data and retains its instance-role permissions.
+3. Publish the instance-bound bootstrap only after controller acceptance, then verify
+   a real trusted CI registration/job and drain instances booted with the old script.
+   Non-secret IAM fixtures test authorization, not registration or job execution.
+4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
+   the remaining controller EC2 launch resources after all launched resources carry
+   the required tags. The old CI authority is retired separately, only after the
+   protected `fcvm` AMI workflow has adopted the replacement builder role/profile.
+
+Keep each gate in a reviewed Terraform change with a fresh plan. The optional cleanup
+scans only bootstrap metadata/tags after every hard-ceiling termination attempt and
+deletes only positively identified, expired controller credentials. Its work is bounded;
+repeated truncation or held/error records require investigation, not a claim that every
+orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.md#controller-first-credential-migration)
+for the protocol and failure behavior. An additive apply alone does not close the old
+PAT or CI escalation paths.
 
 The repository also manages:
 

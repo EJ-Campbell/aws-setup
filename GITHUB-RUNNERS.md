@@ -479,6 +479,54 @@ previous one just launched. Inside one invocation the handler's own loop bounds 
 and the webhook Lambda stays the single authority on the cap.
 
 
+## Controller-first credential migration
+
+The controller can consume both the current PAT-reading user data and the next
+instance-bound bootstrap. This stage deliberately leaves the existing user-data
+parameter, runner PAT grant, broad runner SSM attachment, and controller launch
+resource permissions unchanged. It is preparation, **not completion of credential
+retirement**. The independent `iam:PassRole` escalation is closed now: both controller
+Lambdas may pass only `github-runner-instance-role`, only to EC2. Explicit denies
+protect against another policy allowing any other role or service. The existing
+launcher already uses exactly `github-runner-profile`, so this does not change jobs.
+
+The launcher classifies the exact document fetched from SSM before allocating an
+instance. Old scripts mint no unused bootstrap credential. For a broker script, it
+first obtains a short-lived GitHub registration token, then launches one instance,
+then creates `/github-runner/bootstrap/<instance-id>` as a SecureString with the
+matching `InstanceArn`, `Role=github-runner`, and GitHub's `CredentialExpiresAt`.
+The reusable PAT never enters user data or the job-host credential. Invalid documents
+or unusable tokens refuse before launch. If publication fails after EC2 accepted a
+launch, the controller attempts to terminate that exact instance and delete any
+partially published parameter; it does not fall through to another instance type.
+
+Future launches also receive IMDSv2-only metadata, encrypted disposable roots, and
+runner-tagged volumes/ENIs so the later least-privilege launch policy can identify all
+created resources. Instance-initiated shutdown terminates these disposable instances;
+the later ephemeral bootstrap will use that after its single job. This stage changes
+no existing instance, disk, runner registration, or service.
+
+An instance can lose Spot capacity or fail early in cloud-init without ever consuming
+its credential. The existing five-minute cleanup Lambda therefore scans **metadata
+only**, verifies an exact instance-shaped name and matching controller tags, and deletes
+only credentials whose recorded GitHub expiry has passed. It reads no token value,
+does not infer expiry from an EC2 lookup failure, and ignores non-credential IAM canaries.
+Missing/malformed provenance is held; read/parse/delete failures are logged. Each poll admits
+at most two pages of 50 records and ten seconds of new cleanup requests; the dedicated
+client uses two-second connect/read timeouts without retries. In-flight requests may
+finish after that admission budget. Every instance's hard-ceiling pass finishes before
+this optional I/O; cleanup failures do not suppress lease handling or queue retries.
+The `runner_bootstrap_cleanup` log and invocation result report deleted names, errors,
+and scan truncation. This bounded scan is not a guaranteed AWS deletion deadline:
+repeated truncation or unprovable records require investigation. It never deletes a
+record merely to make progress past that bound.
+
+Deployment order remains controller and additive grant first, broker user data second,
+then a real trusted CI registration/job acceptance and old-boot drain, and only then
+retirement of the old runner PAT/SSM grant and broad controller launch permissions.
+Keep a fresh reviewed plan between those gates. A token broker cannot be proved by an
+IAM-only fixture check or by an additive apply that still serves the old script.
+
 ## What crosses the boundary (secrets inventory)
 
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
@@ -515,7 +563,9 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `dev_to_runner` key. This remains a risk until the separately canaried runner
   policy cutoff; the additive bootstrap grant does not remove it.
 - **`github-runner-lambda-role`** (both Lambdas): logs; EC2
-  `Describe`/`Run`/`Stop`/`Terminate`/`CreateTags`; `iam:PassRole`;
+  `Describe`/`Run`/`Stop`/`Terminate`/`CreateTags`; `iam:PassRole` only on
+  `github-runner-instance-role` and only to EC2, with explicit denies for other
+  roles and services;
   `cloudwatch:GetMetricStatistics`; `ssm:GetParameter` on `/github-runner/*`;
   `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
   `dynamodb:GetItem` + `dynamodb:PutItem` on the registration table, for the cleanup claim.
