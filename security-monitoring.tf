@@ -993,13 +993,8 @@ resource "aws_iam_role_policy" "security_session_logs" {
   })
 }
 
-# Provider aliases are explicit because Terraform cannot choose a provider using
-# for_each. These are security-only regions, not new workload placement options.
-
-provider "aws" {
-  alias  = "security_main_ap_south_1"
-  region = "ap-south-1"
-}
+# Provider aliases are shared with the separately owned regional account defaults
+# in security-regions.tf. These modules own monitoring only, not those defaults.
 
 module "security_main_ap_south_1" {
   source                = "./modules/security-region"
@@ -1013,11 +1008,6 @@ module "security_main_ap_south_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_ca_central_1"
-  region = "ca-central-1"
-}
-
 module "security_main_ca_central_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_ca_central_1 }
@@ -1028,11 +1018,6 @@ module "security_main_ca_central_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_eu_central_1"
-  region = "eu-central-1"
 }
 
 module "security_main_eu_central_1" {
@@ -1071,11 +1056,6 @@ module "security_main_us_west_2" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_eu_north_1"
-  region = "eu-north-1"
-}
-
 module "security_main_eu_north_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_eu_north_1 }
@@ -1086,11 +1066,6 @@ module "security_main_eu_north_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_eu_west_3"
-  region = "eu-west-3"
 }
 
 module "security_main_eu_west_3" {
@@ -1105,11 +1080,6 @@ module "security_main_eu_west_3" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_eu_west_2"
-  region = "eu-west-2"
-}
-
 module "security_main_eu_west_2" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_eu_west_2 }
@@ -1120,11 +1090,6 @@ module "security_main_eu_west_2" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_eu_west_1"
-  region = "eu-west-1"
 }
 
 module "security_main_eu_west_1" {
@@ -1139,11 +1104,6 @@ module "security_main_eu_west_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_ap_northeast_3"
-  region = "ap-northeast-3"
-}
-
 module "security_main_ap_northeast_3" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_ap_northeast_3 }
@@ -1154,11 +1114,6 @@ module "security_main_ap_northeast_3" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_ap_northeast_2"
-  region = "ap-northeast-2"
 }
 
 module "security_main_ap_northeast_2" {
@@ -1173,11 +1128,6 @@ module "security_main_ap_northeast_2" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_ap_northeast_1"
-  region = "ap-northeast-1"
-}
-
 module "security_main_ap_northeast_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_ap_northeast_1 }
@@ -1188,11 +1138,6 @@ module "security_main_ap_northeast_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_sa_east_1"
-  region = "sa-east-1"
 }
 
 module "security_main_sa_east_1" {
@@ -1207,11 +1152,6 @@ module "security_main_sa_east_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_ap_southeast_1"
-  region = "ap-southeast-1"
-}
-
 module "security_main_ap_southeast_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_ap_southeast_1 }
@@ -1222,11 +1162,6 @@ module "security_main_ap_southeast_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_main_ap_southeast_2"
-  region = "ap-southeast-2"
 }
 
 module "security_main_ap_southeast_2" {
@@ -1253,11 +1188,6 @@ module "security_main_us_east_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_main_us_east_2"
-  region = "us-east-2"
-}
-
 module "security_main_us_east_2" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_main_us_east_2 }
@@ -1268,14 +1198,6 @@ module "security_main_us_east_2" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_ap_south_1"
-  region = "ap-south-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_ap_south_1" {
@@ -1290,14 +1212,6 @@ module "security_staging_ap_south_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_ca_central_1"
-  region = "ca-central-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_ca_central_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_ca_central_1 }
@@ -1308,14 +1222,6 @@ module "security_staging_ca_central_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_eu_central_1"
-  region = "eu-central-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_eu_central_1" {
@@ -1342,14 +1248,6 @@ module "security_staging_us_west_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_us_west_2"
-  region = "us-west-2"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_us_west_2" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_us_west_2 }
@@ -1360,14 +1258,6 @@ module "security_staging_us_west_2" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_eu_north_1"
-  region = "eu-north-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_eu_north_1" {
@@ -1382,14 +1272,6 @@ module "security_staging_eu_north_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_eu_west_3"
-  region = "eu-west-3"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_eu_west_3" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_eu_west_3 }
@@ -1400,14 +1282,6 @@ module "security_staging_eu_west_3" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_eu_west_2"
-  region = "eu-west-2"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_eu_west_2" {
@@ -1422,14 +1296,6 @@ module "security_staging_eu_west_2" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_eu_west_1"
-  region = "eu-west-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_eu_west_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_eu_west_1 }
@@ -1440,14 +1306,6 @@ module "security_staging_eu_west_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_ap_northeast_3"
-  region = "ap-northeast-3"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_ap_northeast_3" {
@@ -1462,14 +1320,6 @@ module "security_staging_ap_northeast_3" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_ap_northeast_2"
-  region = "ap-northeast-2"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_ap_northeast_2" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_ap_northeast_2 }
@@ -1480,14 +1330,6 @@ module "security_staging_ap_northeast_2" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_ap_northeast_1"
-  region = "ap-northeast-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_ap_northeast_1" {
@@ -1502,14 +1344,6 @@ module "security_staging_ap_northeast_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_sa_east_1"
-  region = "sa-east-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_sa_east_1" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_sa_east_1 }
@@ -1520,14 +1354,6 @@ module "security_staging_sa_east_1" {
   posture_enabled       = false
   record_global_iam     = false
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_ap_southeast_1"
-  region = "ap-southeast-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_ap_southeast_1" {
@@ -1542,14 +1368,6 @@ module "security_staging_ap_southeast_1" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_ap_southeast_2"
-  region = "ap-southeast-2"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_ap_southeast_2" {
   source                = "./modules/security-region"
   providers             = { aws = aws.security_staging_ap_southeast_2 }
@@ -1562,17 +1380,9 @@ module "security_staging_ap_southeast_2" {
   depends_on            = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
 }
 
-provider "aws" {
-  alias  = "security_staging_us_east_1"
-  region = "us-east-1"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
-}
-
 module "security_staging_us_east_1" {
   source                = "./modules/security-region"
-  providers             = { aws = aws.security_staging_us_east_1 }
+  providers             = { aws = aws.staging_dr }
   central_event_bus_arn = aws_cloudwatch_event_bus.security_alerts.arn
   forwarding_role_arn   = aws_iam_role.security_forward_staging.arn
   audit_bucket_name     = aws_s3_bucket.security_config.id
@@ -1581,14 +1391,6 @@ module "security_staging_us_east_1" {
   posture_enabled   = local.security_posture_enabled
   record_global_iam = false
   depends_on        = [aws_s3_bucket_policy.security_config, aws_cloudwatch_event_bus_policy.security_alerts, aws_iam_role_policy.security_forward, aws_iam_role_policy.security_forward_staging]
-}
-
-provider "aws" {
-  alias  = "security_staging_us_east_2"
-  region = "us-east-2"
-  assume_role {
-    role_arn = "arn:aws:iam::${aws_organizations_account.dev_staging[0].id}:role/OrganizationAccountAccessRole"
-  }
 }
 
 module "security_staging_us_east_2" {

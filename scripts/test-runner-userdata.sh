@@ -226,9 +226,9 @@ fi
 if grep -q 'aws_lambda_function.runner_cleanup,' "$TF_FILE" \
    && grep -q 'aws_iam_role_policy.runner_lambda,' "$TF_FILE" \
    && grep -q 'aws_iam_role_policy.runner,' "$TF_FILE" \
-   && grep -q 'aws_ssm_parameter.runner_user_data,' "$TF_FILE" \
+   && grep -q 'aws_iam_role_policy.runner_bootstrap_controller,' "$TF_FILE" \
    && grep -q 'WEBHOOK_FUNCTION   = "github-runner-webhook"' "$TF_FILE"; then
-    ok "ddb-v1 launcher activation waits for cleanup, IAM, and user data"
+    ok "controller-first activation waits for cleanup and additive IAM; old user data retains its grant"
 else
     bad "Terraform rollout can activate ddb-v1 before both protocol participants"
 fi

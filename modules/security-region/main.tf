@@ -17,19 +17,7 @@ variable "record_global_iam" { type = bool }
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
-# These defaults protect future launches; no existing disk is replaced or copied.
-resource "aws_ebs_encryption_by_default" "security" {
-  enabled = true
-}
-
-resource "aws_ebs_snapshot_block_public_access" "security" {
-  state = "block-all-sharing"
-}
-
-resource "aws_ec2_instance_metadata_defaults" "security" {
-  http_tokens = "required"
-}
-
+# Account defaults have a single independent owner in modules/security-defaults.
 locals {
   # CreateDetector enables omitted optional features. AWS provider 5.100's typed
   # feature enum predates AI_PROTECTION/AI_ANALYST; use its existing Cloud Control

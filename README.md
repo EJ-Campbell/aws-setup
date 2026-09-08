@@ -718,10 +718,30 @@ gh api --method POST repos/ejc3/fcvm/environments/runner-ami-publish/deployment-
 ```
 
 Read back the environment and branch policies before creating/enabling the AWS role.
-There must be no other allowed branch/tag, reviewer, or bypass. The additive producer
-stage creates the builder role/profile and own-instance bootstrap grant first; the
-`fcvm` workflow and runner controller must adopt them before the old CI authority and
-runner PAT grant are retired. An additive apply alone does not close the old path.
+There must be no other allowed branch/tag, reviewer, or bypass. Credential migration
+has separate deployment gates; merging source is not evidence that a gate is live:
+
+1. Create the replacement builder role/profile and own-instance bootstrap grant.
+2. Deploy the backward-compatible runner controller and expiry cleanup. Its
+   `iam:PassRole` grant is independently restricted to the existing runner role and
+   EC2, with explicit denies for other roles/services. Verify the deployed code and
+   full IAM allow/deny cases before changing bootstrap. This source still publishes
+   the existing PAT-reading user data and retains its instance-role permissions.
+3. Publish the instance-bound bootstrap only after controller acceptance, then verify
+   a real trusted CI registration/job and drain instances booted with the old script.
+   Non-secret IAM fixtures test authorization, not registration or job execution.
+4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
+   the remaining controller EC2 launch resources after all launched resources carry
+   the required tags. The old CI authority is retired separately, only after the
+   protected `fcvm` AMI workflow has adopted the replacement builder role/profile.
+
+Keep each gate in a reviewed Terraform change with a fresh plan. The optional cleanup
+scans only bootstrap metadata/tags after every hard-ceiling termination attempt and
+deletes only positively identified, expired controller credentials. Its work is bounded;
+repeated truncation or held/error records require investigation, not a claim that every
+orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.md#controller-first-credential-migration)
+for the protocol and failure behavior. An additive apply alone does not close the old
+PAT or CI escalation paths.
 
 The repository also manages:
 
@@ -910,14 +930,57 @@ The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive sear
 searches to the repository, prefer `rg`, and move large scans/builds to ARM or the parallel
 box.
 
+## Regional security defaults
+
+`security-defaults.tf` manages 102 account settings: three defaults across 17 enabled
+regions in both the main and recovery accounts (34 account/region combinations).
+Coverage is `ap-south-1`, `ap-northeast-{1,2,3}`, `ap-southeast-{1,2}`, `ca-central-1`,
+`eu-central-1`, `eu-north-1`, `eu-west-{1,2,3}`, `sa-east-1`, `us-east-{1,2}` and
+`us-west-{1,2}`. Newly enabled regions must be added explicitly; this does not enable
+opt-in regions. `security-regions.tf` reuses the existing primary/DR providers and
+adds only the missing regional aliases, with the existing recovery-account admin role.
+
+- EBS encryption by default protects new volumes and new snapshot copies. Existing
+  disks and snapshots are not re-encrypted; snapshots of an existing volume still
+  inherit that volume's encryption. No KMS key is created or changed. The deferred
+  existing-disk migration is not part of this rollout. See [EBS encryption defaults](https://docs.aws.amazon.com/ebs/latest/userguide/encryption-by-default.html).
+- Snapshot `block-all-sharing` prevents new public sharing and also blocks public
+  access to already-public owned snapshots. Private sharing and cross-account backups
+  remain allowed. It does not erase the underlying public permission: disabling the
+  block could re-expose old public snapshots. EBS-backed AMI public sharing is a
+  separate control. See [snapshot public-access blocking](https://docs.aws.amazon.com/ebs/latest/userguide/block-public-access-snapshots.html).
+- IMDS `HttpTokens=required` is the default for future launches, not hard enforcement:
+  explicit launch options can override it. Existing instances are not changed. The
+  pinned provider also writes `no-preference` for the regional endpoint/tag defaults
+  and `-1` for the hop limit, matching the September 8 inventory's unset values.
+  Review any non-default regional metadata setting before applying. See [regional IMDS defaults](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-IMDS-new-instances.html).
+
+These settings have no recurring service subscription and create no detectors, log
+pipelines, keys or compute. Ordinary future storage, copy and KMS usage still costs
+money; in particular copying with a different key can require a full snapshot copy.
+This is separate from the paid monitoring rollout awaiting approval, not evidence
+that security logging/detection is active. Public SSH/ET, Cloudflare Access service-token access and
+the verified backup plans, recovery history and cleanup permissions remain unchanged.
+
+Before applying, read the full fresh plan: expect only these regional account settings,
+no instance, volume, backup or access-policy changes. Inventory owned publicly restorable
+snapshots in both accounts using `describe-snapshots --owner-ids <account-id>
+--restorable-by-user-ids all` in every listed region; investigate any result before
+changing its public visibility. After applying, require an empty follow-up plan and
+read back `get-ebs-encryption-by-default`, `get-snapshot-block-public-access-state` and
+`get-instance-metadata-defaults` in all 34 combinations. Expect `true`,
+`block-all-sharing` and `AccountLevel.HttpTokens=required`, respectively. Account defaults
+do not prove existing hosts or disks have been remediated.
+
 ## Security monitoring rollout
 
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
 pairs). The foundation records organization-wide management events and object access
 to the Terraform-state and dev-script buckets, enables external Access Analyzer and
-base GuardDuty, and records traffic for the three active VPCs. It sets future EBS
-encryption and IMDSv2 defaults and blocks public snapshot sharing. It does **not**
+base GuardDuty, and records traffic for the three active VPCs. The regional EBS,
+IMDS and snapshot-sharing defaults above have a separate owner and are not recreated
+by these monitoring modules. Monitoring does **not**
 migrate existing disks, restrict the required public SSH/ET access, remove Cloudflare
 service-token access, or change the verified backup pipeline.
 
@@ -951,8 +1014,9 @@ second detector. A failed live-property postcondition requires an administrator 
 diagnose and review a repair or future typed-resource migration; it does not perform
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
-The foundation expands to 360 managed Terraform resource instances plus one existing
-SNS topic-policy update; the posture gate adds 45 more. These are source counts, not
+After the separate 102 regional defaults, the monitoring foundation adds 258 managed
+Terraform resource instances plus one existing SNS topic-policy update; the posture
+gate adds 45 more. These are source counts, not
 a substitute for the fresh plan. Many are free control settings or permissions, not
 individually billed workloads. No existing compute, volume or backup resource should
 be replaced by this rollout.
@@ -1354,6 +1418,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |

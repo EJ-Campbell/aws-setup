@@ -37,3 +37,51 @@ resource "aws_iam_role_policy" "runner_bootstrap" {
     }]
   })
 }
+
+# Controller-first additive grant. The old runner PAT/user-data grant and broad
+# EC2 launch permissions remain until live acceptance; PassRole is narrowed now.
+resource "aws_iam_role_policy" "runner_bootstrap_controller" {
+  count = var.enable_github_runner ? 1 : 0
+  name  = "broker-instance-bound-bootstrap"
+  role  = aws_iam_role.runner_lambda[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "CreateInstanceBoundBootstrapCredential"
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter", "ssm:AddTagsToResource"]
+        Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+        Condition = {
+          StringEquals = { "aws:RequestTag/Role" = "github-runner" }
+          StringLike   = { "aws:RequestTag/InstanceArn" = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/i-*" }
+        }
+      },
+      {
+        Sid      = "ReadBootstrapProvenanceOnly"
+        Effect   = "Allow"
+        Action   = "ssm:ListTagsForResource"
+        Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+      },
+      {
+        Sid      = "DeleteControllerBootstrapCredentialOnly"
+        Effect   = "Allow"
+        Action   = "ssm:DeleteParameter"
+        Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
+        }
+      },
+      {
+        # DescribeParameters cannot be resource-scoped and returns no values.
+        Sid      = "ListParameterMetadata"
+        Effect   = "Allow"
+        Action   = "ssm:DescribeParameters"
+        Resource = "*"
+        Condition = {
+          StringEquals = { "aws:RequestedRegion" = "us-west-1" }
+        }
+      },
+    ]
+  })
+}

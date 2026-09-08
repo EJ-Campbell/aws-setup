@@ -428,12 +428,22 @@ class TerraformSafetyTests(unittest.TestCase):
     def test_posture_staged_off_without_disabling_foundation(self):
         self.assertRegex(TERRAFORM, r'\bsecurity_posture_enabled\s*=\s*false\b')
         self.assertNotRegex(TERRAFORM, r'\bposture_enabled\s*=\s*true\b')
-        for kind, name in (("aws_ebs_encryption_by_default", "security"),
-                           ("aws_ebs_snapshot_block_public_access", "security"),
-                           ("aws_ec2_instance_metadata_defaults", "security"),
-                           ("aws_cloudcontrolapi_resource", "guardduty"),
+        for kind, name in (("aws_cloudcontrolapi_resource", "guardduty"),
                            ("aws_accessanalyzer_analyzer", "external")):
             self.assertNotIn("posture_enabled", block(REGIONAL, kind, name))
+
+    def test_defaults_have_a_single_separate_owner(self):
+        defaults = (ROOT / "modules/security-defaults/main.tf").read_text()
+        for kind in ("aws_ebs_encryption_by_default", "aws_ebs_snapshot_block_public_access",
+                     "aws_ec2_instance_metadata_defaults"):
+            self.assertNotIn(kind, REGIONAL)
+            self.assertNotIn("posture_enabled", block(defaults, kind, "security"))
+
+    def test_monitoring_reuses_shared_provider_aliases(self):
+        self.assertNotRegex(TERRAFORM, re.compile(r'^provider "aws"', re.M))
+        east1 = re.search(r'^module "security_staging_us_east_1" \{(.*?)^\}', TERRAFORM, re.M | re.S).group(1)
+        self.assertRegex(east1, r'providers\s*=\s*\{ aws = aws\.staging_dr \}')
+        self.assertNotIn("aws.security_staging_us_east_1", TERRAFORM)
 
     def test_guardduty_all_current_optional_features_are_disabled_at_creation(self):
         features = re.search(r'guardduty_optional_features\s*=\s*\[([^]]+)\]', REGIONAL)

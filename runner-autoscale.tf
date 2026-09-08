@@ -54,6 +54,8 @@ data "archive_file" "runner_webhook" {
       import os
       import hmac
       import hashlib
+      import base64
+      import zlib
       import urllib.request
       from datetime import datetime, timezone, timedelta
 
@@ -85,6 +87,36 @@ data "archive_file" "runner_webhook" {
           param_name = os.environ.get('USER_DATA_PARAM', '/github-runner/user-data')
           resp = ssm.get_parameter(Name=param_name)
           return resp['Parameter']['Value']
+
+      def user_data_protocol(user_data):
+          """Identify the exact fetched script, never a separately read version.
+
+          During controller-first rollout the old script still reads its PAT.
+          Mint an instance-bound token only for the broker script, and never tag
+          legacy scripts as if they claimed DynamoDB registration. This keeps an
+          additive controller rollout compatible without a job-host PAT fallback.
+          """
+          try:
+              packed = base64.b64decode(user_data, validate=True)
+              if len(packed) > 65536:
+                  raise ValueError('oversize')
+              if packed.startswith(b'\x1f\x8b'):
+                  decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                  unpacked = decoder.decompress(packed, 262145)
+                  if len(unpacked) > 262144 or not decoder.eof or decoder.unused_data:
+                      raise ValueError('invalid compressed document')
+              else:
+                  unpacked = packed
+              script = unpacked.decode('utf-8')
+              if not script.startswith('#!/bin/bash\n'):
+                  raise ValueError('not a runner script')
+          except (ValueError, TypeError, UnicodeError, zlib.error):
+              raise RuntimeError('Invalid runner user-data document; refusing to launch') from None
+          broker = '\nBOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"\n' in script
+          claims = any(line.lstrip().startswith('REGISTRATION_TABLE=') for line in script.splitlines())
+          if broker and not claims:
+              raise RuntimeError('Broker user data must claim registration; refusing to launch')
+          return broker, claims
 
       def get_latest_runner_ami(arch='arm64'):
           """Get the latest available AMI for the specified architecture"""
@@ -129,6 +161,54 @@ data "archive_file" "runner_webhook" {
           except Exception as e:
               print(f'SSM get_parameter failed: {e}')
           return None
+
+      class RunnerBootstrapError(Exception):
+          """EC2 accepted a launch but its one-host credential could not be brokered."""
+
+      def get_registration_token():
+          """The reusable PAT stays in this controller, never on the job host."""
+          pat = get_github_pat()
+          if not pat:
+              raise RuntimeError('No usable runner-controller PAT; refusing to launch')
+          req = urllib.request.Request(
+              f'https://api.github.com/repos/{REPO}/actions/runners/registration-token',
+              data=b'{}', method='POST', headers={
+                  'Authorization': f'token {pat}',
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+              })
+          with urllib.request.urlopen(req, timeout=5) as resp:
+              body = resp.read(16385)
+          if len(body) > 16384:
+              raise RuntimeError('GitHub returned an oversized registration response')
+          payload = json.loads(body)
+          if not isinstance(payload, dict):
+              raise RuntimeError('GitHub returned an invalid registration response')
+          token = payload.get('token')
+          try:
+              expires = datetime.fromisoformat(payload['expires_at'].replace('Z', '+00:00'))
+              now = datetime.now(timezone.utc)
+              # GitHub documents a one-hour token. Reject unexpected lifetimes
+              # rather than turning this boundary into a durable credential.
+              usable = now + timedelta(minutes=20) < expires <= now + timedelta(minutes=65)
+          except (AttributeError, KeyError, TypeError, ValueError):
+              usable = False
+          if not isinstance(token, str) or not token.strip() or len(token) > 4096 or not usable:
+              raise RuntimeError('GitHub returned no usable registration credential')
+          return token, expires.astimezone(timezone.utc)
+
+      def broker_registration_token(instance_id, token, expires):
+          """Create only after launch so IAM can bind consumption to that instance."""
+          account = os.environ['RUNNER_ACCOUNT_ID']
+          ssm.put_parameter(
+              Name=f'/github-runner/bootstrap/{instance_id}',
+              Description='One-host GitHub registration credential; expires at GitHub after one hour',
+              Type='SecureString', Value=token, Overwrite=False,
+              Tags=[
+                  {'Key': 'Role', 'Value': 'github-runner'},
+                  {'Key': 'InstanceArn', 'Value': f'arn:aws:ec2:us-west-1:{account}:instance/{instance_id}'},
+                  {'Key': 'CredentialExpiresAt', 'Value': expires.isoformat()},
+              ])
 
       # Same two bounds as the cleanup Lambda's roster read, for the same reason.
       ROSTER_PAGE_LIMIT = 10
@@ -507,6 +587,12 @@ data "archive_file" "runner_webhook" {
 
           # Set initial lease - runner will auto-terminate if not renewed
           lease_expiry = get_lease_expiry()
+          # Fetch both inputs BEFORE launching. A GitHub/SSM outage must not
+          # allocate metal that cannot bootstrap. Never interpolate the token
+          # into user data: EC2 exposes that to the instance and control plane.
+          user_data = get_user_data()
+          broker, claims_registration = user_data_protocol(user_data)
+          registration_token = get_registration_token() if broker else None
 
           for instance_type in instance_types:
               try:
@@ -526,9 +612,11 @@ data "archive_file" "runner_webhook" {
                       IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
                       BlockDeviceMappings=[{
                           'DeviceName': '/dev/sda1',
-                          'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True}
+                          'Ebs': {'VolumeSize': volume_size, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}
                       }],
-                      UserData=get_user_data(),
+                      UserData=user_data,
+                      MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1},
+                      InstanceInitiatedShutdownBehavior='terminate',
                       InstanceMarketOptions={
                           'MarketType': 'spot',
                           'SpotOptions': {'SpotInstanceType': 'one-time'}
@@ -544,15 +632,43 @@ data "archive_file" "runner_webhook" {
                               # user data runs. It says nothing about whether
                               # registration succeeded; the cleanup Lambda reads
                               # that from the DynamoDB row this tag points at.
-                              {'Key': 'RunnerRegistrationProtocol', 'Value': 'ddb-v1'}
-                          ]
+                          ] + ([{'Key': 'RunnerRegistrationProtocol', 'Value': 'ddb-v1'}]
+                               if claims_registration else [])
+                      }, {
+                          'ResourceType': 'volume',
+                          'Tags': [{'Key': 'Role', 'Value': 'github-runner'}]
+                      }, {
+                          'ResourceType': 'network-interface',
+                          'Tags': [{'Key': 'Role', 'Value': 'github-runner'}]
                       }]
                   )
-                  return response['Instances'][0]['InstanceId'], instance_type
               except Exception as e:
                   last_error = e
                   print(f"Failed to launch {instance_type}: {e}, trying next...")
                   continue
+
+              # Do not put this in the capacity-fallback try. Once EC2 accepted
+              # a launch, a broker error must never launch another instance type.
+              instance_id = response['Instances'][0]['InstanceId']
+              if not broker:
+                  # Only the transitional, already-deployed script uses its old
+                  # PAT grant. This controller never sends that PAT to the host.
+                  return instance_id, instance_type
+              try:
+                  broker_registration_token(instance_id, *registration_token)
+              except Exception as error:
+                  print(f'BOOTSTRAP BROKER FAILED for {instance_id}: {type(error).__name__}')
+                  try:
+                      ec2.terminate_instances(InstanceIds=[instance_id])
+                  except Exception as terminate_error:
+                      print(f'BOOTSTRAP TERMINATE FAILED for {instance_id}: {type(terminate_error).__name__}')
+                  # A lost PutParameter response may have left the credential.
+                  try:
+                      ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
+                  except Exception:
+                      pass
+                  raise RunnerBootstrapError(f'Credential provisioning failed for {instance_id}; no launch retry') from None
+              return instance_id, instance_type
 
           raise last_error or Exception(f"All instance types failed for {arch}")
 
@@ -638,6 +754,11 @@ data "archive_file" "runner_webhook" {
               for _ in range(budget):
                   spot_id, instance_type = launch_runner(arch)
                   launched_here.append(spot_id)
+          except RunnerBootstrapError as e:
+              emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed', str(e))
+              # A handled result also prevents asynchronous Lambda retries from
+              # repeating an already accepted EC2 launch. Cleanup polls later.
+              return {'statusCode': 503, 'body': str(e)}
           except Exception as e:
               emit_decision(arch, queued_jobs, capacity, max_runners, 'launch-failed',
                             f'{e} (after {len(launched_here)} launched this invocation)')
@@ -669,7 +790,10 @@ resource "aws_lambda_function" "runner_webhook" {
       SUBNET_ID         = aws_subnet.runner[0].id
       SECURITY_GROUP_ID = aws_security_group.runner[0].id
       INSTANCE_PROFILE  = aws_iam_instance_profile.runner[0].name
-      USER_DATA_PARAM   = aws_ssm_parameter.runner_user_data[0].name
+      # Constant breaks the old inverse dependency. A new controller must be
+      # active before the parameter begins requesting broker credentials.
+      USER_DATA_PARAM   = "/github-runner/user-data"
+      RUNNER_ACCOUNT_ID = data.aws_caller_identity.current.account_id
       MAX_RUNNERS       = tostring(local.runner_max_per_arch) # Per architecture
       WEBHOOK_SECRET    = random_password.github_webhook[0].result
     }
@@ -679,16 +803,15 @@ resource "aws_lambda_function" "runner_webhook" {
     Name = "github-runner-webhook"
   }
 
-  # The ddb-v1 tag is a promise that the instance's user data can make its
-  # registration claim and that the cleanup Lambda knows what the claim means.
-  # No tagged instance may launch before the table, both IAM grants, the
-  # cleanup Lambda and the user-data parameter carrying that protocol exist.
+  # Additive grants and cleanup come first, controller second, broker user data
+  # third, removal of the old PAT grants last. The controller recognizes the
+  # actual fetched script, so a producer-only full apply can retain old user data.
   depends_on = [
     aws_dynamodb_table.runner_registration,
     aws_iam_role_policy.runner_lambda,
-    aws_iam_role_policy.runner,
+    aws_iam_role_policy.runner_bootstrap,
+    aws_iam_role_policy.runner_bootstrap_controller,
     aws_lambda_function.runner_cleanup,
-    aws_ssm_parameter.runner_user_data,
   ]
 }
 
@@ -732,10 +855,36 @@ resource "aws_iam_role_policy" "runner_lambda" {
           "ec2:StopInstances",
           "ec2:TerminateInstances",
           "ec2:CreateTags",
-          "iam:PassRole",
           "cloudwatch:GetMetricStatistics"
         ]
         Resource = "*"
+      },
+      {
+        # Every controller launch uses github-runner-profile. This restriction
+        # is independent of the later user-data and EC2 tag-policy migration.
+        Sid      = "PassRunnerRoleToEC2Only"
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.runner[0].arn
+        Condition = {
+          StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" }
+        }
+      },
+      {
+        # A future additive Allow must not restore an admin-profile launch path.
+        Sid         = "DenyPassingOtherRoles"
+        Effect      = "Deny"
+        Action      = "iam:PassRole"
+        NotResource = aws_iam_role.runner[0].arn
+      },
+      {
+        Sid      = "DenyPassingRunnerRoleOutsideEC2"
+        Effect   = "Deny"
+        Action   = "iam:PassRole"
+        Resource = aws_iam_role.runner[0].arn
+        Condition = {
+          StringNotEqualsIfExists = { "iam:PassedToService" = "ec2.amazonaws.com" }
+        }
       },
       {
         Effect   = "Allow"
@@ -1244,12 +1393,19 @@ data "archive_file" "runner_cleanup" {
       import urllib.request
       import json
       import os
+      import re
+      import time
+      from botocore.config import Config
       from datetime import datetime, timezone, timedelta
 
       ec2 = boto3.client('ec2', region_name='us-west-1')
       ssm = boto3.client('ssm', region_name='us-west-1')
       lambda_client = boto3.client('lambda', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      # This optional metadata-only sweep must not inherit SDK's minute-long
+      # timeouts/retries and consume the lifecycle controller's whole budget.
+      bootstrap_ssm = boto3.client('ssm', region_name='us-west-1', config=Config(
+          connect_timeout=2, read_timeout=2, retries={'total_max_attempts': 1}))
 
       REPO = 'ejc3/fcvm'
       REGION = 'us-west-1'
@@ -2161,6 +2317,76 @@ data "archive_file" "runner_cleanup" {
                       demand['arm64'] += 1
           return demand
 
+      def cleanup_expired_bootstrap_parameters(now):
+          """Remove expired, positively identified controller credentials only.
+
+          An instance may lose Spot capacity or fail before its bootstrap ever
+          reads/deletes the parameter. Do not infer that from a missing EC2 row:
+          the exact GitHub expiry, recorded atomically with the token, is enough.
+          No parameter value is read. Valid credentials and IAM canaries stay.
+          """
+          result = {'deleted': [], 'errors': 0, 'truncated': False}
+          account = os.environ.get('RUNNER_ACCOUNT_ID', '')
+          if not re.fullmatch(r'[0-9]{12}', account):
+              result['errors'] = 1
+              return result
+          deadline = time.monotonic() + 10
+          query = {
+              'ParameterFilters': [{'Key': 'Name', 'Option': 'BeginsWith',
+                                    'Values': ['/github-runner/bootstrap/']}],
+              'MaxResults': 50,
+          }
+          # Two pages / 100 metadata records / 10s admission budget per poll.
+          # Requests use 2s connect/read timeouts and no retry; an in-flight
+          # request may finish after the admission deadline.
+          # The next five-minute poll retries after timeouts or partial scans.
+          for _ in range(2):
+              if time.monotonic() >= deadline:
+                  result['truncated'] = True
+                  break
+              try:
+                  page = bootstrap_ssm.describe_parameters(**query)
+              except Exception as error:
+                  print(f'BOOTSTRAP METADATA SCAN FAILED: {type(error).__name__}')
+                  result['errors'] += 1
+                  break
+              for metadata in page.get('Parameters', [])[:50]:
+                  if time.monotonic() >= deadline:
+                      result['truncated'] = True
+                      return result
+                  name = metadata.get('Name', '')
+                  match = re.fullmatch(r'/github-runner/bootstrap/(i-[0-9a-f]{8}(?:[0-9a-f]{9})?)', name)
+                  if not match or metadata.get('Type') != 'SecureString':
+                      continue
+                  expected_arn = f'arn:aws:ec2:{REGION}:{account}:instance/{match.group(1)}'
+                  try:
+                      tags = {tag['Key']: tag['Value'] for tag in bootstrap_ssm.list_tags_for_resource(
+                          ResourceType='Parameter', ResourceId=name)['TagList']}
+                      expires = datetime.fromisoformat(tags.get('CredentialExpiresAt', '').replace('Z', '+00:00'))
+                      if tags.get('Role') != 'github-runner' or tags.get('InstanceArn') != expected_arn:
+                          continue
+                      # Naive/malformed times, absent provenance and live tokens
+                      # never provide authority to delete a parameter.
+                      if expires.tzinfo is None or expires > now:
+                          continue
+                      if time.monotonic() >= deadline:
+                          result['truncated'] = True
+                          return result
+                      bootstrap_ssm.delete_parameter(Name=name)
+                      result['deleted'].append(name)
+                  except Exception as error:
+                      if getattr(error, 'response', {}).get('Error', {}).get('Code') == 'ParameterNotFound':
+                          continue  # The owning bootstrap already deleted it.
+                      print(f'BOOTSTRAP CLEANUP HELD {name}: {type(error).__name__}')
+                      result['errors'] += 1
+              token = page.get('NextToken')
+              if not token:
+                  break
+              query['NextToken'] = token
+          else:
+              result['truncated'] = True
+          return result
+
       def handler(event, context):
           now = datetime.now(timezone.utc)
 
@@ -2250,8 +2476,16 @@ data "archive_file" "runner_cleanup" {
                             f'this instance is NOT covered by the lifetime bound until its '
                             f'record reads cleanly. Every other instance is still checked.')
 
-          # Every ceiling termination has been attempted. Only now is the PAT
-          # read and GitHub asked.
+          # Every ceiling termination has been attempted. Only now may optional
+          # bounded credential cleanup run, the PAT be read, or GitHub be asked.
+          # Never put a parameter read/tag/delete into terminate(): that would
+          # place optional I/O ahead of the next instance's required ceiling.
+          try:
+              bootstrap_cleanup = cleanup_expired_bootstrap_parameters(now)
+          except Exception as error:
+              print(f'BOOTSTRAP CLEANUP FAILED: {type(error).__name__}')
+              bootstrap_cleanup = {'deleted': [], 'errors': 1, 'truncated': False}
+          print(json.dumps({'event': 'runner_bootstrap_cleanup', **bootstrap_cleanup}))
           pat = get_github_pat()
           print(f'PAT available: {bool(pat)}')
           # `roster is None` means the answer never arrived: the call failed, the
@@ -2761,7 +2995,7 @@ data "archive_file" "runner_cleanup" {
               except Exception as e:
                   print(f'Failed to check queued jobs: {e}')
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF
     filename = "lambda_function.py"
   }
@@ -2797,6 +3031,8 @@ resource "aws_lambda_function" "runner_cleanup" {
   tags = {
     Name = "github-runner-cleanup"
   }
+
+  depends_on = [aws_iam_role_policy.runner_bootstrap_controller]
 }
 
 # Async invocations (the cleanup poll's direct invokes) must never be retried by
