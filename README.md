@@ -995,6 +995,37 @@ read back `get-ebs-encryption-by-default`, `get-snapshot-block-public-access-sta
 `block-all-sharing` and `AccountLevel.HttpTokens=required`, respectively. Account defaults
 do not prove existing hosts or disks have been remediated.
 
+## Account-wide S3 public-access blocking
+
+`security-s3-account.tf` manages two global account controls, one each for main
+and recovery, with all four S3 Block Public Access flags enabled. They cover current
+and future buckets/access points in every region; unlike the future-only EBS defaults,
+these controls can also block existing public access. They do not rewrite bucket
+policies/ACLs, migrate disks, create paid monitoring services, or change public SSH,
+Cloudflare service-token access or the verified backup pipeline.
+
+Before deployment, the September 8, 2026 16:41 UTC read-only inventory found six main
+account buckets and no recovery-account buckets. All six already had all four
+bucket-level blocks, `BucketOwnerEnforced`, no bucket policies, no effective public
+ACL grants and no S3 website configuration. All 34 regional access-point listings
+and both multi-region listings were empty. No objects were enumerated or read.
+Private operator evidence is in
+`/tmp/aws-guardrails-review.inJgVqJ5/s3-public-metadata.json` and
+`s3-access-point-metadata.json`; these ephemeral files are not cold-bootstrap inputs.
+Recheck metadata if inventory changes before apply.
+
+S3 combines account, bucket and access-point settings using the most restrictive
+values. Fixed-principal private sharing remains possible; a public bucket policy can
+cause `RestrictPublicBuckets` to block even its otherwise private cross-account grants.
+Review intended S3 websites/sharing before changing these controls, and do not disable
+the account block to make an unreviewed public policy pass. See
+[AWS Block Public Access semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html).
+Expect a fresh full plan with exactly two account-setting creates and no bucket,
+object, policy or backup changes. After applying, require an empty follow-up plan and
+read back `s3control get-public-access-block --account-id <account-id>` under each
+account's verified credentials: all four flags must be true. Account-wide settings
+propagate globally but not necessarily simultaneously across regions.
+
 ## External access findings
 
 `security-external-access.tf` creates 34 external-access analyzers: one `ACCOUNT`
@@ -1369,6 +1400,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
+| Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
