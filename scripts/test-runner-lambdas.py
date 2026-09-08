@@ -16,6 +16,8 @@ Run from the repo root:  python3 scripts/test-runner-lambdas.py
 Exit code 1 if any case fails.
 """
 import contextlib
+import base64
+import gzip
 import io
 import json
 import os
@@ -118,6 +120,7 @@ class FakeEC2:
 
     def run_instances(self, **kw):
         self.calls.append(("run_instances", kw))
+        self.journal.append(f"ec2:run_instances:{kw['InstanceType']}")
         error = self.run_instances_errors.get(kw["InstanceType"])
         if error:
             raise Exception(error)
@@ -222,15 +225,62 @@ class FakeDynamoDB:
 
 
 class FakeSSM:
-    def __init__(self, pat="ghp_test", journal=None):
+    def __init__(self, pat="ghp_test", journal=None, put_error=None, user_data=None,
+                 parameters=(), parameter_tags=None, metadata_error=None,
+                 tag_errors=None, delete_errors=None, metadata_pages=None):
         self.pat = pat
         self.journal = journal if journal is not None else []
+        self.put_error = put_error
+        self.puts = []
+        self.deletes = []
+        self.parameters = list(parameters)
+        self.parameter_tags = parameter_tags or {}
+        self.metadata_error = metadata_error
+        self.tag_errors = tag_errors or {}
+        self.delete_errors = delete_errors or {}
+        self.metadata_pages = metadata_pages
+        self.metadata_calls = []
+        self.tag_calls = []
+        self.user_data = user_data if user_data is not None else base64.b64encode(gzip.compress(
+            b'#!/bin/bash\nREGISTRATION_TABLE="github-runner-registration"\n'
+            b'BOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"\n'
+        )).decode()
 
     def get_parameter(self, **kw):
         self.journal.append(f"ssm:get_parameter:{kw['Name']}")
         if kw["Name"].endswith("/pat"):
             return {"Parameter": {"Value": self.pat}}
-        return {"Parameter": {"Value": "IyEvYmluL2Jhc2gK"}}
+        return {"Parameter": {"Value": self.user_data}}
+
+    def put_parameter(self, **kw):
+        self.journal.append(f"ssm:put_parameter:{kw['Name']}")
+        self.puts.append(kw)
+        if self.put_error:
+            raise self.put_error
+        return {"Version": 1}
+
+    def delete_parameter(self, **kw):
+        self.journal.append(f"ssm:delete_parameter:{kw['Name']}")
+        self.deletes.append(kw)
+        if kw['Name'] in self.delete_errors:
+            raise self.delete_errors[kw['Name']]
+        return {}
+
+    def describe_parameters(self, **kw):
+        self.journal.append('ssm:describe_parameters')
+        self.metadata_calls.append(kw)
+        if self.metadata_error:
+            raise self.metadata_error
+        if self.metadata_pages is not None:
+            return self.metadata_pages[min(len(self.metadata_calls) - 1, len(self.metadata_pages) - 1)]
+        return {"Parameters": self.parameters}
+
+    def list_tags_for_resource(self, **kw):
+        self.journal.append(f"ssm:list_tags:{kw['ResourceId']}")
+        self.tag_calls.append(kw)
+        if kw['ResourceId'] in self.tag_errors:
+            raise self.tag_errors[kw['ResourceId']]
+        return {"TagList": [{"Key": k, "Value": v} for k, v in self.parameter_tags.get(kw['ResourceId'], {}).items()]}
 
 
 class FakeLambdaClient:
@@ -271,7 +321,8 @@ class FakeGitHub:
 
     def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
                  delete_error=False, recheck=None, journal=None, runners_total=None,
-                 omit_runners_total=False, runner_payloads=None):
+                 omit_runners_total=False, runner_payloads=None,
+                 registration_error=False, registration_payload=None):
         self.runs = list(runs)
         self.jobs = jobs or {}
         self.runners = list(runners)
@@ -302,12 +353,20 @@ class FakeGitHub:
         self.journal = journal if journal is not None else []
         self.requests = []
         self.deletes = []
+        self.registration_error = registration_error
+        self.registration_payload = registration_payload
 
     def _payload(self, req):
         url = getattr(req, "url", req)
         method = getattr(req, "method", None)
         self.requests.append(url)
         self.journal.append(f"github:{method or 'GET'}:{url.split('/repos/ejc3/fcvm')[-1]}")
+        if method == "POST" and url.endswith('/actions/runners/registration-token'):
+            if self.registration_error:
+                raise OSError("GitHub registration refused")
+            if self.registration_payload is not None:
+                return self.registration_payload
+            return {"token": "registration-token", "expires_at": (NOW + timedelta(hours=1)).isoformat()}
         if method == "DELETE":
             self.deletes.append(url)
             if self.delete_error:
@@ -368,8 +427,8 @@ class FakeGitHub:
             def __init__(self, data):
                 self.data = json.dumps(data).encode()
 
-            def read(self):
-                return self.data
+            def read(self, limit=None):
+                return self.data if limit is None else self.data[:limit]
 
             def __enter__(self):
                 return self
@@ -418,11 +477,22 @@ def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now
     clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client,
                "dynamodb": dynamodb or FakeDynamoDB()}
     fake_boto3 = types.ModuleType("boto3")
-    fake_boto3.client = lambda service, **kw: clients[service]
+    client_options = []
+    def client(service, **kw):
+        client_options.append((service, kw))
+        return clients[service]
+    fake_boto3.client = client
     sys.modules["boto3"] = fake_boto3
+    fake_botocore = types.ModuleType("botocore")
+    fake_config = types.ModuleType("botocore.config")
+    fake_config.Config = lambda **kw: types.SimpleNamespace(**kw)
+    fake_botocore.config = fake_config
+    sys.modules["botocore"] = fake_botocore
+    sys.modules["botocore.config"] = fake_config
 
     namespace = {"__name__": "lambda_function"}
     exec(compile(source, "<lambda_function.py>", "exec"), namespace)
+    namespace['_test_client_options'] = client_options
 
     if github is not None:
         namespace["urllib"] = github.as_urllib()
@@ -511,7 +581,8 @@ def reaping_item(instance_id="i-lease"):
 # --------------------------------------------------------------------------
 
 def webhook(ec2, **kw):
-    return load_lambda(WEBHOOK_SRC, ec2, FakeSSM(), **kw)
+    kw.setdefault("github", FakeGitHub())
+    return load_lambda(WEBHOOK_SRC, ec2, kw.pop("ssm", FakeSSM()), **kw)
 
 
 def launched_types(ec2):
@@ -611,6 +682,188 @@ def case_every_new_runner_declares_the_registration_protocol():
     assert tags["RunnerRegistrationProtocol"] == "ddb-v1", tags
 
 
+def case_controller_first_accepts_older_pat_script_without_unused_credential():
+    for claims in (False, True):
+        script = '#!/bin/bash\n' + ('REGISTRATION_TABLE="table"\n' if claims else '')
+        script += 'PAT=$(aws ssm get-parameter --name /github-runner/pat)\n'
+        ssm = FakeSSM(user_data=base64.b64encode(gzip.compress(script.encode())).decode())
+        ec2 = FakeEC2()
+        github = FakeGitHub()
+        webhook(ec2, ssm=ssm, github=github)["launch_runner"]("arm64")
+        assert not ssm.puts, "old script leaves an unused bootstrap credential"
+        assert not any("registration-token" in url for url in github.requests)
+        tags = {t["Key"]: t["Value"] for t in ec2.ops("run_instances")[0]["TagSpecifications"][0]["Tags"]}
+        assert (tags.get("RunnerRegistrationProtocol") == "ddb-v1") == claims, tags
+
+
+def case_invalid_or_oversized_user_data_cannot_allocate_runner():
+    invalid = ["not-base64!", base64.b64encode(b"not a bash script").decode(),
+               base64.b64encode(gzip.compress(b"#!/bin/bash\n" + b"x" * 262144)).decode(),
+               base64.b64encode(gzip.compress(b'#!/bin/bash\nBOOTSTRAP_PARAM="/github-runner/bootstrap/$INSTANCE_ID"\n')).decode()]
+    for value in invalid:
+        ec2 = FakeEC2()
+        module = webhook(ec2, ssm=FakeSSM(user_data=value))
+        try:
+            module["launch_runner"]("arm64")
+            raise AssertionError("invalid script was accepted")
+        except RuntimeError:
+            pass
+        assert not ec2.ops("run_instances"), "bad script allocated billable metal"
+
+
+def case_controller_recognizes_real_terraform_user_data_document():
+    source = TF_FILE.read_text()
+    script = source.split('runner_user_data = <<-EOF\n', 1)[1].split('\nEOF\n', 1)[0] + '\n'
+    wire = base64.b64encode(gzip.compress(script.encode())).decode()
+    # This PR is the controller-first stage, not the PAT consumer cutover.
+    assert webhook(FakeEC2())["user_data_protocol"](wire) == (False, True)
+    assert 'PAT=$(aws ssm get-parameter --name /github-runner/pat' in script
+
+
+def case_registration_credential_is_brokered_only_after_instance_exists():
+    journal = []
+    ec2 = FakeEC2(journal=journal)
+    ssm = FakeSSM(journal=journal)
+    module = webhook(ec2, ssm=ssm, github=FakeGitHub(journal=journal))
+    instance_id, _ = module["launch_runner"]("arm64")
+    mint = journal.index("github:POST:/actions/runners/registration-token")
+    launch = next(i for i, value in enumerate(journal) if value.startswith("ec2:run_instances:"))
+    put = journal.index(f"ssm:put_parameter:/github-runner/bootstrap/{instance_id}")
+    assert mint < launch < put, journal
+    credential = ssm.puts[0]
+    assert credential["Type"] == "SecureString" and credential["Overwrite"] is False, credential
+    tags = {t["Key"]: t["Value"] for t in credential["Tags"]}
+    assert tags["InstanceArn"] == f"arn:aws:ec2:{REGION}:{ACCOUNT_ID}:instance/{instance_id}", tags
+    assert tags["CredentialExpiresAt"] == (NOW + timedelta(hours=1)).isoformat(), tags
+    assert "registration-token" not in json.dumps(ec2.ops("run_instances")), "credential leaked into EC2"
+    assert "ghp_test" not in json.dumps(ec2.ops("run_instances")), "PAT leaked into EC2"
+
+
+def case_broker_failure_never_falls_through_to_another_launch():
+    ec2 = FakeEC2()
+    ssm = FakeSSM(put_error=OSError("do-not-print-this-secret"))
+    module = webhook(ec2, ssm=ssm)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        try:
+            module["launch_runner"]("arm64")
+        except module["RunnerBootstrapError"]:
+            pass
+        else:
+            raise AssertionError("postlaunch broker failure was accepted")
+    assert len(ec2.ops("run_instances")) == 1, ec2.calls
+    assert len(ec2.ops("terminate_instances")) == 1, ec2.calls
+    assert len(ssm.deletes) == 1, ssm.deletes
+    assert "do-not-print-this-secret" not in output.getvalue(), output.getvalue()
+
+
+def case_unusable_registration_token_refuses_before_allocating_metal():
+    for github in (
+        FakeGitHub(registration_error=True),
+        FakeGitHub(registration_payload={"token": "expired", "expires_at": NOW.isoformat()}),
+        FakeGitHub(registration_payload={"token": None}),
+        FakeGitHub(registration_payload={"token": "too-long-lived", "expires_at": (NOW + timedelta(hours=2)).isoformat()}),
+        FakeGitHub(registration_payload={"token": "no-timezone", "expires_at": (NOW + timedelta(hours=1)).replace(tzinfo=None).isoformat()}),
+        FakeGitHub(registration_payload={"token": "x" * 4097, "expires_at": (NOW + timedelta(hours=1)).isoformat()}),
+        FakeGitHub(registration_payload={"token": "x" * 16385}),
+        FakeGitHub(registration_payload=[]),
+    ):
+        ec2 = FakeEC2()
+        module = webhook(ec2, github=github)
+        try:
+            module["launch_runner"]("arm64")
+        except (RuntimeError, OSError):
+            pass
+        else:
+            raise AssertionError("unusable token was accepted")
+        assert not ec2.ops("run_instances"), ec2.calls
+
+
+def case_broker_failure_is_handled_without_async_launch_retry():
+    ec2 = FakeEC2()
+    module = webhook(ec2, ssm=FakeSSM(put_error=OSError("SSM refused")))
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}, "launch_count": 4})}
+    result = module["handler"](event, None)
+    assert result["statusCode"] == 503, result
+    assert len(ec2.ops("run_instances")) == 1, ec2.calls
+
+
+def case_partial_batch_broker_failure_preserves_prior_successful_launch():
+    class UniqueEC2(FakeEC2):
+        def run_instances(self, **kw):
+            super().run_instances(**kw)
+            return {'Instances': [{'InstanceId': f'i-{len(self.ops("run_instances")):017x}'}]}
+
+    class FailSecondPublication(FakeSSM):
+        def put_parameter(self, **kw):
+            result = super().put_parameter(**kw)
+            if len(self.puts) == 2:
+                raise OSError('second publication answer lost')
+            return result
+
+    ec2, ssm = UniqueEC2(), FailSecondPublication()
+    module = webhook(ec2, ssm=ssm)
+    event = {'body': json.dumps({'action': 'queued',
+                                'workflow_job': {'labels': ['ARM64']}, 'launch_count': 4})}
+    result = module['handler'](event, None)
+    assert result['statusCode'] == 503, result
+    assert len(ec2.ops('run_instances')) == 2, ec2.calls
+    assert ec2.ops('terminate_instances') == [{'InstanceIds': ['i-00000000000000002']}], ec2.calls
+    assert ssm.deletes == [{'Name': '/github-runner/bootstrap/i-00000000000000002'}], ssm.deletes
+    assert len(ssm.puts) == 2, ssm.puts
+
+
+def case_new_runners_are_encrypted_imdsv2_and_shutdown_terminates():
+    ec2 = FakeEC2()
+    webhook(ec2)["launch_runner"]("arm64")
+    launch = ec2.ops("run_instances")[0]
+    assert launch["BlockDeviceMappings"][0]["Ebs"]["Encrypted"] is True, launch
+    assert launch["MetadataOptions"]["HttpTokens"] == "required", launch
+    assert launch["InstanceInitiatedShutdownBehavior"] == "terminate", launch
+    tags = {s["ResourceType"]: {t["Key"]: t["Value"] for t in s["Tags"]} for s in launch["TagSpecifications"]}
+    for kind in ("instance", "volume", "network-interface"):
+        assert tags[kind]["Role"] == "github-runner", tags
+
+
+def case_controller_passrole_is_pinned_to_runner_role_and_ec2():
+    """Guard the actual Terraform policy and every runtime architecture profile.
+
+    This is a source regression guard, not a substitute for post-plan AWS IAM
+    simulation against the complete rendered policy and current attachments.
+    """
+    source = TF_FILE.read_text()
+    policy = re.search(r'^resource "aws_iam_role_policy" "runner_lambda" \{\n.*?^\}',
+                       source, re.M | re.S).group()
+    statements = re.split(r'\n      \},\n      \{\n', policy)
+    passing = [statement for statement in statements if '"iam:PassRole"' in statement]
+    assert len(passing) == 3, passing
+    by_sid = {re.search(r'Sid\s*=\s*"([^"]+)"', statement).group(1): statement
+              for statement in passing}
+    allow = by_sid['PassRunnerRoleToEC2Only']
+    assert re.search(r'Effect\s*=\s*"Allow"', allow), allow
+    assert re.search(r'Action\s*=\s*"iam:PassRole"', allow), allow
+    assert re.search(r'Resource\s*=\s*aws_iam_role\.runner\[0\]\.arn\s*\n', allow), allow
+    assert re.search(r'StringEquals\s*=\s*\{ "iam:PassedToService" = "ec2.amazonaws.com" \}', allow), allow
+    deny_roles = by_sid['DenyPassingOtherRoles']
+    assert re.search(r'Effect\s*=\s*"Deny"', deny_roles), deny_roles
+    assert re.search(r'NotResource\s*=\s*aws_iam_role\.runner\[0\]\.arn\s*$', deny_roles), deny_roles
+    assert 'Condition' not in deny_roles, deny_roles
+    deny_service = by_sid['DenyPassingRunnerRoleOutsideEC2']
+    assert re.search(r'Effect\s*=\s*"Deny"', deny_service), deny_service
+    assert re.search(r'Resource\s*=\s*aws_iam_role\.runner\[0\]\.arn\s*\n', deny_service), deny_service
+    assert re.search(r'StringNotEqualsIfExists\s*=\s*\{ "iam:PassedToService" = "ec2.amazonaws.com" \}', deny_service), deny_service
+    assert re.search(r'INSTANCE_PROFILE\s*=\s*aws_iam_instance_profile\.runner\[0\]\.name', source)
+    profile_source = (TF_FILE.parent / 'runner-vpc.tf').read_text()
+    profile = re.search(r'^resource "aws_iam_instance_profile" "runner" \{\n.*?^\}',
+                        profile_source, re.M | re.S).group()
+    assert re.search(r'role\s*=\s*aws_iam_role\.runner\[0\]\.name', profile), profile
+    for arch in ('arm64', 'x86_64'):
+        ec2 = FakeEC2()
+        webhook(ec2, env={'INSTANCE_PROFILE': 'github-runner-profile'})['launch_runner'](arch)
+        for call in ec2.ops('run_instances'):
+            assert call['IamInstanceProfile'] == {'Name': 'github-runner-profile'}, call
+
+
 def case_arm_types_are_graviton3_or_newer():
     """Graviton2 cannot run the nested-virtualisation tests.
 
@@ -697,7 +950,11 @@ def case_handler_still_refuses_when_the_pool_is_genuinely_full():
         "action": "queued",
         "workflow_job": {"labels": ["self-hosted", "Linux", "X64"]},
     })}
-    result = webhook(ec2)["handler"](event, None)
+    github = FakeGitHub(runners=[
+        {"id": n + 1, "name": f"runner-i-live{n}", "status": "online", "busy": False}
+        for n in range(4)
+    ])
+    result = webhook(ec2, github=github)["handler"](event, None)
     assert result["body"] == "Max x86_64 runners (4) reached", result
     assert launched_types(ec2) == [], launched_types(ec2)
 
@@ -804,6 +1061,123 @@ def case_one_arch_failure_does_not_rotate_the_other():
 def cleanup(ec2, github, lambda_client=None, env=None, ssm=None, dynamodb=None):
     return load_lambda(CLEANUP_SRC, ec2, ssm or FakeSSM(), lambda_client or FakeLambdaClient(),
                        github, env, dynamodb=dynamodb)
+
+
+def bootstrap_fixture(instance_id="i-0123456789abcdef0", expires=None):
+    name = f"/github-runner/bootstrap/{instance_id}"
+    return ({"Name": name, "Type": "SecureString"}, {
+        "Role": "github-runner",
+        "InstanceArn": instance_arn(instance_id),
+        "CredentialExpiresAt": (expires or NOW - timedelta(minutes=1)).isoformat(),
+    })
+
+
+def case_expired_bootstrap_cleanup_reads_metadata_not_values_or_ec2():
+    metadata, tags = bootstrap_fixture()
+    ssm = FakeSSM(parameters=[metadata], parameter_tags={metadata["Name"]: tags})
+    ec2 = FakeEC2()
+    result = cleanup(ec2, FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)
+    assert result == {"deleted": [metadata["Name"]], "errors": 0, "truncated": False}, result
+    assert not any(entry.startswith("ssm:get_parameter:") for entry in ssm.journal), ssm.journal
+    assert not ec2.calls, "expired token cleanup must not infer absence from an EC2 lookup"
+    assert ssm.metadata_calls == [{"ParameterFilters": [{"Key": "Name", "Option": "BeginsWith",
+        "Values": ["/github-runner/bootstrap/"]}], "MaxResults": 50}], ssm.metadata_calls
+
+
+def case_bootstrap_cleanup_preserves_live_credentials_and_canaries():
+    metadata, tags = bootstrap_fixture(expires=NOW + timedelta(minutes=20))
+    canary = {"Name": "/github-runner/bootstrap/security-canary-20260908-first", "Type": "SecureString"}
+    other = {"Name": "/github-runner/pat", "Type": "SecureString"}
+    ssm = FakeSSM(parameters=[metadata, canary, other], parameter_tags={metadata["Name"]: tags})
+    result = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)
+    assert result["deleted"] == [] and not ssm.deletes, result
+    assert ssm.tag_calls == [{"ResourceType": "Parameter", "ResourceId": metadata["Name"]}], ssm.tag_calls
+
+
+def case_bootstrap_cleanup_requires_complete_matching_provenance():
+    for modification in (
+        {"Role": "other"}, {"InstanceArn": instance_arn("i-fedcba98765432100")},
+        {"CredentialExpiresAt": ""}, {"CredentialExpiresAt": "not-a-time"},
+        {"CredentialExpiresAt": (NOW - timedelta(minutes=1)).replace(tzinfo=None).isoformat()},
+    ):
+        metadata, tags = bootstrap_fixture()
+        tags.update(modification)
+        ssm = FakeSSM(parameters=[metadata], parameter_tags={metadata["Name"]: tags})
+        result = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)
+        assert not ssm.deletes and not result["deleted"], (modification, result)
+    metadata, tags = bootstrap_fixture()
+    metadata["Type"] = "String"
+    ssm = FakeSSM(parameters=[metadata], parameter_tags={metadata["Name"]: tags})
+    assert not cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)["deleted"]
+    assert not ssm.tag_calls
+
+
+def case_bootstrap_cleanup_failure_holds_only_that_parameter_and_redacts_errors():
+    first, first_tags = bootstrap_fixture()
+    second, second_tags = bootstrap_fixture("i-0123456789abcdef1")
+    for failure in ("tag_errors", "delete_errors"):
+        ssm = FakeSSM(parameters=[first, second],
+            parameter_tags={first["Name"]: first_tags, second["Name"]: second_tags},
+            **{failure: {first["Name"]: OSError("do-not-print-credential")}})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)
+        assert result["deleted"] == [second["Name"]] and result["errors"] == 1, result
+        assert "do-not-print-credential" not in output.getvalue(), output.getvalue()
+
+
+def case_bootstrap_cleanup_absent_after_bootstrap_delete_is_not_an_error():
+    metadata, tags = bootstrap_fixture()
+    ssm = FakeSSM(parameters=[metadata], parameter_tags={metadata["Name"]: tags},
+                  delete_errors={metadata["Name"]: FakeClientError("ParameterNotFound")})
+    result = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)["cleanup_expired_bootstrap_parameters"](NOW)
+    assert result == {"deleted": [], "errors": 0, "truncated": False}, result
+
+
+def case_bootstrap_cleanup_is_bounded_by_pages_and_short_client_timeouts():
+    ssm = FakeSSM(metadata_pages=[{"Parameters": [], "NextToken": "more"}])
+    module = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)
+    result = module["cleanup_expired_bootstrap_parameters"](NOW)
+    assert len(ssm.metadata_calls) == 2 and result["truncated"] is True, result
+    assert ssm.metadata_calls[1]["NextToken"] == "more", ssm.metadata_calls
+    options = [kw["config"] for service, kw in module["_test_client_options"] if service == "ssm" and "config" in kw]
+    assert len(options) == 1 and options[0].connect_timeout == 2 and options[0].read_timeout == 2
+    assert options[0].retries == {"total_max_attempts": 1}, options
+
+
+def case_bootstrap_cleanup_time_budget_prevents_late_deletion():
+    metadata, tags = bootstrap_fixture()
+    ssm = FakeSSM(parameters=[metadata], parameter_tags={metadata["Name"]: tags})
+    module = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm)
+    ticks = iter([0, 0, 0, 11])  # expires while reading the tags, before DeleteParameter
+    module["time"] = types.SimpleNamespace(monotonic=lambda: next(ticks))
+    result = module["cleanup_expired_bootstrap_parameters"](NOW)
+    assert not ssm.deletes and result["truncated"] is True, result
+
+
+def case_bootstrap_cleanup_cannot_run_without_exact_account_context():
+    ssm = FakeSSM()
+    module = cleanup(FakeEC2(), FakeGitHub(), ssm=ssm, env={"RUNNER_ACCOUNT_ID": ""})
+    result = module["cleanup_expired_bootstrap_parameters"](NOW)
+    assert result["errors"] == 1 and not ssm.metadata_calls and not ssm.deletes, result
+
+
+def case_bootstrap_cleanup_never_precedes_any_instance_hard_ceiling():
+    journal = []
+    ec2 = FakeEC2([
+        instance("i-aged-first", "c5d.metal", "running", 14 * 60),
+        instance("i-aged-second", "c5d.metal", "running", 14 * 60),
+    ], journal=journal)
+    ssm = FakeSSM(journal=journal, metadata_error=OSError("metadata unavailable"))
+    invoker = FakeLambdaClient()
+    module = cleanup(ec2, FakeGitHub(journal=journal), lambda_client=invoker, ssm=ssm)
+    result = module["handler"]({}, None)
+    scan = journal.index("ssm:describe_parameters")
+    assert journal.index("ec2:terminate:i-aged-first") < scan
+    assert journal.index("ec2:terminate:i-aged-second") < scan
+    assert journal.index("ssm:get_parameter:/github-runner/pat") > scan
+    assert result["bootstrap_cleanup"]["errors"] == 1 and set(result["terminated"]) == {"i-aged-first", "i-aged-second"}
+    assert any("/actions/runs?status=queued" in event for event in journal), journal
 
 
 def case_stalled_launch_is_tagged_then_terminated():
