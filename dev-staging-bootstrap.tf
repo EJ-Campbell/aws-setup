@@ -1,8 +1,8 @@
 # dev-staging-bootstrap.tf
 #
-# Wire the dev-staging member account so terraform + GitHub Actions can deploy into it
-# and it can receive cross-account backup copies (the offsite copy that survives even a
-# main-account compromise).
+# Wire the dev-staging member account for jumpbox Terraform administration and
+# cross-account backup copies. GitHub CI has no deployment role or state access.
+# The shared administration path is not independent recovery custody.
 
 # Cross-account provider: assume OrganizationAccountAccessRole in dev-staging.
 provider "aws" {
@@ -17,7 +17,7 @@ data "aws_caller_identity" "staging" {
   provider = aws.staging
 }
 
-# --- GitHub Actions OIDC + deploy role IN dev-staging (for promote-through-staging CI) ---
+# Retain the old OIDC identity with an explicit deny for existing sessions too.
 resource "aws_iam_openid_connect_provider" "github_staging" {
   provider        = aws.staging
   url             = "https://token.actions.githubusercontent.com"
@@ -35,18 +35,25 @@ resource "aws_iam_role" "github_actions_staging" {
       Principal = { Federated = aws_iam_openid_connect_provider.github_staging.arn }
       Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
-        StringEquals = { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" }
-        StringLike   = { "token.actions.githubusercontent.com:sub" = "repo:ejc3/aws:*" }
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub" = "repo:ejc3/aws:ref:refs/heads/main"
+        }
       }
     }]
   })
 }
 
-# Staging is an isolated verify account: full deploy rights here are fine and are the point.
-resource "aws_iam_role_policy_attachment" "github_actions_staging_admin" {
-  provider   = aws.staging
-  role       = aws_iam_role.github_actions_staging.name
-  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+# No staging workload currently needs GitHub deployment rights. Retire the
+# shared role rather than allowing CI to administer the recovery account.
+resource "aws_iam_role_policy" "github_actions_staging_retired" {
+  provider = aws.staging
+  name     = "retired-ci-identity"
+  role     = aws_iam_role.github_actions_staging.name
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Sid = "RetiredSharedCIIdentity", Effect = "Deny", Action = "*", Resource = "*" }]
+  })
 }
 
 # --- Cross-account backup copy target in dev-staging ---
@@ -86,6 +93,6 @@ resource "aws_backup_global_settings" "main" {
 }
 
 output "dev_staging_github_role_arn" {
-  description = "GitHub Actions terraform role in dev-staging"
+  description = "Retired GitHub CI role in dev-staging; all AWS actions denied"
   value       = aws_iam_role.github_actions_staging.arn
 }

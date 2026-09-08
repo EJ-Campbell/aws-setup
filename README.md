@@ -12,7 +12,7 @@ Cloudflare, and several regions. The platform provides:
 - ephemeral high-speed shared storage and on-demand 96/192-core compute;
 - autoscaled ARM64 and x86 GitHub Actions runners;
 - backups, cross-region/cross-account recovery, and cost alerts;
-- a scheduled drift-detection workflow whose current IAM path is incomplete;
+- credential-free Terraform validation in GitHub, with live plans confined to admin hosts;
 - scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access.
 
 ## Start here
@@ -56,7 +56,7 @@ review and commit any intentional provider upgrade.
 
 `main.tf` enforces Terraform `1.10.3`, which is the version on both jumpboxes and supports
 the ephemeral Workers Builds control-token read. Any Terraform upgrade must update the
-constraint, both jumpboxes, and the drift workflow together.
+constraint, both jumpboxes, and the Terraform validation workflow together.
 
 Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.24.0`
 provider release. That fork adds typed Worker-native Access destinations and the Workers
@@ -763,16 +763,22 @@ real broker-job acceptance.
 The repository also manages:
 
 - a private CodeArtifact npm repository in `us-west-2`;
-- GitHub OIDC roles for drift detection and AMI builds;
-- a separate administrator deploy role inside the `dev-staging` account;
-- a daily Terraform drift workflow on `main`.
+- an owner-approved GitHub OIDC role for runner AMI builds;
+- retired shared main/staging CI identities with explicit denial of all AWS actions;
+- credential-free Terraform validation on pull requests, main pushes, a daily schedule,
+  and manual dispatch.
 
-The drift workflow is not currently healthy: recent scheduled runs fail because its OIDC
-role cannot read the Secrets Manager, Organizations, and CodeArtifact data required by a
-full refresh. Secrets Manager is now the harder blocker of the three -- the Cloudflare and
-GitHub provider tokens both come from there, so a plan cannot even configure its providers
-without that read. Treat drift detection as scheduled but non-functional until that IAM gap
-is fixed.
+The historical `drift.yml` now runs **Terraform Validation**: formatting, locked provider
+installation with `-backend=false`, configuration validation, and CI boundary tests. It
+does not request an OIDC token, assume an AWS role, or read state or secret payloads.
+Full Terraform plans run only on an administration jumpbox. Even a read-only plan loads
+credential-bearing state and configures privileged Cloudflare/GitHub providers; calling
+that permission set read-only would not prevent administrator access through those secrets.
+A green validation check is not evidence of zero live drift.
+
+This CI identity retirement does not change runner bootstrap, controller behavior, or the
+existing runner PAT grant. Those require a separate controller-first deployment, harmless
+own-versus-other bootstrap canaries, and an in-flight runner check before the PAT cutoff.
 
 ## Bootstrap, authentication, and convergence
 
