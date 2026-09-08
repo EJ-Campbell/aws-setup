@@ -141,7 +141,7 @@ Advanced tier, base64+gzip — too big for Lambda's 4 KB env limit). On boot it 
 (btrfs RAID0 over instance NVMe, `/dev/kvm` permissions, IPv6), reads only its controller-
 brokered **registration token** from `/github-runner/bootstrap/<instance-id>`, and runs
 `config.sh --url https://github.com/ejc3/fcvm --token <reg> --name runner-<instance-id>
---labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral`. The controller
+--labels self-hosted,Linux,<ARM64|X64> --unattended --replace --ephemeral --disableupdate`. The controller
 uses the PAT to call GitHub's registration-token endpoint; bootstrap has no PAT fallback.
 Xtrace is switched off before reading the short-lived token. Older boots may still be
 running the prior PAT-reading script until the separately verified drain.
@@ -520,7 +520,11 @@ process), so an in-flight request may finish after the polling admission deadlin
 It preserves the existing NVMe/IPv6 gates, validates GitHub's exact `.runner` identity,
 and conditionally claims the same instance-ARN DynamoDB row before starting any service.
 
-Registration uses `--ephemeral`. The credential is unset from the shell and its SSM
+Bootstrap downloads runner `2.337.0` and verifies its architecture-specific SHA-256
+against the [official release asset digests](https://github.com/actions/runner/releases/tag/v2.337.0)
+before extraction. A failed download or checksum never reaches registration.
+Registration uses `--ephemeral --disableupdate`, so automatic updates cannot replace the
+verified wrapper. The credential is unset from the shell and its SSM
 parameter must be successfully deleted before service installation/start; an uncertain
 delete never starts a job. The service drop-in disables systemd restarts, bounds unknown
 GitHub service-wrapper failures, and requests poweroff on service exit. The controller's
@@ -537,6 +541,18 @@ returns success after an ephemeral job, and
 stops on that exit. The environment setting stops unknown/signal exits after one
 failure; known retry/update exits remain capped at ten consecutive attempts. The
 standard `runsvc.sh` waits for that wrapper, allowing systemd's post-stop hook to run.
+
+This is a reviewed update cadence, not a permanent version freeze. GitHub's
+[runner update policy](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#runner-software-updates-on-self-hosted-runners)
+requires an upgrade within 30 days of any new release (including patch releases),
+and can stop assigning jobs immediately for a required critical security update.
+Monitor `actions/runner` releases. Before that deadline, update `RUNNER_VERSION` and
+both official Linux asset digests together, verify the downloaded packages, rerun the
+released wrapper's success/known-retry/unknown/signal exit tests and the offline bootstrap
+suite, then review and Terraform-publish the new user data. Verify one trusted job and
+its termination before considering the bump accepted. Release rollout is progressive;
+also confirm the selected version is supported for `ejc3/fcvm`. Never bypass a checksum
+or re-enable automatic updates to work around an unreviewed wrapper change.
 
 This publication does not remove the old PAT permission: a job host can still read that
 PAT until the separate IAM cutoff. Require a real trusted registration/job that proves

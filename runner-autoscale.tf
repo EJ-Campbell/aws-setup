@@ -1244,11 +1244,27 @@ else
   RUNNER_LABEL="X64"
 fi
 
-RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+# Keep this release and its official asset digests with the verified wrapper
+# contract in GITHUB-RUNNERS.md; updates are reviewed, not discovered at boot.
+RUNNER_VERSION="2.337.0"
+case "$RUNNER_ARCH" in
+  arm64) RUNNER_SHA256="9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393" ;;
+  x64) RUNNER_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613" ;;
+  *) echo "FATAL: unverified runner architecture $RUNNER_ARCH"; exit 1 ;;
+esac
 RUNNER_URL="https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-$${RUNNER_ARCH}-$${RUNNER_VERSION}.tar.gz"
 mkdir -p /opt/actions-runner
 cd /opt/actions-runner
-curl -sL "$RUNNER_URL" | tar xz
+if ! curl -fLsS --connect-timeout 10 --max-time 300 --retry 2 "$RUNNER_URL" -o runner.tar.gz; then
+  echo "FATAL: verified runner package download failed; refusing to register"
+  exit 1
+fi
+if ! printf '%s  %s\n' "$RUNNER_SHA256" runner.tar.gz | sha256sum --check --status; then
+  echo "FATAL: runner package checksum mismatch; refusing to extract or register"
+  exit 1
+fi
+tar xzf runner.tar.gz
+rm runner.tar.gz
 chown -R ubuntu:ubuntu /opt/actions-runner
 
 # Do not xtrace either token into cloud-init or the serial console.
@@ -1288,7 +1304,7 @@ done
 if [ -n "$REG_TOKEN" ] && [ "$REG_TOKEN" != "None" ]; then
   RUNNER_NAME="runner-$INSTANCE_ID"
   sudo -u ubuntu ./config.sh --url https://github.com/ejc3/fcvm --token "$REG_TOKEN" \
-    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral
+    --name "$RUNNER_NAME" --labels "self-hosted,Linux,$RUNNER_LABEL" --unattended --replace --ephemeral --disableupdate
   unset REG_TOKEN
 
   # `.runner` is the identity GitHub assigned, written by config.sh with

@@ -172,6 +172,7 @@ fi
 
 if ! grep -Eq '^PAT=|ssm get-parameter --name /github-runner/pat|Authorization: token' "$USERDATA" \
    && grep -q -- '--ephemeral' "$USERDATA" \
+   && grep -q -- '--disableupdate' "$USERDATA" \
    && grep -q 'BOOTSTRAP_PARAM="/github-runner/bootstrap/\$INSTANCE_ID"' "$USERDATA"; then
     ok "bootstrap fetches only its instance-bound token and registers an ephemeral runner"
 else
@@ -267,6 +268,80 @@ echo "registration interleavings:"
 REG_TMP=$(mktemp -d)
 trap 'rm -f "$USERDATA"; rm -rf "$REG_TMP"' EXIT
 mkdir -p "$REG_TMP/bin" "$REG_TMP/work"
+
+# Execute the real package block without network access. Good-package cases mock
+# only digest success; the corrupt-package case uses the real checksum utility.
+# Every case checks the selected official digest and requires verification before
+# the fake extractor can run. Actual release packages are verified separately at
+# each reviewed version bump.
+echo "verified runner package:"
+if grep -q '^RUNNER_VERSION="2.337.0"$' "$USERDATA" \
+   && ! grep -q 'actions/runner/releases/latest' "$USERDATA"; then
+    ok "runner version is pinned instead of resolved from mutable latest"
+else
+    bad "runner package can drift away from the reviewed wrapper version"
+fi
+DOWNLOAD_BLOCK="$REG_TMP/download.sh"
+{
+    echo 'set -euo pipefail'
+    sed -n '/^RUNNER_VERSION=/,/^chown -R ubuntu:ubuntu \/opt\/actions-runner$/p' "$USERDATA" \
+      | sed "s|/opt/actions-runner|$REG_TMP/package|g"
+} > "$DOWNLOAD_BLOCK"
+
+download_case() { # scenario arch expected_rc expected_extract
+    local scenario=$1 arch=$2 want_rc=$3 want_extract=$4 rc=0
+    local journal="$REG_TMP/download-$scenario-$arch.log"
+    : > "$journal"
+    (
+      curl() {
+        echo download >> "$JOURNAL"
+        case " $* " in
+          *" https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-$RUNNER_ARCH-2.337.0.tar.gz -o runner.tar.gz ") : ;;
+          *) return 90 ;;
+        esac
+        [ "$FAKE_SCENARIO" != download_failure ] || return 22
+        printf 'deliberately not a runner archive\n' > runner.tar.gz
+      }
+      sha256sum() {
+        local digest filename
+        read -r digest filename
+        [ "$filename" = runner.tar.gz ] || return 91
+        case "$RUNNER_ARCH:$digest" in
+          arm64:9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393) : ;;
+          x64:70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613) : ;;
+          *) return 91 ;;
+        esac
+        if [ "$FAKE_SCENARIO" = checksum_failure ]; then
+          printf '%s  %s\n' "$digest" "$filename" | command sha256sum "$@"
+          return $?
+        fi
+        echo verified >> "$JOURNAL"
+      }
+      tar() {
+        [ "$*" = 'xzf runner.tar.gz' ] || return 92
+        grep -q '^verified$' "$JOURNAL" || return 92
+        echo extract >> "$JOURNAL"
+      }
+      chown() { :; }
+      export -f curl sha256sum tar chown
+      FAKE_SCENARIO="$scenario" JOURNAL="$journal" RUNNER_ARCH="$arch" \
+        bash "$DOWNLOAD_BLOCK"
+    ) > "$REG_TMP/download-$scenario-$arch.output" 2>&1 || rc=$?
+    local extracted=0
+    grep -q '^extract$' "$journal" && extracted=1
+    if [ "$rc" = "$want_rc" ] && [ "$extracted" = "$want_extract" ] \
+       && { [ "$rc" = 0 ] || grep -q '^FATAL:' "$REG_TMP/download-$scenario-$arch.output"; }; then
+      ok "package $scenario/$arch (rc=$rc extracted=$extracted)"
+    else
+      bad "package $scenario/$arch: got $rc/$extracted expected $want_rc/$want_extract"
+    fi
+}
+download_case verified arm64 0 1
+download_case verified x64 0 1
+download_case checksum_failure arm64 1 0
+download_case download_failure x64 1 0
+download_case unsupported ppc64 1 0
+
 REG_BLOCK="$REG_TMP/registration.sh"
 {
     echo 'set -euo pipefail'
@@ -376,6 +451,10 @@ set -eu
 case " $* " in
   *" --ephemeral "*) : ;;
   *) echo "registration is not ephemeral" >&2; exit 92 ;;
+esac
+case " $* " in
+  *" --disableupdate "*) : ;;
+  *) echo "registration permits an unverified wrapper update" >&2; exit 92 ;;
 esac
 echo config >> "$JOURNAL"
 [ "$FAKE_SCENARIO" = config_failure ] && exit 1
