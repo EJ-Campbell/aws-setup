@@ -209,6 +209,17 @@ class BackupTopologyTests(unittest.TestCase):
         for forbidden in ("ec2:CreateTags", "ec2:DeleteTags", "iam:CreateServiceLinkedRole"):
             self.assertNotIn(forbidden, policy)
 
+    def test_native_ebs_tag_read_requires_backup_forwarding_and_source_region(self):
+        policy = resource("aws_iam_role_policy", "backup_recovery")
+        grant = statement(policy, "ReadProcessingTagsOnlyThroughBackup")
+        self.assertRegex(grant, r'Effect\s*=\s*"Allow"')
+        self.assertRegex(grant, r'Action\s*=\s*"ec2:DescribeTags"')
+        self.assertRegex(grant, r'Resource\s*=\s*"\*"')
+        self.assertIn('"ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }', grant)
+        self.assertRegex(grant, r'StringEquals\s*=\s*\{ "aws:RequestedRegion" = var\.aws_region \}')
+        self.assertEqual(policy.count('"ec2:DescribeTags"'), 1)
+        self.assertNotIn('"ec2:DescribeSnapshots"', policy)
+
     def test_controller_uses_new_final_vault_and_optional_canary(self):
         function = resource("aws_lambda_function", "backup_recovery")
         for field, value in {

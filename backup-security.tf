@@ -323,6 +323,19 @@ resource "aws_iam_role_policy" "backup_recovery" {
         Resource = "arn:aws:ec2:${var.aws_region}::snapshot/*"
       },
       {
+        # Live CloudTrail 2026-09-08: ListTags forwards DescribeTags using this
+        # role. EC2 tag reads have no resource-level scope, so require Backup FAS
+        # and the source region; the entry-point ListTags ARN scope stays above.
+        Sid      = "ReadProcessingTagsOnlyThroughBackup"
+        Effect   = "Allow"
+        Action   = "ec2:DescribeTags"
+        Resource = "*"
+        Condition = {
+          "ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }
+          StringEquals               = { "aws:RequestedRegion" = var.aws_region }
+        }
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "${aws_cloudwatch_log_group.backup_recovery.arn}:*"
