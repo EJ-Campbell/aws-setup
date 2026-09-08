@@ -40,8 +40,15 @@ def final_retention(point):
     return 365 if captured.day == 1 else 30 if captured.weekday() == 6 else 7
 
 
-def verified_copy(point, destination_points, jobs, destination, retention, key=None, source_vault=None, now=None):
+def verified_copy(point, destination_points, jobs, destination, retention, key=None, source_vault=None, now=None,
+                  expired_checkpoint_lineage=False):
     """A completed job alone is not proof that its exact recovery point is usable."""
+    # Cleanup can reconstruct an already-copied chain through an EXPIRED CMK
+    # checkpoint. This is historical metadata only, never a usable final/copy
+    # source; ordinary copy/health callers retain the COMPLETED-only default.
+    if expired_checkpoint_lineage and key is None:
+        raise ValueError("Expired lineage requires an exact checkpoint key")
+    statuses = {"COMPLETED", "EXPIRED"} if expired_checkpoint_lineage else {"COMPLETED"}
     for job in jobs:
         if (job.get("State") != "COMPLETED"
                 or job.get("SourceRecoveryPointArn") != point["RecoveryPointArn"]
@@ -51,7 +58,7 @@ def verified_copy(point, destination_points, jobs, destination, retention, key=N
             continue
         copied = next((candidate for candidate in destination_points
                        if candidate["RecoveryPointArn"] == job.get("DestinationRecoveryPointArn")), None)
-        if (copied is None or copied.get("Status") != "COMPLETED"
+        if (copied is None or copied.get("Status") not in statuses
                 or copied.get("ResourceType") != "EBS" or copied.get("IsEncrypted") is not True
                 or copied.get("ResourceArn") != point["ResourceArn"]
                 or copied.get("CreationDate") != point["CreationDate"]
@@ -71,6 +78,8 @@ def verified_copy(point, destination_points, jobs, destination, retention, key=N
 
 def copy_point(client, point, source_vault, destination, jobs, role, now, retention_days):
     """Only retry a terminal failure, after six hours, at most three times per point."""
+    if point.get("Status") != "COMPLETED":
+        raise ValueError("Cannot copy a non-completed recovery point: " + point["RecoveryPointArn"])
     matching = [job for job in jobs
                 if job.get("SourceRecoveryPointArn") == point["RecoveryPointArn"]
                 and job.get("DestinationBackupVaultArn") == destination]
@@ -287,6 +296,70 @@ def canary_restore_health(stage, config, now):
     return errors
 
 
+def checkpoint_origin(point, jobs, config):
+    return next((job for job in jobs
+                 if job.get("State") == "COMPLETED"
+                 and job.get("DestinationBackupVaultArn") == config["dr_vault_arn"]
+                 and job.get("DestinationRecoveryPointArn") == point["RecoveryPointArn"]
+                 and job.get("SourceBackupVaultArn") in {
+                     config["primary_vault_arn"], config["processing_vault_arn"]}
+                 and job.get("SourceRecoveryPointArn")
+                 and job.get("ResourceArn") == point["ResourceArn"]), None)
+
+
+def expired_cleanup_candidates(primary, dr, config, pending_raw, dr_raw, stage_points,
+                               primary_jobs, dr_jobs, confirmed_intermediates, now):
+    """Retry failed deletion only with independently surviving exact copy proof.
+
+    EXPIRED remains unhealthy while present. Do not copy it, accept it as a final
+    destination, or remove a newest/unproven CMK checkpoint to make alarms green.
+    """
+    cleanup, errors = [], []
+    for point in pending_raw:
+        if (point.get("Status") != "EXPIRED" or point.get("ResourceType") != "EBS"
+                or point.get("ResourceArn") not in config["volumes"]):
+            continue
+        try:
+            final = None
+            if point.get("IsEncrypted") is False:
+                final = verified_copy(point, stage_points, primary_jobs, config["stage_vault_arn"],
+                                      final_retention(point), source_vault=config["processing_vault_arn"], now=now)
+            elif (point.get("IsEncrypted") is True and point.get("EncryptionKeyArn")
+                  and point["ResourceArn"] in config["cmk_hop_volumes"]):
+                intermediate = verified_copy(point, dr_raw, primary_jobs, config["dr_vault_arn"],
+                                             None, config["dr_key"], config["processing_vault_arn"], now,
+                                             expired_checkpoint_lineage=True)
+                if intermediate is not None:
+                    final = verified_copy(intermediate, stage_points, dr_jobs, config["stage_vault_arn"],
+                                          final_retention(point), source_vault=config["dr_vault_arn"], now=now)
+            if final is not None:
+                tags = primary.list_tags(ResourceArn=point["RecoveryPointArn"]).get("Tags", {})
+                if (tags.get("BackupPipeline") != "fleet-processing-v2"
+                        or not tags.get("aws:backup:source-resource")):
+                    raise ValueError("Expired processing point lacks pipeline provenance: " + point["RecoveryPointArn"])
+                cleanup.append((primary, config["processing_vault"], point))
+        except Exception as error:
+            errors.append(str(error))
+    for point in dr_raw:
+        if (point.get("Status") != "EXPIRED" or point.get("ResourceType") != "EBS"
+                or point.get("ResourceArn") not in config["cmk_hop_volumes"]
+                or point.get("IsEncrypted") is not True or point.get("EncryptionKeyArn") != config["dr_key"]):
+            continue
+        try:
+            newest = latest(dr_raw, point["ResourceArn"])
+            successor = latest(confirmed_intermediates, point["ResourceArn"])
+            if (point["RecoveryPointArn"] == newest["RecoveryPointArn"] or successor is None
+                    or successor["CreationDate"] <= point["CreationDate"]):
+                continue
+            final = verified_copy(point, stage_points, dr_jobs, config["stage_vault_arn"],
+                                  final_retention(point), source_vault=config["dr_vault_arn"], now=now)
+            if final is not None and checkpoint_origin(point, primary_jobs, config) is not None:
+                cleanup.append((dr, config["dr_vault"], point))
+        except Exception as error:
+            errors.append(str(error))
+    return cleanup, errors
+
+
 def reconcile(primary, dr, stage, config, now):
     allowed = set(config["volumes"])
     hop_volumes = set(config["cmk_hop_volumes"])
@@ -374,14 +447,7 @@ def reconcile(primary, dr, stage, config, now):
             final = verified_copy(point, stage_points, dr_jobs, config["stage_vault_arn"],
                                   final_retention(point), source_vault=config["dr_vault_arn"], now=now)
             if final is not None:
-                origin = next((job for job in primary_jobs
-                               if job.get("State") == "COMPLETED"
-                               and job.get("DestinationBackupVaultArn") == config["dr_vault_arn"]
-                               and job.get("DestinationRecoveryPointArn") == point["RecoveryPointArn"]
-                               and job.get("SourceBackupVaultArn") in {
-                                   config["primary_vault_arn"], config["processing_vault_arn"]}
-                               and job.get("SourceRecoveryPointArn")
-                               and job.get("ResourceArn") == point["ResourceArn"]), None)
+                origin = checkpoint_origin(point, primary_jobs, config)
                 if origin is None:
                     errors.append("Missing first-leg lineage; retaining CMK checkpoint: " + point["RecoveryPointArn"])
                 else:
@@ -402,6 +468,11 @@ def reconcile(primary, dr, stage, config, now):
             if (point["RecoveryPointArn"] != newest["RecoveryPointArn"]
                     and successor["CreationDate"] > point["CreationDate"]):
                 cleanup.append((dr, config["dr_vault"], point))
+        expired, expired_errors = expired_cleanup_candidates(
+            primary, dr, config, pending_raw, dr_raw, stage_points,
+            primary_jobs, dr_jobs, confirmed_intermediates, now)
+        cleanup.extend(expired)
+        errors.extend(expired_errors)
         for client, vault, point in cleanup:
             try:
                 client.delete_recovery_point(BackupVaultName=vault, RecoveryPointArn=point["RecoveryPointArn"])

@@ -43,6 +43,13 @@ def compact_list(source, name):
     return match[1]
 
 
+def statement(source, sid):
+    matches = re.findall(r'\bSid\s*=\s*"' + re.escape(sid) + r'"(.*?)\n      \},', source, re.S)
+    if len(matches) != 1:
+        raise AssertionError("Expected one IAM statement: " + sid)
+    return matches[0]
+
+
 class BackupTopologyTests(unittest.TestCase):
     def test_recovery_account_and_region_are_explicit(self):
         self.assertRegex(SECURITY, r'backup_recovery_region\s*=\s*"us-east-1"')
@@ -132,17 +139,75 @@ class BackupTopologyTests(unittest.TestCase):
         final = resource("aws_backup_vault_policy", "staging_recovery_dr")
         self.assertNotIn("DeleteRecoveryPoint", final)
 
-    def test_controller_has_no_identity_deletion_or_retention_bypass(self):
+    def test_controller_has_no_backup_identity_deletion_or_retention_bypass(self):
         policy = resource("aws_iam_role_policy", "backup_recovery")
         self.assertNotIn("backup:DeleteRecoveryPoint", policy)
-        denied = re.search(r'Effect\s*=\s*"Deny"\s+Action\s*=\s*\[(.*?)\]', policy, re.S).group(1)
-        for action in ("ec2:DeleteSnapshot", "backup:UpdateRecoveryPointLifecycle",
-                       "backup:DisassociateRecoveryPoint", "backup:TagResource", "backup:UntagResource",
+        denied = statement(policy, "NoAlternativeDeletionOrRetentionBypass")
+        self.assertRegex(denied, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(denied, r'Resource\s*=\s*"\*"')
+        self.assertNotIn("Condition", denied)
+        for action in ("backup:UpdateRecoveryPointLifecycle", "backup:DisassociateRecoveryPoint",
+                       "backup:DisassociateRecoveryPointFromParent", "backup:TagResource", "backup:UntagResource",
                        "backup:PutBackupVaultAccessPolicy", "backup:DeleteBackupVaultAccessPolicy",
                        "backup:PutBackupVaultLockConfiguration", "backup:DeleteBackupVaultLockConfiguration"):
             self.assertIn('"' + action + '"', denied)
+        self.assertNotIn("ec2:DeleteSnapshot", denied)
         self.assertIn('"iam:PassedToService" = "backup.amazonaws.com"', policy)
         self.assertIn("Resource = local.backup_service_role_arn", re.sub(r"\s+", " ", policy))
+
+    def test_direct_and_missing_context_snapshot_deletion_remain_explicitly_denied(self):
+        policy = resource("aws_iam_role_policy", "backup_recovery")
+        denied = statement(policy, "NoSnapshotDeletionOutsideBackup")
+        self.assertRegex(denied, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(denied, r'Action\s*=\s*"ec2:DeleteSnapshot"')
+        self.assertRegex(denied, r'Resource\s*=\s*"\*"')
+        self.assertIn('"ForAllValues:StringNotEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }', denied)
+        # Missing/empty CalledVia must match the deny. Null:false would exempt
+        # missing context; ForAnyValue on this deny would do the same.
+        self.assertNotRegex(denied, r"\bNull\s*=")
+        self.assertNotIn("ForAnyValue", denied)
+
+    def test_forwarded_pipeline_snapshot_deletion_is_gated_and_tag_scoped(self):
+        policy = resource("aws_iam_role_policy", "backup_recovery")
+        grant = statement(policy, "DeleteProcessingSnapshotsOnlyThroughBackup")
+        self.assertRegex(policy, r'local\.backup_recovery_cleanup_enabled\s*\?\s*\[\s*\{\s*'
+                         r'(?:#[^\n]*\n\s*)*Sid\s*=\s*"DeleteProcessingSnapshotsOnlyThroughBackup"')
+        self.assertRegex(grant, r'Effect\s*=\s*"Allow"')
+        self.assertRegex(grant, r'Action\s*=\s*"ec2:DeleteSnapshot"')
+        self.assertRegex(grant, r'Resource\s*=\s*local\.backup_snapshot_arns\b')
+        self.assertIn('"ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }', grant)
+        self.assertRegex(grant, r'"ec2:Owner"\s*=\s*data\.aws_caller_identity\.current\.account_id')
+        self.assertRegex(grant, r'"aws:ResourceTag/BackupPipeline"\s*=\s*"fleet-processing-v2"')
+        self.assertIn('Null = { "aws:ResourceTag/aws:backup:source-resource" = "false" }', grant)
+        snapshot_arns = re.search(r'backup_snapshot_arns\s*=\s*\[(.*?)\]', SECURITY, re.S).group(1)
+        self.assertEqual(re.findall(r'"([^"]+)"', snapshot_arns), [
+            "arn:aws:ec2:${var.aws_region}::snapshot/*", "arn:aws:ec2:us-east-1::snapshot/*"])
+
+    def test_untagged_initial_checkpoint_exception_is_exact_and_retires_at_cutover(self):
+        policy = resource("aws_iam_role_policy", "backup_recovery")
+        grant = statement(policy, "DeleteExactSupersededBootstrapCheckpointsThroughBackup")
+        self.assertIn("local.backup_recovery_cleanup_enabled && !local.backup_recovery_cutover_enabled ? [", policy)
+        self.assertRegex(grant, r'Effect\s*=\s*"Allow"')
+        self.assertRegex(grant, r'Action\s*=\s*"ec2:DeleteSnapshot"')
+        snapshots = re.search(r'\bResource\s*=\s*\[(.*?)\]', grant, re.S).group(1)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', snapshots)), {
+            "arn:aws:ec2:us-east-1::snapshot/snap-0a7f6a0dde2e248b6",
+            "arn:aws:ec2:us-east-1::snapshot/snap-017274f57046154b9"})
+        self.assertNotIn("*", snapshots)
+        self.assertIn('"ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }', grant)
+        self.assertRegex(grant, r'"ec2:Owner"\s*=\s*data\.aws_caller_identity\.current\.account_id')
+        self.assertRegex(grant, r'Null\s*=\s*\{ "aws:ResourceTag/aws:backup:source-resource" = "false" \}')
+        # One unconditional direct-call deny and only these two conditional allows.
+        self.assertEqual(policy.count('"ec2:DeleteSnapshot"'), 3)
+
+    def test_retry_provenance_read_does_not_grant_retagging(self):
+        policy = resource("aws_iam_role_policy", "backup_recovery")
+        grant = statement(policy, "ReadProcessingRetryProvenance")
+        self.assertRegex(grant, r'Effect\s*=\s*"Allow"')
+        self.assertRegex(grant, r'Action\s*=\s*"backup:ListTags"')
+        self.assertRegex(grant, r'Resource\s*=\s*"arn:aws:ec2:\$\{var\.aws_region\}::snapshot/\*"')
+        for forbidden in ("ec2:CreateTags", "ec2:DeleteTags", "iam:CreateServiceLinkedRole"):
+            self.assertNotIn(forbidden, policy)
 
     def test_controller_uses_new_final_vault_and_optional_canary(self):
         function = resource("aws_lambda_function", "backup_recovery")

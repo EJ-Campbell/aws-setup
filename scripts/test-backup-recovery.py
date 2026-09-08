@@ -50,13 +50,15 @@ RESTORE_JOB = {"RestoreJobId": "restore-job", "IamRoleArn": "restore-role", "Res
 
 
 class Backup:
-    def __init__(self, points=None, jobs=None, vault_points=None):
+    def __init__(self, points=None, jobs=None, vault_points=None, tags=None):
         self.points = points or []
         self.jobs = jobs or []
         self.vault_points = vault_points
         self.started = []
         self.validation = []
         self.deleted = []
+        self.tags = tags or {}
+        self.tag_reads = []
 
     def get_paginator(self, operation):
         def paginate(**kwargs):
@@ -81,6 +83,10 @@ class Backup:
 
     def delete_recovery_point(self, **kwargs):
         self.deleted.append(kwargs)
+
+    def list_tags(self, **kwargs):
+        self.tag_reads.append(kwargs["ResourceArn"])
+        return {"Tags": self.tags.get(kwargs["ResourceArn"], {})}
 
 
 class RecoveryTests(unittest.TestCase):
@@ -366,6 +372,135 @@ class PipelineTests(unittest.TestCase):
         for config in [dict(CONFIG, processing_vault="local"), dict(CONFIG, cmk_hop_volumes=["unrelated"])]:
             with self.assertRaises(ValueError):
                 module.reconcile(Backup(), Backup(), Backup(), config, NOW)
+
+
+class ExpiredCleanupTests(unittest.TestCase):
+    provenance = {"BackupPipeline": "fleet-processing-v2", "aws:backup:source-resource": "backup-source-id"}
+
+    def direct(self, *, source_changes=None, final_changes=None, job_changes=None, tags=None, enabled=True):
+        source = dict(POINT, IsEncrypted=False, Lifecycle={})
+        final = dict(copied(source, "final"), **(final_changes or {}))
+        job = completed_copy(source, final, **(job_changes or {}))
+        source = dict(dict(source, Status="EXPIRED"), **(source_changes or {}))
+        primary = Backup(vault_points={"pending": [source]}, jobs=[job],
+                         tags={source["RecoveryPointArn"]: self.provenance if tags is None else tags})
+        dr = Backup()
+        result = module.reconcile(primary, dr, Backup([final]), dict(CONFIG, cleanup_enabled=enabled), NOW)
+        self.assertEqual(primary.started + dr.started, [], "Expired cleanup must never start a copy")
+        return primary, result
+
+    def test_proven_expired_processing_retries_but_remains_unhealthy_until_absent(self):
+        primary, (_, errors) = self.direct()
+        self.assertEqual(primary.deleted, [{"BackupVaultName": "pending", "RecoveryPointArn": POINT["RecoveryPointArn"]}])
+        self.assertEqual(primary.tag_reads, [POINT["RecoveryPointArn"]])
+        self.assertTrue(any("remains EXPIRED" in error for error in errors))
+
+    def test_disabled_gate_never_reads_tags_or_retries_expired_cleanup(self):
+        for enabled in [False, None, "true", 1]:
+            primary, (_, errors) = self.direct(enabled=enabled)
+            self.assertEqual(primary.deleted + primary.tag_reads, [])
+            self.assertTrue(any("EXPIRED" in error for error in errors))
+
+    def test_processing_provenance_requires_both_pipeline_and_reserved_source_tags(self):
+        for tags in [{}, {"BackupPipeline": "other", "aws:backup:source-resource": "id"},
+                     {"BackupPipeline": "fleet-processing-v2"}, {"aws:backup:source-resource": "id"}]:
+            with self.subTest(tags=tags):
+                primary, (_, errors) = self.direct(tags=tags)
+                self.assertEqual(primary.deleted, [])
+                self.assertTrue(any("lacks pipeline provenance" in error for error in errors))
+
+    def test_tag_read_failure_is_fail_closed(self):
+        with patch.object(Backup, "list_tags", side_effect=RuntimeError("AccessDenied ListTags")):
+            primary, (_, errors) = self.direct()
+        self.assertEqual(primary.deleted, [])
+        self.assertIn("AccessDenied ListTags", errors)
+
+    def test_partial_and_deleting_are_not_expired_retry_candidates(self):
+        for status in ["PARTIAL", "DELETING"]:
+            primary, _ = self.direct(source_changes={"Status": status})
+            self.assertEqual(primary.deleted + primary.tag_reads, [])
+
+    def test_missing_mismatched_expired_or_time_expired_final_never_authorizes_retry(self):
+        for changes in [{"Status": "EXPIRED"}, {"Status": "PARTIAL"}, {"ResourceArn": "other"},
+                        {"CreationDate": NOW - timedelta(seconds=1)}, {"IsEncrypted": False},
+                        {"Lifecycle": {}}, {"CalculatedLifecycle": {"DeleteAt": NOW}}]:
+            with self.subTest(changes=changes):
+                primary, _ = self.direct(final_changes=changes)
+                self.assertEqual(primary.deleted + primary.tag_reads, [])
+        for changes in [{"State": "FAILED"}, {"SourceRecoveryPointArn": "other"},
+                        {"SourceBackupVaultArn": "other"}, {"DestinationRecoveryPointArn": "missing"},
+                        {"DestinationBackupVaultArn": "other"}, {"ResourceArn": "other"}]:
+            with self.subTest(changes=changes):
+                primary, _ = self.direct(job_changes=changes)
+                self.assertEqual(primary.deleted + primary.tag_reads, [])
+
+    def pair(self, *, old_changes=None, new_changes=None, old_final_changes=None,
+             new_final_changes=None, first_changes=None, include_source=False):
+        old_source = dict(POINT, CreationDate=NOW - timedelta(days=1), RecoveryPointArn="source-old")
+        new_source = dict(POINT, RecoveryPointArn="source-new")
+        old = copied(old_source, "old", key="dr-key", retention=365)
+        new = dict(copied(new_source, "new", key="dr-key", retention=365), **(new_changes or {}))
+        old_final = dict(copied(old, "old-final"), **(old_final_changes or {}))
+        new_final = dict(copied(new, "new-final"), **(new_final_changes or {}))
+        first_jobs = [completed_copy(old_source, old, "dr-vault", **(first_changes or {})),
+                      completed_copy(new_source, new, "dr-vault")]
+        final_jobs = [completed_copy(old, old_final, source_vault="dr-vault"),
+                      completed_copy(new, new_final, source_vault="dr-vault")]
+        old = dict(dict(old, Status="EXPIRED"), **(old_changes or {}))
+        primary = Backup(vault_points={"pending": [dict(old_source, Status="EXPIRED")] if include_source else []},
+                         jobs=first_jobs, tags={old_source["RecoveryPointArn"]: self.provenance})
+        dr = Backup([old, new], final_jobs)
+        result = module.reconcile(primary, dr, Backup([old_final, new_final]), dict(CONFIG, cleanup_enabled=True), NOW)
+        self.assertEqual(primary.started + dr.started, [])
+        return primary, dr, result
+
+    def test_superseded_expired_checkpoint_retries_only_with_its_own_and_newer_final_proof(self):
+        primary, dr, (_, errors) = self.pair()
+        self.assertEqual(dr.deleted, [{"BackupVaultName": "dr", "RecoveryPointArn": "arn:aws:ec2:us-east-1::snapshot/snap-old"}])
+        self.assertEqual(primary.deleted + primary.tag_reads, [])
+        self.assertTrue(any("EXPIRED" in error for error in errors))
+
+    def test_expired_processing_can_use_expired_checkpoint_only_as_historical_chain_proof(self):
+        primary, dr, (_, errors) = self.pair(include_source=True)
+        self.assertEqual(primary.deleted, [{"BackupVaultName": "pending", "RecoveryPointArn": "source-old"}])
+        self.assertEqual(len(dr.deleted), 1)
+        self.assertEqual(sum("EXPIRED" in error for error in errors), 2)
+
+    def test_newest_or_equal_date_expired_checkpoint_is_never_deleted(self):
+        for old_changes in [{"CreationDate": NOW}, {"CreationDate": NOW + timedelta(seconds=1)}]:
+            primary, dr, _ = self.pair(old_changes=old_changes)
+            self.assertEqual(primary.deleted + dr.deleted, [])
+
+    def test_expired_successor_or_unverified_successor_cannot_authorize_checkpoint_retry(self):
+        for new_changes, final_changes in [({"Status": "EXPIRED"}, {}), ({"Status": "PARTIAL"}, {}),
+                                          ({}, {"Status": "EXPIRED"}), ({}, {"IsEncrypted": False})]:
+            primary, dr, _ = self.pair(new_changes=new_changes, new_final_changes=final_changes)
+            self.assertEqual(primary.deleted + dr.deleted, [])
+
+    def test_checkpoint_needs_exact_key_origin_and_unexpired_final(self):
+        cases = [{"old_changes": {"EncryptionKeyArn": "wrong-key"}},
+                 {"first_changes": {"SourceBackupVaultArn": "legacy-unrelated"}},
+                 {"first_changes": {"State": "FAILED"}},
+                 {"first_changes": {"ResourceArn": "other"}},
+                 {"old_final_changes": {"Status": "EXPIRED"}},
+                 {"old_final_changes": {"CalculatedLifecycle": {"DeleteAt": NOW}}}]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                primary, dr, _ = self.pair(**changes)
+                self.assertEqual(primary.deleted + dr.deleted, [])
+
+    def test_expired_points_never_become_copy_usable_or_default_accepted_destinations(self):
+        expired = dict(POINT, Status="EXPIRED")
+        self.assertEqual(module.usable([expired], {RESOURCE}), [])
+        self.assertIsNone(module.verified_copy(POINT, [expired], [completed_copy(POINT, expired)],
+                                              "stage-vault", 365))
+        with self.assertRaisesRegex(ValueError, "exact checkpoint key"):
+            module.verified_copy(POINT, [expired], [], "stage-vault", 365, expired_checkpoint_lineage=True)
+        for status in ["EXPIRED", "PARTIAL", "DELETING", None]:
+            client = Backup()
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "non-completed recovery point"):
+                module.copy_point(client, dict(POINT, Status=status), "pending", "stage-vault", [], "role", NOW, 7)
+            self.assertEqual(client.started, [])
 
 
 class MonthlyRestoreTests(unittest.TestCase):

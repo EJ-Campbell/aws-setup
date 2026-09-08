@@ -785,8 +785,12 @@ with **no expiration while a copy is pending**. Only confirmed final copies perm
 source cleanup. The controller keeps the latest CMK checkpoint for each encrypted root
 until a verified successor exists: deleting every checkpoint would force expensive
 full transfers again. Older checkpoints are removed only with complete copy lineage.
-Cleanup permissions come only from those two temporary-vault policies; the controller
-cannot delete legacy history or final recovery points. Copy failures retain pending
+Recovery-point deletion is granted only by those two temporary-vault policies. AWS
+Backup also forwards the underlying EC2 deletion using the controller's credentials;
+that permission requires Backup in `aws:CalledVia`, our snapshot owner and pipeline
+tags. Direct EC2 deletion remains explicitly denied. The two untagged bootstrap CMK
+seeds have exact-snapshot exceptions that retire at cutover. The controller cannot
+delete legacy history or final recovery points. Copy failures retain pending
 data and raise alarms rather than silently expiring it. Stalled cleanup costs storage.
 
 Cold bootstrap must start with both cleanup and selection-cutover gates false. Bootstrap
@@ -827,6 +831,12 @@ Roll out with fresh full Terraform plans in this order:
    Verify the five processing captures and superseded CMK checkpoints actually disappear,
    not merely that deletion returned HTTP 200; keep each newest checkpoint. A permission
    failure must retain data, not lead to a broad identity-policy deletion grant.
+   AWS can return HTTP 200 yet leave a point `EXPIRED` when its forwarded EC2 call
+   fails authorization. Inspect the recovery point's status message and CloudTrail;
+   after repair, the controller retries only expired points with the same complete
+   final-copy lineage (and a strictly newer verified successor for CMK checkpoints).
+   An expired processing retry also checks its provenance tag. Errors remain visible
+   until the point disappears. Verify underlying snapshot absence as well.
 6. Only after that cleanup acceptance succeeds, set `backup_recovery_cutover_enabled=true`
    and apply the two changed selections plus the controller's acceptance handoff.
    Their preconditions reject cutover while cleanup is disabled; replacement creates
@@ -865,8 +875,8 @@ the air-gapped key, and its standard-vault data source rejects this vault type.
 with `DescribeBackupVault`; the vault has `prevent_destroy`. Recheck the pin against
 live vault metadata after any deliberate vault recovery/replacement. It does not
 grant access to every key in other accounts.
-AWS Backup cleans up after the two-hour validation
-window; the controller checks expected per-volume jobs and backs up cleanup after four hours.
+AWS Backup starts cleanup after successful validation (or the two-hour validation
+window); the controller checks expected per-volume jobs and backs up cleanup after four hours.
 Require a real successful restore/validation/cleanup cycle before claiming recovery
 testing is proven. Five east1 tests cost $7.50 plus roughly $0.094 per hour retaining
 all restored volumes. At September 7 pricing and measured written snapshot sizes,
