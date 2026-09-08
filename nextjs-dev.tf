@@ -79,10 +79,10 @@ resource "aws_iam_role_policy_attachment" "nextjs_dev_ssm" {
 # Read metadata only, never another copy of either secret payload in state.
 # cloudflare-tunnel-* also matches Terraform's control-plane API token.
 data "aws_secretsmanager_secret" "nextjs_connector" {
-  for_each = toset([
-    "cloudflare-tunnel-credentials",
-    "cloudflare-dolphin-tunnel-credentials",
-  ])
+  for_each = toset(concat(
+    ["cloudflare-tunnel-credentials"],
+    local.dolphin_enabled ? ["cloudflare-dolphin-tunnel-credentials"] : [],
+  ))
   name = each.value
 }
 
@@ -109,13 +109,14 @@ resource "aws_iam_role_policy" "nextjs_dev" {
         Sid    = "ReadOwnSecrets"
         Effect = "Allow"
         Action = "secretsmanager:GetSecretValue"
-        Resource = [
+        Resource = concat([
           data.aws_secretsmanager_secret.nextjs_connector["cloudflare-tunnel-credentials"].arn,
-          data.aws_secretsmanager_secret.nextjs_connector["cloudflare-dolphin-tunnel-credentials"].arn,
           # Hop key for reaching the other dev servers. Grants nothing beyond them: its
           # public half is never installed on the jumpbox. See dev-hop-key.tf.
           aws_secretsmanager_secret.dev_hop.arn,
-        ]
+          ], local.dolphin_enabled ? [
+          data.aws_secretsmanager_secret.nextjs_connector["cloudflare-dolphin-tunnel-credentials"].arn,
+        ] : [])
       },
       {
         # devhop-refresh resolves the other dev servers' private IPs at boot, because they

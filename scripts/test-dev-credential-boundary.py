@@ -54,7 +54,7 @@ class DevCredentialBoundaryTests(unittest.TestCase):
     def test_nextjs_connector_metadata_is_exact_and_contains_no_payload(self):
         metadata = block('nextjs-dev.tf', 'data', 'nextjs_connector')
         self.assertIn('data "aws_secretsmanager_secret"', metadata)
-        self.assertEqual(re.findall(r'^\s+"(cloudflare-[^\"]+)"', metadata, re.M), [
+        self.assertEqual(re.findall(r'"(cloudflare-[^\"]+)"', metadata), [
             'cloudflare-tunnel-credentials', 'cloudflare-dolphin-tunnel-credentials',
         ])
         self.assertNotIn('secret_version', metadata)
@@ -68,6 +68,14 @@ class DevCredentialBoundaryTests(unittest.TestCase):
         self.assertIn('aws_secretsmanager_secret.dev_hop.arn', policy)
         self.assertNotIn('secret:cloudflare-', policy)
         self.assertNotIn('cloudflare-tunnel-token', policy)
+
+    def test_optional_dolphin_secret_and_grant_use_existing_zone_gate(self):
+        metadata = block('nextjs-dev.tf', 'data', 'nextjs_connector')
+        self.assertIn('local.dolphin_enabled ? ["cloudflare-dolphin-tunnel-credentials"] : []', metadata)
+        policy = block('nextjs-dev.tf', 'resource', 'nextjs_dev', 'aws_iam_role_policy')
+        self.assertRegex(policy, r'local\.dolphin_enabled\s*\?\s*\[\s*'
+                         r'data\.aws_secretsmanager_secret\.nextjs_connector'
+                         r'\["cloudflare-dolphin-tunnel-credentials"\]\.arn,\s*\]\s*:\s*\[\]')
 
     def test_required_public_ssh_and_access_service_token_remain(self):
         sg = block('nextjs-dev.tf', 'resource', 'nextjs_dev', 'aws_security_group')
