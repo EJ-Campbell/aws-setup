@@ -298,12 +298,29 @@ resource "aws_iam_role_policy" "backup_recovery" {
   role = aws_iam_role.backup_recovery.name
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "NoAlternativeDeletionOrRetentionBypass"
         Effect   = "Deny"
-        Action   = ["ec2:DeleteSnapshot", "backup:UpdateRecoveryPointLifecycle", "backup:DisassociateRecoveryPoint", "backup:DisassociateRecoveryPointFromParent", "backup:TagResource", "backup:UntagResource", "backup:PutBackupVaultAccessPolicy", "backup:DeleteBackupVaultAccessPolicy", "backup:PutBackupVaultLockConfiguration", "backup:DeleteBackupVaultLockConfiguration"]
+        Action   = ["backup:UpdateRecoveryPointLifecycle", "backup:DisassociateRecoveryPoint", "backup:DisassociateRecoveryPointFromParent", "backup:TagResource", "backup:UntagResource", "backup:PutBackupVaultAccessPolicy", "backup:DeleteBackupVaultAccessPolicy", "backup:PutBackupVaultLockConfiguration", "backup:DeleteBackupVaultLockConfiguration"]
         Resource = "*"
+      },
+      {
+        # DeleteRecoveryPoint forwards EC2 authorization as the caller, not the
+        # stored backup role. Missing CalledVia also matches this explicit deny.
+        # AWSBackupFullAccess uses the same Backup-only FAS condition for its allow:
+        # https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AWSBackupFullAccess.html
+        Sid       = "NoSnapshotDeletionOutsideBackup"
+        Effect    = "Deny"
+        Action    = "ec2:DeleteSnapshot"
+        Resource  = "*"
+        Condition = { "ForAllValues:StringNotEquals" = { "aws:CalledVia" = "backup.amazonaws.com" } }
+      },
+      {
+        Sid      = "ReadProcessingRetryProvenance"
+        Effect   = "Allow"
+        Action   = "backup:ListTags"
+        Resource = "arn:aws:ec2:${var.aws_region}::snapshot/*"
       },
       {
         Effect   = "Allow"
@@ -361,7 +378,43 @@ resource "aws_iam_role_policy" "backup_recovery" {
         Resource  = "*"
         Condition = { StringEquals = { "cloudwatch:namespace" = "FleetBackup" } }
       },
-    ]
+      ], local.backup_recovery_cleanup_enabled ? [
+      {
+        # This prerequisite cannot bypass the two vault policies: direct EC2
+        # calls are explicitly denied above, and Backup deletion has no identity
+        # allow. Require our owner, new pipeline tag, and AWS's reserved backup tag.
+        Sid      = "DeleteProcessingSnapshotsOnlyThroughBackup"
+        Effect   = "Allow"
+        Action   = "ec2:DeleteSnapshot"
+        Resource = local.backup_snapshot_arns
+        Condition = {
+          "ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }
+          StringEquals = {
+            "ec2:Owner"                      = data.aws_caller_identity.current.account_id
+            "aws:ResourceTag/BackupPipeline" = "fleet-processing-v2"
+          }
+          Null = { "aws:ResourceTag/aws:backup:source-resource" = "false" }
+        }
+      },
+      ] : [], local.backup_recovery_cleanup_enabled && !local.backup_recovery_cutover_enabled ? [
+      {
+        # The two initial CMK seeds predate the pipeline tag. Exact snapshot pins
+        # from the accepted 2026-09-07 copy lineage avoid retagging or granting
+        # deletion over legacy snapshots. Retire this exception at final cutover.
+        Sid    = "DeleteExactSupersededBootstrapCheckpointsThroughBackup"
+        Effect = "Allow"
+        Action = "ec2:DeleteSnapshot"
+        Resource = [
+          "arn:aws:ec2:us-east-1::snapshot/snap-0a7f6a0dde2e248b6",
+          "arn:aws:ec2:us-east-1::snapshot/snap-017274f57046154b9",
+        ]
+        Condition = {
+          "ForAnyValue:StringEquals" = { "aws:CalledVia" = "backup.amazonaws.com" }
+          StringEquals               = { "ec2:Owner" = data.aws_caller_identity.current.account_id }
+          Null                       = { "aws:ResourceTag/aws:backup:source-resource" = "false" }
+        }
+      },
+    ] : [])
   })
 }
 
