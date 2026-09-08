@@ -568,8 +568,7 @@ locals {
         if rule in FORWARD_RULES:
             return {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:"+main_account+":event-bus/security-alerts",
                 "RoleArn": "arn:aws:iam::"+account+":role/security-findings-forward",
-                "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE},
-                "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+                "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE}}
         target = {"DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:"+main_account+":security-central-delivery-dlq"}}
         if rule == "security-alerts-notify":
             target.update({"Id": "confirmed-operator-email", "Arn": sns_topic,
