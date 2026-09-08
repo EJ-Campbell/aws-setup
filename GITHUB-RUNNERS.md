@@ -575,11 +575,6 @@ Closed (were sharp edges, now hardened):
 
 Still open (accepted for now):
 
-- **The OIDC role is admin-capable by composition.** Its inline policy reads as scoped, but
-  `ec2:RunInstances` (`Resource: *`) plus `iam:PassRole` on `jumpbox-admin-role` (which
-  carries `AdministratorAccess`) lets a run launch an instance under the admin profile and
-  act as admin from there. The `sub` is `repo:ejc3/aws:*` / `repo:ejc3/fcvm:*` — any ref,
-  not pinned to a protected branch or a GitHub environment.
 - **PAT blast radius.** `/github-runner/pat` can register and remove runners on `ejc3/fcvm`;
   any process on a runner that reaches instance-role SSM can read it. Self-hosted runners and
   untrusted PRs don't mix.
@@ -607,5 +602,11 @@ Still open (accepted for now):
 
   Rotate the HMAC with `terraform apply -replace='random_password.github_webhook[0]'`; the
   same apply writes both sides.
-- Pattern A needs nothing in GitHub but the workflow's `permissions: id-token: write` and the
-  role ARN — no repo secret to manage.
+- Pattern A requires the workflow's `permissions: id-token: write`, the dedicated
+  `github-actions-ami-builder` role ARN, and `environment: runner-ami-publish`.
+  Before enabling the publisher, restore and read back the environment using
+  `.github/runner-ami-environment.json` and the recovery steps in `README.md`:
+  only `ejc3` may approve, administrator bypass is disabled, and the sole deployment
+  branch policy is `main` with no allowed tags. The role checks the exact environment
+  OIDC subject; omitting the environment fails role assumption. No AWS repo secret
+  is required.
