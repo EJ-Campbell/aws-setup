@@ -612,6 +612,43 @@ Still open (accepted for now):
 
 ## Operating it
 
+### Temporary runner credential-boundary acceptance
+
+`runner-bootstrap-canary.tf` creates two small Amazon Linux 2023 ARM instances in the
+existing runner network, with the actual `github-runner-profile`, and two **non-credential**
+SecureString fixtures bound to their current instance ARNs. These are IAM test machines,
+not CI runners: no repository, runner registration, job, or personal login is installed.
+Their `Role=runner-iam-canary` excludes them from runner autoscaling and cleanup. Unlike the
+original PR #69 fixtures, they do not depend on already-expired CI instance IDs.
+
+Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
+
+```bash
+python3 scripts/check-runner-iam-canary.py --phase before
+```
+
+Each actual EC2 role must read only its own fixture and receive `AccessDenied` for its peer
+through both `GetParameter` and batch `GetParameters`.
+The test prints parameter **names**, never values. Reusable PAT access is checked with IAM
+simulation only: `before` records the still-open permission; `after` requires an explicit
+deny. Neither phase attempts to fetch the real PAT. The fixtures contain no registration
+credential, and passing this check does not prove controller brokering or CI registration.
+
+Deploy the backward-compatible controller first while retaining the old user-data/PAT
+path; then publish broker user data and prove a real runner registers, deletes its own
+one-host credential before accepting a job, and completes trusted CI. Only after old boots
+have drained may the runner's broad SSM attachment/PAT grant be retired. Re-run with
+`--phase after` and verify the SSM agent still checks in. Do not combine these deployment
+gates into an unobserved single apply.
+
+The pair costs approximately **$0.032/hour** in `us-west-1` at the 2026-09-08 prices:
+two $0.010/hour instances, two $0.005/hour public IPv4 addresses, and 16 GiB total gp3 at
+$0.096/GiB-month, excluding tiny API/KMS/data-transfer usage. CPU credit mode is `standard`.
+Remove `runner-bootstrap-canary.tf` in a reviewed follow-up and apply a plan destroying
+only its two instances and two fixtures. Root volumes delete with the instances; no EIP,
+snapshot, or backup is created. Verify no matching running instance or parameter remains.
+The `RemoveAfter` tag is only a reminder and **does not shut these machines down**.
+
 - All of Pattern B is gated on `var.enable_github_runner` — flip it to `false` to tear the
   self-hosted side down. Two applies now: `aws_dynamodb_table.runner_registration` sets
   `deletion_protection_enabled = true`, so clear that first. Replacing that table while
