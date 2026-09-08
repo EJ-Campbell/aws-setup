@@ -156,7 +156,7 @@ class Events:
     def describe_rule(self, **kwargs):
         self.factory.rule_reads.append((self.account, self.region, kwargs))
         name, bus = kwargs["Name"], kwargs.get("EventBusName")
-        response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name == "security-forward-audit" else "ENABLED",
+        response = {"Name": name, "State": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if name in ("security-forward-audit", "security-alerts-notify") else "ENABLED",
                     "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
         if name == "security-delivery-health":
             response["ScheduleExpression"] = "rate(5 minutes)"
@@ -174,8 +174,7 @@ class Events:
         if rule in REGIONAL_RULES:
             target = {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/security-alerts",
                       "RoleArn": "arn:aws:iam::" + self.account + ":role/security-findings-forward",
-                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"},
-                      "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"}}
         elif rule == "security-alerts-notify":
             target = {"Id": "confirmed-operator-email", "Arn": SNS_TOPIC,
                       "RoleArn": "arn:aws:iam::" + MAIN + ":role/security-alerts-notify",
@@ -324,6 +323,18 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(result["failures"], 0)
                 self.assertEqual(result["depth"], 0)
 
+    def test_central_notifications_require_read_only_management_state(self):
+        # Forwarding CloudTrail onto a custom bus is not a documented exemption
+        # from the read-only management-event state requirement on its rule.
+        for state in ("ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS", "ENABLED", "DISABLED"):
+            with self.subTest(state=state):
+                self.factory.rules = {(MAIN, "us-west-1", "security-alerts-notify"):
+                    lambda response: dict(response, State=state)}
+                result = self.inspect(region="us-west-1")
+                self.assertEqual(result["errors"] == 0, state == "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
+                self.assertEqual(result["failures"], 0)
+                self.assertEqual(result["depth"], 0)
+
     def test_removed_duplicate_paginated_or_denied_targets_fail_closed(self):
         for override in (lambda r: {"Targets": []}, lambda r: {},
                          lambda r: {"Targets": r["Targets"] * 2}, lambda r: dict(r, NextToken="do-not-follow"),
@@ -342,6 +353,38 @@ class DeliveryTests(unittest.TestCase):
                     response["Targets"][0][key] = value
                     return response
                 with self.subTest(rule=rule, key=key):
+                    self.factory.targets = {(MAIN, "us-west-1", rule): change}
+                    self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_event_bus_retry_policy_is_absent_not_ignored(self):
+        # EventBridge rejects RetryPolicy for event-bus targets. Absence is the
+        # exact supported contract, not permission to ignore added target fields.
+        for account in (MAIN, STAGING):
+            for rule in REGIONAL_RULES:
+                with self.subTest(account=account, rule=rule, policy="absent"):
+                    self.factory.targets = {}
+                    self.assertEqual(self.inspect(account=account)["errors"], 0)
+                for policy in (None, {}, {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}):
+                    def change(response):
+                        response["Targets"][0]["RetryPolicy"] = policy
+                        return response
+                    with self.subTest(account=account, rule=rule, policy=policy):
+                        self.factory.targets = {(account, "us-east-1", rule): change}
+                        self.assertGreaterEqual(self.inspect(account=account)["errors"], 1)
+
+    def test_non_bus_retry_policies_remain_required_and_exact(self):
+        for rule, expected in (("security-alerts-notify", {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}),
+                               ("security-delivery-health", {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2})):
+            target = self.module["expected_target"](rule, MAIN, "us-west-1", MAIN, SNS_TOPIC)
+            self.assertEqual(target["RetryPolicy"], expected)
+            for policy in (None, dict(expected, MaximumEventAgeInSeconds=60), dict(expected, MaximumRetryAttempts=0)):
+                def change(response):
+                    if policy is None:
+                        response["Targets"][0].pop("RetryPolicy")
+                    else:
+                        response["Targets"][0]["RetryPolicy"] = policy
+                    return response
+                with self.subTest(rule=rule, policy=policy):
                     self.factory.targets = {(MAIN, "us-west-1", rule): change}
                     self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
 
@@ -699,6 +742,12 @@ class TerraformSafetyTests(unittest.TestCase):
             self.assertIn('"security-forward-findings", "security-forward-audit"', policy)
             self.assertNotIn(":rule/security-forward-*", policy)
 
+    def test_central_rule_accepts_forwarded_management_reads_without_broadening_pattern(self):
+        rule = block(TERRAFORM, "aws_cloudwatch_event_rule", "security_notify")
+        self.assertRegex(rule, r'\bstate\s*=\s*"ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"')
+        self.assertRegex(rule, r'event_pattern\s*=\s*jsonencode\(\{ account = local\.security_account_ids \}\)')
+        self.assertNotIn("is_enabled", rule)
+
     @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free semantic fixtures run above")
     def test_actual_shipped_event_patterns_match_fixtures_and_default_size_quota(self):
         start = re.search(r"security_event_patterns\s*=\s*\{", REGIONAL).end() - 1
@@ -735,6 +784,10 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(json.loads(result.stdout.strip())), {
             "security-forward-findings": "ENABLED", "security-forward-audit": "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"})
+        central = block(TERRAFORM, "aws_cloudwatch_event_rule", "security_notify")
+        central_state = re.search(r'^\s*state\s*=\s*(.+)$', central, re.M)
+        self.assertIsNotNone(central_state)
+        self.assertEqual(self.native_json_value(central_state.group(1)), "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS")
 
     def test_posture_covers_both_source_regions_and_final_recovery_region(self):
         expected = {"security_main_us_west_1", "security_main_us_west_2",
@@ -1031,6 +1084,19 @@ class TerraformSafetyTests(unittest.TestCase):
             self.assertIn('"aws:PrincipalIsAWSService"', policy)
         for source, target in ((REGIONAL, "central"), (TERRAFORM, "security_notify"), (TERRAFORM, "security_delivery_health")):
             self.assertIn("dead_letter_config", block(source, "aws_cloudwatch_event_target", target))
+
+    def test_retry_policy_is_only_configured_for_supported_target_types(self):
+        target = block(REGIONAL, "aws_cloudwatch_event_target", "central")
+        self.assertNotRegex(target, r"\bretry_policy\s*\{")
+        self.assertRegex(target, r"\barn\s*=\s*var\.central_event_bus_arn\b")
+        self.assertRegex(target, r"\brole_arn\s*=\s*var\.forwarding_role_arn\b")
+        self.assertIn("aws_sqs_queue.delivery_failures.arn", target)
+        for name, age, attempts in (("security_notify", 86400, 185), ("security_delivery_health", 300, 2)):
+            target = block(TERRAFORM, "aws_cloudwatch_event_target", name)
+            self.assertEqual(len(re.findall(r"\bretry_policy\s*\{", target)), 1)
+            self.assertRegex(target, rf"maximum_event_age_in_seconds\s*=\s*{age}\b")
+            self.assertRegex(target, rf"maximum_retry_attempts\s*=\s*{attempts}\b")
+            self.assertIn("aws_sqs_queue.security_delivery_failures.arn", target)
 
     def test_failure_alarms_trigger_on_one_failure_and_missing_pulses_alarm(self):
         gauges = block(TERRAFORM, "aws_cloudwatch_metric_alarm", "security_delivery")

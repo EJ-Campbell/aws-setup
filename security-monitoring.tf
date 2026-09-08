@@ -453,6 +453,8 @@ resource "aws_cloudwatch_event_rule" "security_notify" {
   name           = "security-alerts-notify"
   event_bus_name = aws_cloudwatch_event_bus.security_alerts.name
   event_pattern  = jsonencode({ account = local.security_account_ids })
+  # Forwarded CloudTrail reads need this state on the custom-bus rule too.
+  state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS"
 }
 
 # Use an execution role for SNS delivery: its trust pins the exact originating
@@ -566,8 +568,7 @@ locals {
         if rule in FORWARD_RULES:
             return {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:"+main_account+":event-bus/security-alerts",
                 "RoleArn": "arn:aws:iam::"+account+":role/security-findings-forward",
-                "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE},
-                "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+                "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE}}
         target = {"DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:"+main_account+":security-central-delivery-dlq"}}
         if rule == "security-alerts-notify":
             target.update({"Id": "confirmed-operator-email", "Arn": sns_topic,
@@ -628,7 +629,7 @@ locals {
             expected_arn = "arn:aws:events:"+region+":"+account+":rule/"+(bus+"/" if bus else "")+rule
             try:
                 state = events.describe_rule(Name=rule, **scope)
-                expected_state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if rule == "security-forward-audit" else "ENABLED"
+                expected_state = "ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS" if rule in ("security-forward-audit", "security-alerts-notify") else "ENABLED"
                 if state.get("State") != expected_state or state.get("Name") != rule or state.get("Arn") != expected_arn:
                     errors += 1
                 if rule == "security-delivery-health" and state.get("ScheduleExpression") != "rate(5 minutes)":

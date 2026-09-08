@@ -207,10 +207,8 @@ resource "aws_cloudwatch_event_target" "central" {
   target_id = "central-security-alerts"
   arn       = var.central_event_bus_arn
   role_arn  = var.forwarding_role_arn
-  retry_policy {
-    maximum_event_age_in_seconds = 86400
-    maximum_retry_attempts       = 185
-  }
+  # Event-bus targets reject RetryPolicy; their role and regional DLQ are supported.
+  # https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_events_targets.EventBusProps.html
   dead_letter_config { arn = aws_sqs_queue.delivery_failures.arn }
   depends_on = [aws_sqs_queue_policy.delivery_failures]
 }
