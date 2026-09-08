@@ -1,30 +1,39 @@
-name: Terraform Drift Detection
+name: Terraform Validation
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   schedule:
     - cron: '0 8 * * *'  # 8am UTC daily
   workflow_dispatch:
 
 jobs:
-  drift:
+  validate:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
 
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.10.3
 
-      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
-        with:
-          role-to-assume: arn:aws:iam::928413605543:role/github-actions-terraform
-          aws-region: us-west-1
+      # A full plan reads credential-bearing state and managed secret values.
+      # Never restore AWS credentials here to make a refresh pass; full drift
+      # checks belong on the administration host, not a GitHub runner.
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
 
-      - name: Terraform Init
-        run: terraform init
+      - name: Install pinned providers without state access
+        run: terraform init -backend=false -lockfile=readonly
 
-      - name: Check for Drift
-        run: terraform plan -detailed-exitcode
+      - name: Validate Terraform configuration
+        run: terraform validate
+
+      - name: Verify CI privilege boundaries
+        run: python3 scripts/test-ci-security.py

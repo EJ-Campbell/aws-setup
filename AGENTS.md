@@ -189,7 +189,7 @@ Terraform runs directly on the jumpbox, against the S3 backend with DynamoDB loc
 instance role supplies credentials, so there is no login step and nothing to auto-refresh.
 Keep `.terraform.lock.hcl` tracked so both admin boxes resolve the same providers.
 `main.tf` enforces Terraform 1.10.3 because the Workers Builds control token uses an
-ephemeral resource. Bump that constraint, both jumpboxes, and the drift workflow together.
+ephemeral resource. Bump that constraint, both jumpboxes, and the validation workflow together.
 When the exact Cloudflare fork pin advances, use targeted `terraform providers lock` for
 `registry.terraform.io/ejc3/cloudflare`, then `terraform init -lockfile=readonly`; never use
 broad `terraform init -upgrade`, which can advance unrelated `~>` providers.
@@ -279,11 +279,12 @@ versioning and every related `prevent_destroy` guard. Never disable the Builds g
 these resources exist, and never apply a plan that replaces them without explicit recovery
 intent.
 
-**Drift CI is not currently healthy**: the scheduled workflow lacks Secrets Manager,
-Organizations, and CodeArtifact read access. Secrets Manager is the hardest of the three
-now that both the Cloudflare and GitHub providers take their tokens from there -- a plan
-cannot configure its providers without it. Do not describe the schedule as working drift
-protection until a live run succeeds.
+**GitHub runs credential-free validation, not live drift**: `drift.yml` installs locked
+providers with `-backend=false`, runs `validate`, and checks CI boundaries. Never restore
+state, secret-payload, Lambda-environment, or log-read access to make a GitHub full plan
+pass. Those reads can convey administrator credentials. Full plans belong on a jumpbox;
+a successful validation is not an empty live plan. The shared main/staging CI roles are
+retired with Deny `*`; only the owner-approved AMI publisher uses GitHub OIDC.
 
 **Optional Mac is off and its timestamp is stale**: never set `enable_mac_dev=true` without
 also supplying a new `mac_teardown_at` at least 24 hours after allocation and reviewing

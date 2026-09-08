@@ -2,7 +2,12 @@
 
 How `ejc3` repos get CI into AWS account `928413605543` (us-west-1), and what crosses
 the GitHub↔AWS boundary to make it work. Defined in `github-actions.tf`,
-`runner-autoscale.tf`, and `runner-vpc.tf`.
+`github-ami-builder.tf`, `runner-autoscale.tf`, and `runner-vpc.tf`.
+
+This stage retires the shared main/staging CI identities and switches GitHub to
+credential-free Terraform validation. It does not remove the runner PAT grant or
+change controller/runner bootstrap. That separate cutoff requires controller-first
+rollout, own/other bootstrap canaries, and a fresh in-flight runner preflight.
 
 **The model:** two integrations, opposite directions of trust. GitHub-hosted runners
 reach *into* AWS with **no stored credential** — short-lived OIDC federation. Self-hosted
@@ -11,37 +16,51 @@ secret**, a PAT in SSM. Every resource below belongs to one of those two pattern
 
 |  | Pattern A — hosted → AWS | Pattern B — self-hosted in AWS |
 |--|--|--|
-| Repos | `ejc3/aws`, `ejc3/fcvm` | `ejc3/fcvm` (uses both) |
+| Repos | `ejc3/fcvm` owner-approved AMI build only | `ejc3/fcvm` |
 | Runs on | GitHub's `ubuntu-latest` | spot `*.metal` in this account |
 | Secret across the boundary | none (federated token) | GitHub PAT + webhook HMAC |
-| What it does | Terraform drift, AMI builds, CodeArtifact | KVM/Firecracker CI that needs bare metal |
+| What it does | isolated, non-admin AMI builds | KVM/Firecracker CI that needs bare metal |
 | Credential lifetime | ~1h STS session | PAT until manually rotated |
 
 ## Pattern A — hosted runners reach into AWS with OIDC (keyless)
 
 A GitHub-hosted job authenticates to AWS by presenting an OIDC token GitHub signs for it,
 which AWS STS exchanges for a ~1-hour role session. Nothing long-lived is stored on either
-side — there is no AWS access key in repo secrets to leak or rotate.
+side — there is no AWS access key in repo secrets to leak or rotate. OIDC by itself
+does not make permissions safe: the old role could pass the administrator role to
+an EC2 instance. The dedicated role explicitly denies passing any other role.
 
 The trust chain:
 - **OIDC provider** (`aws_iam_openid_connect_provider.github`) — `token.actions.githubusercontent.com`,
   audience `sts.amazonaws.com`, thumbprint `6938fd4d98bab03faadb97b34396831e3780aea1` pinned.
-- **Role** `github-actions-terraform` — assumable only via `sts:AssumeRoleWithWebIdentity`
-  when the token's `aud` is `sts.amazonaws.com` **and** its `sub` matches
-  `repo:ejc3/aws:*` or `repo:ejc3/fcvm:*`. The `sub` is the only thing tying a given
-  GitHub repo to this role.
-- **Permissions** on that role: account-wide read-only (`Describe*`/`Get*`/`List*` across
-  ec2, iam, s3, cloudwatch, logs, rds, lambda, apigateway, budgets, ses, ssm, backup,
-  events, sns, sms-voice); Terraform state on `aws-infrastructure-*-tf-state`; the lock table
-  `ejc3-terraform-locks` (`GetItem`/`PutItem`/`DeleteItem`); an AMI-builder block
-  (`RunInstances`, `Stop`/`TerminateInstances`, `CreateImage`, `CreateTags`, `Register`/`DeregisterImage`);
-  `iam:PassRole` on `jumpbox-admin-role`; and CodeArtifact read + publish.
+- **Role** `github-actions-ami-builder` — requires audience `sts.amazonaws.com` and
+  subject `repo:ejc3/fcvm:environment:runner-ami-publish`. This GitHub environment
+  permits only the `main` deployment branch and requires approval by `ejc3` with
+  administrator bypass disabled. Collaborators can request a main build; only
+  the owner may approve publishing the image used by future shared runners.
+- **Permissions:** Canonical Ubuntu images; the isolated runner subnet/security
+  group; tagged builder instances, volumes and ENIs; image creation from those
+  builders; c7gd.8xlarge with IMDSv2 and encrypted 40 GiB gp3 root; `PassRole` only on `ami-builder-role` and
+  only to EC2. It cannot mutate IAM, assume another role, read state/SSM parameters/
+  Secrets Manager payloads, or launch the administrator profile.
+- **Builder host** `ami-builder-profile`: SSM agent connectivity and progress tags,
+  no reusable secrets or administrator delegation. CI reads progress tags, not arbitrary
+  SSM command output. Detailed builder diagnostics remain administration-only.
 
-The consumer is `.github/workflows/drift.yml` — daily at 08:00 UTC (and `workflow_dispatch`),
-requesting `id-token: write`, then `aws-actions/configure-aws-credentials@v4` with
-`role-to-assume: arn:aws:iam::928413605543:role/github-actions-terraform` and a
-`terraform plan -detailed-exitcode` to detect drift. No `aws-access-key-id` anywhere in
-the workflow.
+The consumer is fcvm's `.github/workflows/build-runner-ami.yml`, after the producer
+role/profile exists. Its `workflow_run` must require successful, same-repository
+main builds; manual dispatch of main remains available to collaborators. Checkout
+uses `github.event.workflow_run.head_sha` for automatic runs and `github.sha` for
+manual runs. Normal CI does not require this publishing approval.
+
+`ejc3/aws/.github/workflows/drift.yml` now runs **Terraform Validation**, not live
+drift: formatting, locked provider installation with `-backend=false`, `validate`,
+and offline security tests. It receives no AWS identity, state, or secret values.
+Full plans stay on an administration jumpbox. A plan reads credential-bearing state
+and refreshes managed secrets; `sensitive = true` masks display, not access. Do not
+broaden a secret policy or restore CI state access just to make a plan green.
+Both old `github-actions-terraform` identities (main and staging) are retained with
+explicit `Deny *`; they provide no authority, including for old role sessions.
 
 ## Pattern B — self-hosted autoscaling runners on spot metal
 
@@ -554,6 +573,20 @@ its termination before considering the bump accepted. Release rollout is progres
 also confirm the selected version is supported for `ejc3/fcvm`. Never bypass a checksum
 or re-enable automatic updates to work around an unreviewed wrapper change.
 
+The `Runner Release Freshness` workflow checks this source pin daily at 09:17 UTC,
+only on `ejc3/aws` main, using a GitHub-hosted runner and the anonymous public release
+API. Its checkout token is read-only and not persisted; it has no repository secrets,
+AWS credentials, OIDC, PR trigger, or auto-upgrade/deploy step. A newer stable release
+immediately fails the run with the first missed release's 30-day deadline and the
+update procedure; malformed/unavailable/truncated history also fails visibly.
+Failures use normal GitHub Actions notifications, whose delivery depends on the
+operator's notification settings. This is a reminder, not guaranteed paging or a
+substitute for critical-release monitoring: [scheduled runs can be delayed or dropped,
+and public-repository inactivity can disable schedules](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Check that the scheduled run stays enabled and recent. The check only reads git/public
+releases, not deployed SSM, so a committed but unapplied pin still needs the deployment
+and trusted-job acceptance above.
+
 This publication does not remove the old PAT permission: a job host can still read that
 PAT until the separate IAM cutoff. Require a real trusted registration/job that proves
 own-credential deletion, single-job exit, and EC2 termination, then verify old boots are
@@ -563,10 +596,10 @@ drained before removing the legacy grants. Retest the non-secret IAM canaries af
 
 | Secret | Where it lives | Direction | Who reads it | Set / rotated by |
 |--|--|--|--|--|
-| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` | manual `put-parameter`; TF stores `placeholder` with `ignore_changes = [value]` |
+| **GitHub PAT** | `/github-runner/pat`, SSM `SecureString` | GitHub-issued, stored in AWS | `github-runner-instance-role`, `github-runner-lambda-role` until the separate runner cutoff | populated out of band; refresh can persist it in protected TF state despite `ignore_changes = [value]` |
 | **Webhook HMAC** | `random_password.github_webhook` → Lambda env `WEBHOOK_SECRET` *and* the GitHub hook's `configuration.secret` | shared, both sides | the webhook Lambda; GitHub signs with it | Terraform generates it; both sides written in one apply. Rotate with `terraform apply -replace='random_password.github_webhook[0]'` |
 | **Registration token** | controller-created instance-bound SSM parameter, deleted before job startup | GitHub-issued, short-lived | controller and that booting instance | GitHub API, ~1h lifetime; controller removes expired leftovers |
-| **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | trust policy on `github-actions-terraform` |
+| **OIDC federation** | no secret — thumbprint pinned on the provider | GitHub asserts, AWS verifies | n/a | exact owner-approved environment trust on `github-actions-ami-builder` |
 | **`dev_to_runner` SSH key** | private in SSM `SecureString` `/dev-servers/runner-ssh-key`, public baked into runner `authorized_keys` | AWS-internal (dev box → runner) | dev-server role fetches the private key | TF-generated `tls_private_key` (ED25519) |
 | **`fcvm-ec2` keypair** | EC2 keypair `fcvm-ec2` (launch `KeyName`); public key baked into runner `authorized_keys` | AWS-internal (operator → runner) | whoever holds `~/.ssh/fcvm-ec2` (the jumpbox operator) | manual EC2 keypair, never rotated |
 | **Webhook admin PAT** | `github-webhook-admin-pat`, Secrets Manager `us-west-1` | GitHub-issued, stored in AWS | the `integrations/github` provider only — no instance role can read it | manual; fine-grained PAT, one permission: `Webhooks: Read and write` on `ejc3/fcvm` |
@@ -585,13 +618,15 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 ## IAM boundaries — who can read what
 
 - **`github-runner-instance-role`** (on the runner): `AmazonSSMManagedInstanceCore` for
-  Session Manager, `ssm:GetParameter` scoped to **the PAT parameter only**, and
+  Session Manager, an explicit `ssm:GetParameter` grant for the PAT, and
   `ec2:AssignIpv6Addresses` + `ec2:DescribeNetworkInterfaces` (`Resource: *`, for the
   boot-time IPv6 self-assign); and `dynamodb:GetItem` + `dynamodb:PutItem` on
   `github-runner-registration`, restricted by `dynamodb:LeadingKeys` to
   `${ec2:SourceInstanceARN}`, so a runner can claim and read its own row and no other
-  (no `Scan`, `Query`, `UpdateItem` or `DeleteItem`). A runner cannot read the
-  `dev_to_runner` key or any other parameter.
+  (no `Scan`, `Query`, `UpdateItem` or `DeleteItem`). The managed SSM core policy
+  additionally allows `GetParameter`/`GetParameters` account-wide, including the
+  `dev_to_runner` key. This remains a risk until the separately canaried runner
+  policy cutoff; the additive bootstrap grant does not remove it.
 - **`github-runner-lambda-role`** (both Lambdas): logs; EC2
   `Describe`/`Run`/`Stop`/`Terminate`/`CreateTags`; `iam:PassRole` only on
   `github-runner-instance-role` and only to EC2, with explicit denies for other
@@ -599,8 +634,11 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
   `cloudwatch:GetMetricStatistics`; `ssm:GetParameter` on `/github-runner/*`;
   `lambda:InvokeFunction` on the webhook function (for the cleanup retry); and
   `dynamodb:GetItem` + `dynamodb:PutItem` on the registration table, for the cleanup claim.
-- **`github-actions-terraform`** (Pattern A): the read-only + state + AMI-builder set above.
-  Its only write into IAM is `PassRole` on `jumpbox-admin-role`.
+- **`github-actions-terraform`** (main and staging): explicit Deny `*`, no AWS
+  authority, state, or secret payload access. Old CodeArtifact token/publisher
+  resource-policy grants are removed; repositories and packages are retained.
+- **`github-actions-ami-builder`** (Pattern A): the exact owner-approved environment
+  and least-privilege build permissions above. No administrator delegation.
 
 ## Network posture
 
@@ -652,11 +690,6 @@ Closed (were sharp edges, now hardened):
 
 Still open (accepted for now):
 
-- **The OIDC role is admin-capable by composition.** Its inline policy reads as scoped, but
-  `ec2:RunInstances` (`Resource: *`) plus `iam:PassRole` on `jumpbox-admin-role` (which
-  carries `AdministratorAccess`) lets a run launch an instance under the admin profile and
-  act as admin from there. The `sub` is `repo:ejc3/aws:*` / `repo:ejc3/fcvm:*` — any ref,
-  not pinned to a protected branch or a GitHub environment.
 - **PAT blast radius.** `/github-runner/pat` can register and remove runners on `ejc3/fcvm`;
   any process on a runner that reaches instance-role SSM can read it. Self-hosted runners and
   untrusted PRs don't mix.
@@ -665,12 +698,38 @@ Still open (accepted for now):
 
 ### Temporary runner credential-boundary acceptance
 
-`runner-bootstrap-canary.tf` creates two small Amazon Linux 2023 ARM instances in the
-existing runner network, with the actual `github-runner-profile`, and two **non-credential**
-SecureString fixtures bound to their current instance ARNs. These are IAM test machines,
-not CI runners: no repository, runner registration, job, or personal login is installed.
-Their `Role=runner-iam-canary` excludes them from runner autoscaling and cleanup. Unlike the
-original PR #69 fixtures, they do not depend on already-expired CI instance IDs.
+This source removes the temporary `runner-bootstrap-canary.tf` fixtures for cost cleanup.
+This cleanup can proceed while real broker-job acceptance is capacity-blocked. Removal
+does not mean the runner IAM cutoff passed: its job/deletion/drain/after-canary gates still apply.
+The acceptance checker and offline tests remain in `scripts/` for the next reviewed test.
+
+Before applying this cleanup, inspect a fresh full plan and require **only these four
+managed-resource destroys**, with no creates, updates, or other destroys:
+
+```text
+aws_instance.runner_iam_canary["first"]
+aws_instance.runner_iam_canary["second"]
+aws_ssm_parameter.runner_iam_canary["first"]
+aws_ssm_parameter.runner_iam_canary["second"]
+```
+
+These are two small Amazon Linux IAM-test hosts (`Role=runner-iam-canary`, no jobs,
+repositories, registrations, or personal logins) and two literal non-credential
+SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
+runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is removed.
+Until the cleanup is applied and checked, the fixtures may still be live. After applying,
+verify the exact two instances terminated, their root volumes deleted, and their two
+`/github-runner/bootstrap/security-canary-20260908-*` parameters absent. Do not describe
+them as cleaned up based on a git merge alone. `RemoveAfter=2026-09-08` was only a reminder,
+not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
+instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
+
+For a later acceptance window, restore the [reviewed fixture template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
+in a new Terraform PR. Revalidate its AMI availability and removal date, keep fixture
+names aligned with the checker, and bind each fixture to the **new** instance ARN.
+Apply and verify those four test resources first; the checker intentionally fails when
+the required pair is absent. Never bypass an acceptance gate because the prior fixtures
+were removed, and never read a real PAT or registration token as a substitute.
 
 Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
 
@@ -692,21 +751,14 @@ have drained may the runner's broad SSM attachment/PAT grant be retired. Re-run 
 `--phase after` and verify the SSM agent still checks in. Do not combine these deployment
 gates into an unobserved single apply.
 
-The pair costs approximately **$0.032/hour** in `us-west-1` at the 2026-09-08 prices:
-two $0.010/hour instances, two $0.005/hour public IPv4 addresses, and 16 GiB total gp3 at
-$0.096/GiB-month, excluding tiny API/KMS/data-transfer usage. CPU credit mode is `standard`.
-Remove `runner-bootstrap-canary.tf` in a reviewed follow-up and apply a plan destroying
-only its two instances and two fixtures. Root volumes delete with the instances; no EIP,
-snapshot, or backup is created. Verify no matching running instance or parameter remains.
-The `RemoveAfter` tag is only a reminder and **does not shut these machines down**.
-
 - All of Pattern B is gated on `var.enable_github_runner` — flip it to `false` to tear the
   self-hosted side down. Two applies now: `aws_dynamodb_table.runner_registration` sets
   `deletion_protection_enabled = true`, so clear that first. Replacing that table while
   runners are live removes the registration row of every running instance; none is reaped
   for it (a runner GitHub still lists, or one carrying `RunnerSeenAt`, is held to the
   ceiling) but every new boot fails closed until the table is back.
-- Set the PAT out of band (it's never in Terraform state):
+- Populate the PAT out of band; Terraform refresh can retain it in protected state
+  even with `ignore_changes = [value]`. Never print it or grant CI backend access:
   `aws ssm put-parameter --name /github-runner/pat --value ghp_xxx --type SecureString --overwrite`.
 - The webhook is Terraform's, both halves. It is `github_repository_webhook.runner`, pointed
   at `runner_webhook_url`, event `workflow_job`, secret generated by
@@ -720,5 +772,11 @@ The `RemoveAfter` tag is only a reminder and **does not shut these machines down
 
   Rotate the HMAC with `terraform apply -replace='random_password.github_webhook[0]'`; the
   same apply writes both sides.
-- Pattern A needs nothing in GitHub but the workflow's `permissions: id-token: write` and the
-  role ARN — no repo secret to manage.
+- Pattern A requires the workflow's `permissions: id-token: write`, the dedicated
+  `github-actions-ami-builder` role ARN, and `environment: runner-ami-publish`.
+  Before enabling the publisher, restore and read back the environment using
+  `.github/runner-ami-environment.json` and the recovery steps in `README.md`:
+  only `ejc3` may approve, administrator bypass is disabled, and the sole deployment
+  branch policy is `main` with no allowed tags. The role checks the exact environment
+  OIDC subject; omitting the environment fails role assumption. No AWS repo secret
+  is required.

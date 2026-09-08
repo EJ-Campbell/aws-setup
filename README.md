@@ -12,7 +12,7 @@ Cloudflare, and several regions. The platform provides:
 - ephemeral high-speed shared storage and on-demand 96/192-core compute;
 - autoscaled ARM64 and x86 GitHub Actions runners;
 - backups, cross-region/cross-account recovery, and cost alerts;
-- a scheduled drift-detection workflow whose current IAM path is incomplete;
+- credential-free Terraform validation in GitHub, with live plans confined to admin hosts;
 - scoped IAM capabilities for agents, including temporary EBS volumes and Bedrock access.
 
 ## Start here
@@ -56,7 +56,7 @@ review and commit any intentional provider upgrade.
 
 `main.tf` enforces Terraform `1.10.3`, which is the version on both jumpboxes and supports
 the ephemeral Workers Builds control-token read. Any Terraform upgrade must update the
-constraint, both jumpboxes, and the drift workflow together.
+constraint, both jumpboxes, and the Terraform validation workflow together.
 
 Cloudflare is intentionally pinned to the signed `ejc3/cloudflare` `5.24.0`
 provider release. That fork adds typed Worker-native Access destinations and the Workers
@@ -736,6 +736,9 @@ has separate deployment gates; merging source is not evidence that a gate is liv
    The runner release and asset checksums are pinned and automatic updates disabled;
    review each release bump before GitHub's 30-day update deadline (immediately for
    required critical fixes), following the [runner update procedure](GITHUB-RUNNERS.md#instance-bound-single-job-bootstrap).
+   A daily main-only `Runner Release Freshness` workflow fails when a newer stable
+   version exists; it never upgrades or deploys automatically. Keep its scheduled
+   runs and GitHub failure notifications enabled.
 4. Retire runner PAT reads and the broad SSM attachment only after those tests. Narrow
    the remaining controller EC2 launch resources after all launched resources carry
    the required tags. The old CI authority is retired separately, only after the
@@ -749,19 +752,33 @@ orphan has expired out of AWS. See [controller-first migration](GITHUB-RUNNERS.m
 for the protocol and failure behavior. An additive apply alone does not close the old
 PAT or CI escalation paths.
 
+The temporary runner IAM fixture source is removed for cost cleanup, independently of
+those still-required acceptance gates. Apply only a fresh plan deleting its two canary
+hosts and two non-credential parameters, then verify their absence; a merge alone does
+not stop billing. Before any later cutoff, recreate fresh Terraform-managed fixtures
+and repeat the required checks. The checker/tests and [exact cleanup/recreation scope](GITHUB-RUNNERS.md#temporary-runner-credential-boundary-acceptance)
+are retained; this cleanup does not retire runner PAT permissions or authorize skipping
+real broker-job acceptance.
+
 The repository also manages:
 
 - a private CodeArtifact npm repository in `us-west-2`;
-- GitHub OIDC roles for drift detection and AMI builds;
-- a separate administrator deploy role inside the `dev-staging` account;
-- a daily Terraform drift workflow on `main`.
+- an owner-approved GitHub OIDC role for runner AMI builds;
+- retired shared main/staging CI identities with explicit denial of all AWS actions;
+- credential-free Terraform validation on pull requests, main pushes, a daily schedule,
+  and manual dispatch.
 
-The drift workflow is not currently healthy: recent scheduled runs fail because its OIDC
-role cannot read the Secrets Manager, Organizations, and CodeArtifact data required by a
-full refresh. Secrets Manager is now the harder blocker of the three -- the Cloudflare and
-GitHub provider tokens both come from there, so a plan cannot even configure its providers
-without that read. Treat drift detection as scheduled but non-functional until that IAM gap
-is fixed.
+The historical `drift.yml` now runs **Terraform Validation**: formatting, locked provider
+installation with `-backend=false`, configuration validation, and CI boundary tests. It
+does not request an OIDC token, assume an AWS role, or read state or secret payloads.
+Full Terraform plans run only on an administration jumpbox. Even a read-only plan loads
+credential-bearing state and configures privileged Cloudflare/GitHub providers; calling
+that permission set read-only would not prevent administrator access through those secrets.
+A green validation check is not evidence of zero live drift.
+
+This CI identity retirement does not change runner bootstrap, controller behavior, or the
+existing runner PAT grant. Those require a separate controller-first deployment, harmless
+own-versus-other bootstrap canaries, and an in-flight runner check before the PAT cutoff.
 
 ## Bootstrap, authentication, and convergence
 
@@ -980,6 +997,9 @@ do not prove existing hosts or disks have been remediated.
 
 ## Security monitoring rollout
 
+This paid monitoring rollout remains unapplied pending owner cost approval. Deploying
+the separate free controls does not authorize this stage.
+
 `security-monitoring.tf` and `modules/security-region/main.tf` define the monitoring
 foundation in both accounts across all 17 currently enabled regions (34 account/region
 pairs). The foundation records organization-wide management events and object access
@@ -1020,10 +1040,10 @@ second detector. A failed live-property postcondition requires an administrator 
 diagnose and review a repair or future typed-resource migration; it does not perform
 automatic remediation. Never remove `prevent_destroy` merely to make a plan pass.
 
-After the separate 102 regional defaults and 36 external-analysis resources, the
-monitoring foundation adds 225 managed Terraform resource instances plus one existing
-SNS topic-policy update; the posture
-gate adds 45 more. These are source counts, not
+After the separate 102 regional defaults, 36 external-analysis resources and two
+global S3 controls, the monitoring foundation adds 225 managed Terraform resource
+instances plus one existing SNS topic-policy update; the posture gate adds 45 more.
+These are source counts, not
 a substitute for the fresh plan. Many are free control settings or permissions, not
 individually billed workloads. No existing compute, volume or backup resource should
 be replaced by this rollout.
@@ -1086,6 +1106,37 @@ not measured forecasts or a spending cap. Review Cost Explorer usage types and G
 usage statistics after the first complete week; initial Config inventory, rapid runner
 churn or unusually noisy network activity can raise the bill. The existing account-wide
 cost alerts remain useful, but do not enforce a monitoring-only budget limit.
+
+## Account-wide S3 public-access blocking
+
+`security-s3-account.tf` manages two global account controls, one each for main
+and recovery, with all four S3 Block Public Access flags enabled. They cover current
+and future buckets/access points in every region; unlike the future-only EBS defaults,
+these controls can also block existing public access. They do not rewrite bucket
+policies/ACLs, migrate disks, create paid monitoring services, or change public SSH,
+Cloudflare service-token access or the verified backup pipeline.
+
+Before deployment, the September 8, 2026 16:41 UTC read-only inventory found six main
+account buckets and no recovery-account buckets. All six already had all four
+bucket-level blocks, `BucketOwnerEnforced`, no bucket policies, no effective public
+ACL grants and no S3 website configuration. All 34 regional access-point listings
+and both multi-region listings were empty. No objects were enumerated or read.
+Private operator evidence is in
+`/tmp/aws-guardrails-review.inJgVqJ5/s3-public-metadata.json` and
+`s3-access-point-metadata.json`; these ephemeral files are not cold-bootstrap inputs.
+Recheck metadata if inventory changes before apply.
+
+S3 combines account, bucket and access-point settings using the most restrictive
+values. Fixed-principal private sharing remains possible; a public bucket policy can
+cause `RestrictPublicBuckets` to block even its otherwise private cross-account grants.
+Review intended S3 websites/sharing before changing these controls, and do not disable
+the account block to make an unreviewed public policy pass. See
+[AWS Block Public Access semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html).
+Expect a fresh full plan with exactly two account-setting creates and no bucket,
+object, policy or backup changes. After applying, require an empty follow-up plan and
+read back `s3control get-public-access-block --account-id <account-id>` under each
+account's verified credentials: all four flags must be true. Account-wide settings
+propagate globally but not necessarily simultaneously across regions.
 
 ## External access findings
 
@@ -1461,6 +1512,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Recovery and monitoring | `backups.tf`, `backup-security.tf`, `security-monitoring.tf`, `modules/security-region/main.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Free external-access findings | `security-external-access.tf` |
+| Global S3 public-access defaults | `security-s3-account.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |

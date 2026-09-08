@@ -37,54 +37,9 @@ resource "aws_codeartifact_repository" "npm_upstream" {
   tags = { Name = "ejc3-npm-upstream" }
 }
 
-# Domain policy — allow the GitHub Actions role to get auth tokens
-resource "aws_codeartifact_domain_permissions_policy" "main" {
-  provider = aws.usw2
-  domain   = aws_codeartifact_domain.main.domain
-
-  policy_document = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "GitHubActionsGetToken"
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.github_actions_terraform.arn }
-        Action    = "codeartifact:GetAuthorizationToken"
-        Resource  = aws_codeartifact_domain.main.arn
-      }
-    ]
-  })
-}
-
-# Repository policy — allow GitHub Actions role to publish and read
-resource "aws_codeartifact_repository_permissions_policy" "npm" {
-  provider   = aws.usw2
-  repository = aws_codeartifact_repository.npm.repository
-  domain     = aws_codeartifact_domain.main.domain
-
-  policy_document = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "GitHubActionsPublish"
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.github_actions_terraform.arn }
-        Action = [
-          "codeartifact:PublishPackageVersion",
-          "codeartifact:PutPackageMetadata",
-          "codeartifact:ReadFromRepository",
-          "codeartifact:DescribePackageVersion",
-          "codeartifact:GetPackageVersionReadme",
-          "codeartifact:GetRepositoryEndpoint",
-          "codeartifact:ListPackageVersions",
-          "codeartifact:ListPackages",
-          "codeartifact:DeletePackageVersions"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
+# Same-account dev publishers continue using their identity policies. Remove the
+# old shared CI role's resource-policy token/publish grants; the repositories and
+# existing packages remain intact. CI has no replacement package-publishing grant.
 
 # Outputs
 output "npm_registry_domain" {
