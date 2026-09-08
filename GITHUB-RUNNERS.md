@@ -698,12 +698,38 @@ Still open (accepted for now):
 
 ### Temporary runner credential-boundary acceptance
 
-`runner-bootstrap-canary.tf` creates two small Amazon Linux 2023 ARM instances in the
-existing runner network, with the actual `github-runner-profile`, and two **non-credential**
-SecureString fixtures bound to their current instance ARNs. These are IAM test machines,
-not CI runners: no repository, runner registration, job, or personal login is installed.
-Their `Role=runner-iam-canary` excludes them from runner autoscaling and cleanup. Unlike the
-original PR #69 fixtures, they do not depend on already-expired CI instance IDs.
+This source removes the temporary `runner-bootstrap-canary.tf` fixtures for cost cleanup.
+This cleanup can proceed while real broker-job acceptance is capacity-blocked. Removal
+does not mean the runner IAM cutoff passed: its job/deletion/drain/after-canary gates still apply.
+The acceptance checker and offline tests remain in `scripts/` for the next reviewed test.
+
+Before applying this cleanup, inspect a fresh full plan and require **only these four
+managed-resource destroys**, with no creates, updates, or other destroys:
+
+```text
+aws_instance.runner_iam_canary["first"]
+aws_instance.runner_iam_canary["second"]
+aws_ssm_parameter.runner_iam_canary["first"]
+aws_ssm_parameter.runner_iam_canary["second"]
+```
+
+These are two small Amazon Linux IAM-test hosts (`Role=runner-iam-canary`, no jobs,
+repositories, registrations, or personal logins) and two literal non-credential
+SecureStrings. Their two 8 GiB roots delete with the instances; no EIP, snapshot, backup,
+runner role/profile, Lambda, network, DynamoDB table/row, or real CI host is removed.
+Until the cleanup is applied and checked, the fixtures may still be live. After applying,
+verify the exact two instances terminated, their root volumes deleted, and their two
+`/github-runner/bootstrap/security-canary-20260908-*` parameters absent. Do not describe
+them as cleaned up based on a git merge alone. `RemoveAfter=2026-09-08` was only a reminder,
+not an automatic expiry policy. Removing the pair stops approximately $0.032/hour of
+instance/public-IPv4/gp3 charges at the original prices, excluding small API usage.
+
+For a later acceptance window, restore the [reviewed fixture template from PR #69](https://github.com/ejc3/aws/blob/38452b036af7cde46fd8da189e3feab687b40bca/runner-bootstrap-canary.tf)
+in a new Terraform PR. Revalidate its AMI availability and removal date, keep fixture
+names aligned with the checker, and bind each fixture to the **new** instance ARN.
+Apply and verify those four test resources first; the checker intentionally fails when
+the required pair is absent. Never bypass an acceptance gate because the prior fixtures
+were removed, and never read a real PAT or registration token as a substitute.
 
 Run from the jumpbox after Terraform applies the four temporary resources and SSH is ready:
 
@@ -724,14 +750,6 @@ one-host credential before accepting a job, and completes trusted CI. Only after
 have drained may the runner's broad SSM attachment/PAT grant be retired. Re-run with
 `--phase after` and verify the SSM agent still checks in. Do not combine these deployment
 gates into an unobserved single apply.
-
-The pair costs approximately **$0.032/hour** in `us-west-1` at the 2026-09-08 prices:
-two $0.010/hour instances, two $0.005/hour public IPv4 addresses, and 16 GiB total gp3 at
-$0.096/GiB-month, excluding tiny API/KMS/data-transfer usage. CPU credit mode is `standard`.
-Remove `runner-bootstrap-canary.tf` in a reviewed follow-up and apply a plan destroying
-only its two instances and two fixtures. Root volumes delete with the instances; no EIP,
-snapshot, or backup is created. Verify no matching running instance or parameter remains.
-The `RemoveAfter` tag is only a reminder and **does not shut these machines down**.
 
 - All of Pattern B is gated on `var.enable_github_runner` — flip it to `false` to tear the
   self-hosted side down. Two applies now: `aws_dynamodb_table.runner_registration` sets
