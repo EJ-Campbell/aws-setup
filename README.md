@@ -933,6 +933,48 @@ The jumpbox's gp3 volumes are capped at 125 MB/s. Never run broad recursive sear
 searches to the repository, prefer `rg`, and move large scans/builds to ARM or the parallel
 box.
 
+## Regional security defaults
+
+`security-defaults.tf` manages 102 account settings: three defaults across 17 enabled
+regions in both the main and recovery accounts (34 account/region combinations).
+Coverage is `ap-south-1`, `ap-northeast-{1,2,3}`, `ap-southeast-{1,2}`, `ca-central-1`,
+`eu-central-1`, `eu-north-1`, `eu-west-{1,2,3}`, `sa-east-1`, `us-east-{1,2}` and
+`us-west-{1,2}`. Newly enabled regions must be added explicitly; this does not enable
+opt-in regions. `security-regions.tf` reuses the existing primary/DR providers and
+adds only the missing regional aliases, with the existing recovery-account admin role.
+
+- EBS encryption by default protects new volumes and new snapshot copies. Existing
+  disks and snapshots are not re-encrypted; snapshots of an existing volume still
+  inherit that volume's encryption. No KMS key is created or changed. The deferred
+  existing-disk migration is not part of this rollout. See [EBS encryption defaults](https://docs.aws.amazon.com/ebs/latest/userguide/encryption-by-default.html).
+- Snapshot `block-all-sharing` prevents new public sharing and also blocks public
+  access to already-public owned snapshots. Private sharing and cross-account backups
+  remain allowed. It does not erase the underlying public permission: disabling the
+  block could re-expose old public snapshots. EBS-backed AMI public sharing is a
+  separate control. See [snapshot public-access blocking](https://docs.aws.amazon.com/ebs/latest/userguide/block-public-access-snapshots.html).
+- IMDS `HttpTokens=required` is the default for future launches, not hard enforcement:
+  explicit launch options can override it. Existing instances are not changed. The
+  pinned provider also writes `no-preference` for the regional endpoint/tag defaults
+  and `-1` for the hop limit, matching the September 8 inventory's unset values.
+  Review any non-default regional metadata setting before applying. See [regional IMDS defaults](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-IMDS-new-instances.html).
+
+These settings have no recurring service subscription and create no detectors, log
+pipelines, keys or compute. Ordinary future storage, copy and KMS usage still costs
+money; in particular copying with a different key can require a full snapshot copy.
+This is separate from the paid monitoring rollout awaiting approval, not evidence
+that security logging/detection is active. Public SSH/ET, Cloudflare Access service-token access and
+the verified backup plans, recovery history and cleanup permissions remain unchanged.
+
+Before applying, read the full fresh plan: expect only these regional account settings,
+no instance, volume, backup or access-policy changes. Inventory owned publicly restorable
+snapshots in both accounts using `describe-snapshots --owner-ids <account-id>
+--restorable-by-user-ids all` in every listed region; investigate any result before
+changing its public visibility. After applying, require an empty follow-up plan and
+read back `get-ebs-encryption-by-default`, `get-snapshot-block-public-access-state` and
+`get-instance-metadata-defaults` in all 34 combinations. Expect `true`,
+`block-all-sharing` and `AccountLevel.HttpTokens=required`, respectively. Account defaults
+do not prove existing hosts or disks have been remediated.
+
 ## Private browser manager
 
 `browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
@@ -1274,6 +1316,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | Shared I/O and burst compute | `io-box.tf`, `parallel-box.tf`, `parallel-box-watchdog.tf`, `scripts/parallel-box.sh` |
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
+| Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
