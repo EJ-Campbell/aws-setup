@@ -961,7 +961,8 @@ Security findings and high-risk IAM, network, KMS and backup changes forward to 
 existing confirmed `cost-alerts` SNS topic. Normal processing/checkpoint cleanup does
 not page the owner; deletion attempts against legacy/final backup history do. Every
 regional forwarder has an encrypted 14-day dead-letter queue. A five-minute read-only
-watchdog checks failed deliveries and queued events in all 34 pairs, with independent
+watchdog verifies enabled rules and exact targets (destination, execution role, retries
+and DLQ), then checks failed deliveries and queued events in all 34 pairs, with independent
 missing-heartbeat and Lambda-error alarms. It never consumes or deletes queued events.
 The S3 audit archive has 90-day **governance** retention and one-year expiry; privileged
 administrators can bypass governance, unlike the recovery vault's compliance lock.

@@ -40,6 +40,7 @@ locals {
     "RDS_LOGIN_EVENTS", "LAMBDA_NETWORK_LOGS", "RUNTIME_MONITORING",
     "AI_PROTECTION", "AI_ANALYST",
   ]
+  guardduty_runtime_agents = ["EKS_ADDON_MANAGEMENT", "ECS_FARGATE_AGENT_MANAGEMENT", "EC2_AGENT_MANAGEMENT"]
 }
 
 # The live regional CloudFormation schema accepts current feature names. All
@@ -53,7 +54,7 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
     Features = [for name in local.guardduty_optional_features : merge({
       Name = name, Status = "DISABLED"
       }, name == "RUNTIME_MONITORING" ? {
-      AdditionalConfiguration = [for agent in ["EKS_ADDON_MANAGEMENT", "ECS_FARGATE_AGENT_MANAGEMENT", "EC2_AGENT_MANAGEMENT"] : {
+      AdditionalConfiguration = [for agent in local.guardduty_runtime_agents : {
         Name = agent, Status = "DISABLED"
       }]
     } : {})]
@@ -75,6 +76,14 @@ resource "aws_cloudcontrolapi_resource" "guardduty" {
         contains(["FLOW_LOGS", "CLOUD_TRAIL", "DNS_LOGS"], feature.Name) || feature.Status == "DISABLED"
       ]), false)
       error_message = "GuardDuty optional feature readback differs from the reviewed disabled set; do not accept hidden enrollment or omit an unsupported regional feature silently."
+    }
+    postcondition {
+      condition = try(alltrue([for agent in local.guardduty_runtime_agents :
+        lookup({ for setting in one([for feature in jsondecode(self.properties).Features : feature if feature.Name == "RUNTIME_MONITORING"]).AdditionalConfiguration : setting.Name => setting.Status }, agent, "MISSING") == "DISABLED"
+        ]) && alltrue(flatten([for feature in jsondecode(self.properties).Features :
+          [for setting in try(feature.AdditionalConfiguration, []) : setting.Status == "DISABLED"]
+      ])), false)
+      error_message = "GuardDuty nested agent-management readback must explicitly disable every configured agent, even when Runtime Monitoring itself is disabled."
     }
   }
 }

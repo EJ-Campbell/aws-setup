@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import types
@@ -31,6 +33,7 @@ REGIONS = re.findall(r'"([a-z]{2}-[a-z]+-\d)"', re.search(
     r"security_delivery_regions = \[(.*?)\n  \]", TERRAFORM, re.S
 ).group(1))
 MAIN, STAGING = "111111111111", "222222222222"
+SNS_TOPIC = "arn:aws:sns:us-west-1:" + MAIN + ":cost-alerts"
 NOW = datetime.datetime(2026, 9, 7, 12, tzinfo=datetime.timezone.utc)
 COUNTERS = ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible", "ApproximateNumberOfMessagesDelayed"]
 
@@ -73,6 +76,49 @@ class SQS:
         return {"Attributes": copy.deepcopy(result)}
 
 
+class Events:
+    def __init__(self, factory, account, region):
+        self.factory, self.account, self.region = factory, account, region
+
+    def describe_rule(self, **kwargs):
+        self.factory.rule_reads.append((self.account, self.region, kwargs))
+        name, bus = kwargs["Name"], kwargs.get("EventBusName")
+        response = {"Name": name, "State": "ENABLED",
+                    "Arn": "arn:aws:events:" + self.region + ":" + self.account + ":rule/" + (bus + "/" if bus else "") + name}
+        if name == "security-delivery-health":
+            response["ScheduleExpression"] = "rate(5 minutes)"
+        override = self.factory.rules.get((self.account, self.region, name))
+        if isinstance(override, Exception):
+            raise override
+        return override(copy.deepcopy(response)) if override else response
+
+    def list_targets_by_rule(self, **kwargs):
+        self.factory.target_reads.append((self.account, self.region, kwargs))
+        assert kwargs["Limit"] == 2 and "NextToken" not in kwargs
+        rule = kwargs["Rule"]
+        if rule == "security-forward-findings":
+            target = {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:" + MAIN + ":event-bus/security-alerts",
+                      "RoleArn": "arn:aws:iam::" + self.account + ":role/security-findings-forward",
+                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:" + self.region + ":" + self.account + ":security-findings-delivery-dlq"},
+                      "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+        elif rule == "security-alerts-notify":
+            target = {"Id": "confirmed-operator-email", "Arn": SNS_TOPIC,
+                      "RoleArn": "arn:aws:iam::" + MAIN + ":role/security-alerts-notify",
+                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"},
+                      "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+        elif rule == "security-delivery-health":
+            target = {"Id": rule, "Arn": "arn:aws:lambda:us-west-1:" + MAIN + ":function:security-delivery-health",
+                      "DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:" + MAIN + ":security-central-delivery-dlq"},
+                      "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}}
+        else:
+            raise AssertionError("Unexpected rule " + rule)
+        response = {"Targets": [target]}
+        override = self.factory.targets.get((self.account, self.region, rule))
+        if isinstance(override, Exception):
+            raise override
+        return override(copy.deepcopy(response)) if override else response
+
+
 class STS:
     def __init__(self, factory):
         self.factory = factory
@@ -98,6 +144,8 @@ class Session:
             return CloudWatch(self.factory, self.account, region_name)
         if name == "sqs":
             return SQS(self.factory, self.account, region_name)
+        if name == "events":
+            return Events(self.factory, self.account, region_name)
         if name == "sts" and self.account == MAIN:
             return STS(self.factory)
         raise AssertionError("Unexpected AWS capability: " + name)
@@ -108,6 +156,8 @@ class Factory:
         self.main_thread = threading.get_ident()
         self.reads, self.queue_reads, self.published, self.assumed = [], [], [], []
         self.metrics, self.queues, self.client_errors = {}, {}, set()
+        self.rules, self.targets = {}, {}
+        self.rule_reads, self.target_reads = [], []
         self.assume_error = self.publish_error = False
 
     def Session(self, **kwargs):
@@ -146,7 +196,7 @@ class DeliveryTests(unittest.TestCase):
         self.module = load(self.factory)
 
     def run_handler(self, regions=None, extra=None):
-        env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS)}
+        env = {"MAIN_ACCOUNT": MAIN, "STAGING_ACCOUNT": STAGING, "REGIONS": json.dumps(regions or REGIONS), "SNS_TOPIC_ARN": SNS_TOPIC}
         env.update(extra or {})
         output = io.StringIO()
         with patch.dict(os.environ, env), contextlib.redirect_stdout(output):
@@ -155,7 +205,7 @@ class DeliveryTests(unittest.TestCase):
 
     def inspect(self, account=MAIN, region="us-east-1"):
         return self.module["inspect_region"](CloudWatch(self.factory, account, region),
-            SQS(self.factory, account, region), account, region, MAIN, NOW)
+            SQS(self.factory, account, region), Events(self.factory, account, region), account, region, MAIN, SNS_TOPIC, NOW)
 
     def test_complete_empty_failure_metrics_are_healthy(self):
         values, log = self.run_handler()
@@ -171,6 +221,59 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(requested, 72)
         self.assertEqual(requested * 288 * 30, 622080)
         self.assertEqual(len(self.factory.queue_reads), 35)
+        self.assertEqual(len(self.factory.rule_reads), 36)
+        self.assertEqual(len(self.factory.target_reads), 36)
+
+    def test_disabled_missing_or_wrong_rule_is_not_a_healthy_quiet_region(self):
+        for override in (lambda r: dict(r, State="DISABLED"), lambda r: {},
+                         lambda r: dict(r, Name="other"), lambda r: dict(r, Arn="other"),
+                         RuntimeError("ResourceNotFoundException"), TimeoutError("private diagnostic")):
+            with self.subTest(override=override):
+                self.factory.rules[(MAIN, "us-east-1", "security-forward-findings")] = override
+                values, log = self.run_handler(["us-east-1"])
+                self.assertGreaterEqual(values["ObserverErrors"], 1)
+                self.assertEqual(values["FailedDeliveries"], 0)
+                self.assertEqual(values["QueuedEvents"], 0)
+                self.assertNotIn("private diagnostic", json.dumps(log))
+
+    def test_removed_duplicate_paginated_or_denied_targets_fail_closed(self):
+        for override in (lambda r: {"Targets": []}, lambda r: {},
+                         lambda r: {"Targets": r["Targets"] * 2}, lambda r: dict(r, NextToken="do-not-follow"),
+                         RuntimeError("AccessDenied"), TimeoutError("private diagnostic")):
+            with self.subTest(override=override):
+                self.factory.targets[(STAGING, "us-east-1", "security-forward-findings")] = override
+                values, _ = self.run_handler(["us-east-1"])
+                self.assertGreaterEqual(values["ObserverErrors"], 1)
+
+    def test_target_destination_role_dlq_retries_and_payload_are_exact(self):
+        for rule in ("security-forward-findings", "security-alerts-notify", "security-delivery-health"):
+            for key, value in (("Arn", "arn:foreign"), ("RoleArn", "arn:foreign"), ("Id", "other"),
+                               ("DeadLetterConfig", {}), ("RetryPolicy", {}), ("Input", "{}"),
+                               ("InputTransformer", {})):
+                def change(response):
+                    response["Targets"][0][key] = value
+                    return response
+                with self.subTest(rule=rule, key=key):
+                    self.factory.targets = {(MAIN, "us-west-1", rule): change}
+                    self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+
+    def test_central_rules_and_watchdog_schedule_are_independently_checked(self):
+        for rule in ("security-alerts-notify", "security-delivery-health"):
+            with self.subTest(rule=rule):
+                self.factory.rules = {(MAIN, "us-west-1", rule): lambda r: dict(r, State="DISABLED")}
+                self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        self.factory.rules = {(MAIN, "us-west-1", "security-delivery-health"): lambda r: dict(r, ScheduleExpression="rate(1 day)")}
+        self.assertGreaterEqual(self.inspect(region="us-west-1")["errors"], 1)
+        central = [request for _, _, request in self.factory.rule_reads if request["Name"] == "security-alerts-notify"]
+        self.assertTrue(all(request["EventBusName"] == "security-alerts" for request in central))
+
+    def test_event_api_failure_does_not_skip_other_read_only_health_checks(self):
+        self.factory.rules[(MAIN, "us-east-1", "security-forward-findings")] = TimeoutError("unavailable")
+        result = self.inspect()
+        self.assertEqual(result["errors"], 1)
+        self.assertEqual(len(self.factory.target_reads), 1)
+        self.assertEqual(len(self.factory.reads), 1)
+        self.assertEqual(len(self.factory.queue_reads), 1)
 
     def test_metric_names_case_dimensions_and_query_window(self):
         self.inspect(region="us-west-1")
@@ -296,7 +399,9 @@ class DeliveryTests(unittest.TestCase):
         for invalid in ([], ["us-east-1"] * 18, ["us-east-1", "us-east-1"], [None], [{}], ["../host"], "us-east-1"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.run_handler(extra={"REGIONS": json.dumps(invalid)})
-        for invalid in ({"MAIN_ACCOUNT": "invalid"}, {"STAGING_ACCOUNT": MAIN}):
+        for invalid in ({"MAIN_ACCOUNT": "invalid"}, {"STAGING_ACCOUNT": MAIN},
+                        {"SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:" + MAIN + ":wrong-region"},
+                        {"SNS_TOPIC_ARN": "arn:aws:sns:us-west-1:" + STAGING + ":wrong-account"}):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 self.run_handler(extra=invalid)
         self.assertEqual(self.factory.assumed, [])
@@ -348,6 +453,45 @@ class TerraformSafetyTests(unittest.TestCase):
         self.assertIn('jsondecode(self.properties).Enable == true', detector)
         self.assertIn('name, "MISSING") == "DISABLED"', detector)
         self.assertIn('feature.Status == "DISABLED"', detector)
+
+    def test_guardduty_nested_agent_postcondition_is_strict(self):
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        agents = re.search(r'guardduty_runtime_agents\s*=\s*(\[[^]]+\])', REGIONAL)
+        self.assertIsNotNone(agents)
+        self.assertEqual(set(json.loads(agents.group(1))),
+                         {"EKS_ADDON_MANAGEMENT", "ECS_FARGATE_AGENT_MANAGEMENT", "EC2_AGENT_MANAGEMENT"})
+        self.assertIn('AdditionalConfiguration = [for agent in local.guardduty_runtime_agents', detector)
+        self.assertIn('agent, "MISSING") == "DISABLED"', detector)
+        self.assertIn('setting.Status == "DISABLED"', detector)
+
+    @unittest.skipUnless(os.environ.get("SECURITY_TEST_TERRAFORM"), "optional native HCL fixture check; SDK-free static guard runs above")
+    def test_actual_guardduty_nested_expression_rejects_enabled_missing_malformed_agents(self):
+        detector = block(REGIONAL, "aws_cloudcontrolapi_resource", "guardduty")
+        conditions = re.findall(r'postcondition\s*\{\s*condition\s*=(.*?)\n\s*error_message\s*=\s*"([^"]+)"', detector, re.S)
+        expression = next(value for value, message in conditions if message.startswith("GuardDuty nested"))
+        agents = json.loads(re.search(r'guardduty_runtime_agents\s*=\s*(\[[^]]+\])', REGIONAL).group(1))
+        good = {"Features": [{"Name": "RUNTIME_MONITORING", "Status": "DISABLED", "AdditionalConfiguration": [
+            {"Name": name, "Status": "DISABLED"} for name in agents]}]}
+        fixtures = [("all disabled", good, True)]
+        for agent in agents:
+            bad = copy.deepcopy(good)
+            next(setting for setting in bad["Features"][0]["AdditionalConfiguration"] if setting["Name"] == agent)["Status"] = "ENABLED"
+            fixtures.append((agent + " enabled", bad, False))
+        for label, settings in (("missing one", good["Features"][0]["AdditionalConfiguration"][:-1]),
+                                ("missing all", []), ("malformed", None),
+                                ("unknown enabled", good["Features"][0]["AdditionalConfiguration"] + [{"Name": "NEW_AGENT", "Status": "ENABLED"}])):
+            bad = copy.deepcopy(good)
+            bad["Features"][0]["AdditionalConfiguration"] = settings
+            fixtures.append((label, bad, False))
+        with tempfile.TemporaryDirectory(prefix="security-expression-") as directory:
+            for label, properties, expected in fixtures:
+                with self.subTest(case=label):
+                    rendered = expression.replace("local.guardduty_runtime_agents", json.dumps(agents)).replace("self.properties", json.dumps(json.dumps(properties)))
+                    result = subprocess.run([os.environ["SECURITY_TEST_TERRAFORM"], "console", "-no-color"],
+                        input=" ".join(rendered.splitlines()) + "\n", text=True, capture_output=True, timeout=15, cwd=directory,
+                        env={"CHECKPOINT_DISABLE": "1", "TF_CLI_CONFIG_FILE": "/dev/null", "TF_IN_AUTOMATION": "1"})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), str(expected).lower())
 
     def test_kms_and_backup_tampering_alert_without_routine_cleanup_noise(self):
         pattern = block(REGIONAL, "aws_cloudwatch_event_rule", "findings")
@@ -414,6 +558,11 @@ class TerraformSafetyTests(unittest.TestCase):
             self.assertNotIn("sqs:PurgeQueue", policy)
             self.assertIn('"sqs:GetQueueAttributes"', policy)
             self.assertIn('"cloudwatch:GetMetricData"', policy)
+            self.assertIn('"events:DescribeRule", "events:ListTargetsByRule"', policy)
+            self.assertIn(':rule/security-forward-findings', policy)
+            self.assertNotIn('"events:Put', policy)
+        self.assertIn('aws_cloudwatch_event_rule.security_notify.arn', main)
+        self.assertIn('aws_cloudwatch_event_rule.security_delivery_health.arn', main)
         self.assertNotIn('"sts:AssumeRole"', staging)
         self.assertIn('"cloudwatch:namespace" = "SecurityDelivery"', main)
         role = block(TERRAFORM, "aws_iam_role", "security_delivery_observer_staging")

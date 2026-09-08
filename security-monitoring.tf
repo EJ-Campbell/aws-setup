@@ -556,7 +556,25 @@ locals {
     NAMESPACE = "SecurityDelivery"
     QUEUE = "security-findings-delivery-dlq"
 
-    def inspect_region(cloudwatch, sqs, account, region, main_account, now):
+    def expected_target(rule, account, region, main_account, sns_topic):
+        if rule == "security-forward-findings":
+            return {"Id": "central-security-alerts", "Arn": "arn:aws:events:us-west-1:"+main_account+":event-bus/security-alerts",
+                "RoleArn": "arn:aws:iam::"+account+":role/security-findings-forward",
+                "DeadLetterConfig": {"Arn": "arn:aws:sqs:"+region+":"+account+":"+QUEUE},
+                "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}}
+        target = {"DeadLetterConfig": {"Arn": "arn:aws:sqs:us-west-1:"+main_account+":security-central-delivery-dlq"}}
+        if rule == "security-alerts-notify":
+            target.update({"Id": "confirmed-operator-email", "Arn": sns_topic,
+                "RoleArn": "arn:aws:iam::"+main_account+":role/security-alerts-notify",
+                "RetryPolicy": {"MaximumEventAgeInSeconds": 86400, "MaximumRetryAttempts": 185}})
+        elif rule == "security-delivery-health":
+            target.update({"Id": rule, "Arn": "arn:aws:lambda:us-west-1:"+main_account+":function:security-delivery-health",
+                "RetryPolicy": {"MaximumEventAgeInSeconds": 300, "MaximumRetryAttempts": 2}})
+        else:
+            raise ValueError("Unexpected monitored rule")
+        return target
+
+    def inspect_region(cloudwatch, sqs, events, account, region, main_account, sns_topic, now):
         rules = [("security-forward-findings", None)]
         queues = [QUEUE]
         if account == main_account and region == "us-west-1":
@@ -573,6 +591,26 @@ locals {
                     "Metric": {"Namespace": "AWS/Events", "MetricName": metric, "Dimensions": dimensions},
                     "Period": 300, "Stat": "Sum"}})
         failures, depth, errors = 0, 0, 0
+        # Sparse failure metrics cannot distinguish a quiet rule from a deleted
+        # rule/target. Independently verify the enabled, exact delivery topology.
+        # Never follow pagination or accept additional/redirected/transformed targets.
+        for rule, bus in rules:
+            scope = {"EventBusName": bus} if bus else {}
+            expected_arn = "arn:aws:events:"+region+":"+account+":rule/"+(bus+"/" if bus else "")+rule
+            try:
+                state = events.describe_rule(Name=rule, **scope)
+                if state.get("State") != "ENABLED" or state.get("Name") != rule or state.get("Arn") != expected_arn:
+                    errors += 1
+                if rule == "security-delivery-health" and state.get("ScheduleExpression") != "rate(5 minutes)":
+                    errors += 1
+            except Exception:
+                errors += 1
+            try:
+                response = events.list_targets_by_rule(Rule=rule, Limit=2, **scope)
+                if response.get("NextToken") or response.get("Targets") != [expected_target(rule, account, region, main_account, sns_topic)]:
+                    errors += 1
+            except Exception:
+                errors += 1
         try:
             response = cloudwatch.get_metric_data(
                 MetricDataQueries=queries, StartTime=now-datetime.timedelta(minutes=15), EndTime=now,
@@ -612,11 +650,13 @@ locals {
     def handler(event, context):
         main_account, staging_account = os.environ["MAIN_ACCOUNT"], os.environ["STAGING_ACCOUNT"]
         regions = json.loads(os.environ["REGIONS"])
+        sns_topic = os.environ["SNS_TOPIC_ARN"]
         if (not isinstance(regions, list) or not 1 <= len(regions) <= 17
                 or any(not isinstance(region, str) or not re.fullmatch(r"[a-z]{2}-[a-z]+-[1-9]", region) for region in regions)
                 or len(set(regions)) != len(regions)
                 or not re.fullmatch(r"[0-9]{12}", main_account) or not re.fullmatch(r"[0-9]{12}", staging_account)
-                or main_account == staging_account):
+                or main_account == staging_account
+                or not re.fullmatch(r"arn:aws:sns:us-west-1:"+main_account+r":[A-Za-z0-9_-]{1,256}", sns_topic)):
             raise ValueError("Invalid security region coverage")
         now = datetime.datetime.now(datetime.timezone.utc)
         main = boto3.Session(region_name="us-west-1")
@@ -638,7 +678,8 @@ locals {
             for region in regions:
                 try:
                     tasks.append((session.client("cloudwatch", region_name=region, config=CONFIG),
-                        session.client("sqs", region_name=region, config=CONFIG), account, region, main_account, now))
+                        session.client("sqs", region_name=region, config=CONFIG),
+                        session.client("events", region_name=region, config=CONFIG), account, region, main_account, sns_topic, now))
                 except Exception:
                     errors += 1
         # 34 account/region jobs, six concurrent readers, short SDK timeouts and
@@ -698,6 +739,10 @@ resource "aws_iam_role_policy" "security_delivery_observer_staging" {
       {
         Effect   = "Allow", Action = "sqs:GetQueueAttributes"
         Resource = [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${aws_organizations_account.dev_staging[0].id}:security-findings-delivery-dlq"]
+      },
+      {
+        Effect   = "Allow", Action = ["events:DescribeRule", "events:ListTargetsByRule"]
+        Resource = [for region in local.security_delivery_regions : "arn:aws:events:${region}:${aws_organizations_account.dev_staging[0].id}:rule/security-forward-findings"]
       }
     ]
   })
@@ -721,6 +766,13 @@ resource "aws_iam_role_policy" "security_delivery_health" {
       {
         Effect   = "Allow", Action = "sqs:GetQueueAttributes"
         Resource = concat([aws_sqs_queue.security_delivery_failures.arn], [for region in local.security_delivery_regions : "arn:aws:sqs:${region}:${data.aws_caller_identity.current.account_id}:security-findings-delivery-dlq"])
+      },
+      {
+        Effect = "Allow", Action = ["events:DescribeRule", "events:ListTargetsByRule"]
+        Resource = concat([
+          aws_cloudwatch_event_rule.security_notify.arn,
+          aws_cloudwatch_event_rule.security_delivery_health.arn,
+        ], [for region in local.security_delivery_regions : "arn:aws:events:${region}:${data.aws_caller_identity.current.account_id}:rule/security-forward-findings"])
       },
       {
         Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.security_delivery_observer_staging.arn
@@ -761,6 +813,7 @@ resource "aws_lambda_function" "security_delivery_health" {
       MAIN_ACCOUNT    = data.aws_caller_identity.current.account_id
       STAGING_ACCOUNT = aws_organizations_account.dev_staging[0].id
       REGIONS         = jsonencode(local.security_delivery_regions)
+      SNS_TOPIC_ARN   = aws_sns_topic.cost_alerts.arn
     }
   }
   depends_on = [aws_iam_role_policy.security_delivery_health, aws_iam_role_policy.security_delivery_observer_staging]
