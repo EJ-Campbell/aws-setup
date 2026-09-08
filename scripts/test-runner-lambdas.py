@@ -864,6 +864,20 @@ def case_controller_passrole_is_pinned_to_runner_role_and_ec2():
             assert call['IamInstanceProfile'] == {'Name': 'github-runner-profile'}, call
 
 
+def case_controller_bootstrap_deletion_uses_supported_global_resource_tag():
+    source = (TF_FILE.parent / 'runner-bootstrap.tf').read_text()
+    controller = re.search(r'^resource "aws_iam_role_policy" "runner_bootstrap_controller" \{\n.*?^\}',
+                           source, re.M | re.S).group()
+    statements = re.split(r'\n      \},\n      \{\n', controller)
+    deletion = next(s for s in statements if '"DeleteControllerBootstrapCredentialOnly"' in s)
+    assert re.search(r'Effect\s*=\s*"Allow"', deletion), deletion
+    assert re.search(r'Action\s*=\s*"ssm:DeleteParameter"', deletion), deletion
+    assert 'parameter/github-runner/bootstrap/*' in deletion, deletion
+    assert re.search(r'StringEquals\s*=\s*\{ "aws:ResourceTag/Role" = "github-runner" \}', deletion), deletion
+    assert 'ssm:resourceTag/' not in controller, controller
+    assert '"ssm:GetParameter"' not in controller, controller
+
+
 def case_arm_types_are_graviton3_or_newer():
     """Graviton2 cannot run the nested-virtualisation tests.
 

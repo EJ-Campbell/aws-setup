@@ -69,7 +69,7 @@ resource "aws_iam_role_policy" "runner_bootstrap_controller" {
         Action   = "ssm:DeleteParameter"
         Resource = "arn:aws:ssm:us-west-1:${data.aws_caller_identity.current.account_id}:parameter/github-runner/bootstrap/*"
         Condition = {
-          StringEquals = { "ssm:resourceTag/Role" = "github-runner" }
+          StringEquals = { "aws:ResourceTag/Role" = "github-runner" }
         }
       },
       {
