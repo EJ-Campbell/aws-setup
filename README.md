@@ -978,6 +978,37 @@ read back `get-ebs-encryption-by-default`, `get-snapshot-block-public-access-sta
 `block-all-sharing` and `AccountLevel.HttpTokens=required`, respectively. Account defaults
 do not prove existing hosts or disks have been remediated.
 
+## External access findings
+
+`security-external-access.tf` creates 34 external-access analyzers: one `ACCOUNT`
+analyzer named `security-external-access` in each account/region covered by the
+regional defaults above. It reuses the same providers and does not enable regions.
+AWS lists external analysis at [no additional charge](https://aws.amazon.com/iam/access-analyzer/pricing/);
+paid internal-access/unused-access analyzers and paid custom policy checks are not
+enabled. Terraform also owns the two required `AWSServiceRoleForAccessAnalyzer` roles,
+one per account (36 resources total). Each account's analyzers depend on its own role
+to avoid racing first-time service-role creation. Only Access Analyzer can assume
+this read-only, service-owned resource-metadata role; its trust/permissions are defined
+by AWS, not custom grants to operators or workloads. No workload role gains permissions.
+See [service-role boundary](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-analyzer-using-service-linked-roles.html).
+
+This reports supported resource-policy access from outside the account, including
+public and cross-account sharing. It is not an access-control enforcement or proof
+that all identity-policy escalation paths are closed. Intentional sharing between
+the main and recovery accounts can generate findings because each account is its
+own trust boundary. No findings are automatically archived; inspect their resource,
+principal and policy before deciding whether access is intended. Creating an analyzer
+does not change public SSH, Cloudflare service-token access, disks or backup sharing.
+
+This free stage does not add email delivery. Findings are available through the
+Access Analyzer API; the separately reviewed monitoring stage can forward finding
+events later. After the fresh full plan/apply, verify all 34 analyzers have exactly
+`type=ACCOUNT` and `status=ACTIVE` using `list-analyzers`/`get-analyzer`, then inspect
+active findings with `list-findings`. Allow the documented analysis delay (policy
+changes can take up to 30 minutes); an immediately empty list is not a completed
+security audit. Do not silently create a second analyzer or replace an existing
+one if preflight finds account-level analysis already configured.
+
 ## Private browser manager
 
 `browser-manager/` is a separate, single-owner Next.js dashboard and `browserctl` CLI for
@@ -1320,6 +1351,7 @@ cover private pipes, bounded actions, profile isolation and immediate session ex
 | GitHub runners and OIDC | `runner-autoscale.tf`, `github-actions.tf`, `GITHUB-RUNNERS.md` |
 | Recovery and monitoring | `backups.tf`, `cost-alerts.tf`, `fcvm-ec2-key-backup.tf` |
 | Regional account defaults | `security-defaults.tf`, `security-regions.tf`, `modules/security-defaults/main.tf` |
+| Free external-access findings | `security-external-access.tf` |
 | Private browser desktops (AWS and personal Mac) | `browser-manager/`, `browser-manager.tf`, `browser-manager-mac.tf` |
 | Optional Mac | `mac-dev.tf`, `mac-dev-secrets.tf`, `mac-dev-teardown.tf` |
 | Staging and packages | `dev-staging-account.tf`, `dev-staging-bootstrap.tf`, `codeartifact.tf` |
